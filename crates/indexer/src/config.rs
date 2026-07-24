@@ -9,6 +9,14 @@ pub struct Config {
     pub stellar_rpc_url: String,
     pub network: String,
     pub poll_interval: Duration,
+    /// Shortest adaptive poll interval, applied when lag >= `lag_high_watermark`.
+    pub poll_interval_floor: Duration,
+    /// Longest adaptive poll interval, applied when the indexer is caught up.
+    pub poll_interval_ceiling: Duration,
+    /// Lag (ledgers) at or above which the floor interval applies.
+    pub lag_high_watermark: u64,
+    /// Hysteresis deadband (ledgers) suppressing interval churn on lag jitter.
+    pub poll_hysteresis_ledgers: u64,
     pub index_diagnostic: bool,
     pub max_events_per_poll: u32,
     pub redis_stream_maxlen: u64,
@@ -42,6 +50,20 @@ impl Config {
         let poll_interval_ms = parse_bounded_u64("POLL_INTERVAL_MS", 1000, 100, 60_000)?;
         let max_events_per_poll = parse_bounded_u64("MAX_EVENTS_PER_POLL", 200, 1, 10_000)?;
 
+        // Adaptive poll interval bounds (issue #198). Defaults: poll every 250ms
+        // while far behind, back off to 5s once caught up, cross over at 100
+        // ledgers of lag, with a 10-ledger hysteresis deadband.
+        let poll_interval_floor_ms = parse_bounded_u64("POLL_INTERVAL_FLOOR_MS", 250, 50, 60_000)?;
+        let poll_interval_ceiling_ms =
+            parse_bounded_u64("POLL_INTERVAL_CEILING_MS", 5000, 100, 600_000)?;
+        if poll_interval_ceiling_ms <= poll_interval_floor_ms {
+            return Err(TridentError::ConfigError(format!(
+                "[indexer] POLL_INTERVAL_CEILING_MS ({poll_interval_ceiling_ms}) must exceed POLL_INTERVAL_FLOOR_MS ({poll_interval_floor_ms})"
+            )));
+        }
+        let lag_high_watermark = parse_bounded_u64("LAG_HIGH_WATERMARK", 100, 1, 100_000_000)?;
+        let poll_hysteresis_ledgers = parse_bounded_u64("POLL_HYSTERESIS_LEDGERS", 10, 0, 1_000_000)?;
+
         let index_diagnostic = std::env::var("INDEX_DIAGNOSTIC")
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
@@ -59,6 +81,10 @@ impl Config {
             stellar_rpc_url: stellar_rpc_url.unwrap(),
             network,
             poll_interval: Duration::from_millis(poll_interval_ms),
+            poll_interval_floor: Duration::from_millis(poll_interval_floor_ms),
+            poll_interval_ceiling: Duration::from_millis(poll_interval_ceiling_ms),
+            lag_high_watermark,
+            poll_hysteresis_ledgers,
             index_diagnostic,
             max_events_per_poll: max_events_per_poll as u32,
             redis_stream_maxlen: std::env::var("REDIS_STREAM_MAXLEN")

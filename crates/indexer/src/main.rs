@@ -9,6 +9,7 @@ mod config;
 mod db;
 mod metrics;
 mod parser;
+mod poll;
 mod redis_stream;
 mod rpc;
 mod streamer;

@@ -29,6 +29,7 @@ use crate::{
     config::Config,
     db, metrics,
     parser::Parser,
+    poll::{AdaptivePoll, AdaptivePollConfig},
     redis_stream,
     rpc::RpcClient,
 };
@@ -51,6 +52,8 @@ pub struct Streamer {
     alerter: Alerter,
     /// Chain tip ledger from the most recent RPC response (issue #75).
     last_chain_tip: u64,
+    /// Adaptive poll-interval controller driven by chain-tip lag (issue #198).
+    adaptive_poll: AdaptivePoll,
 }
 
 impl Streamer {
@@ -67,6 +70,12 @@ impl Streamer {
             config.alert_lag_threshold,
             config.alert_cooldown_minutes,
         )?;
+        let adaptive_poll = AdaptivePoll::new(AdaptivePollConfig {
+            floor: config.poll_interval_floor,
+            ceiling: config.poll_interval_ceiling,
+            high_watermark: config.lag_high_watermark,
+            hysteresis_ledgers: config.poll_hysteresis_ledgers,
+        });
 
         Ok(Self {
             config,
@@ -78,6 +87,7 @@ impl Streamer {
             poll_count: 0,
             alerter,
             last_chain_tip: 0,
+            adaptive_poll,
         })
     }
 
@@ -170,9 +180,15 @@ impl Streamer {
                 }
             }
 
+            // Derive the next poll interval from the current chain-tip lag:
+            // poll fast while behind, back off once caught up (issue #198).
+            let lag = self.last_chain_tip.saturating_sub(cursor);
+            let interval = self.adaptive_poll.next_interval(lag);
+            metrics::set_effective_poll_interval(interval.as_millis() as u64);
+
             // Sleep until the next poll interval, waking immediately on shutdown.
             tokio::select! {
-                _ = tokio::time::sleep(self.config.poll_interval) => {}
+                _ = tokio::time::sleep(interval) => {}
                 _ = shutdown.cancelled() => {
                     tracing::info!("Shutdown signal received, stopping after current poll");
                     break;
@@ -534,6 +550,10 @@ mod tests {
             redis_url: redis_url.to_string(),
             network: "testnet".to_string(),
             poll_interval: Duration::from_millis(50),
+            poll_interval_floor: Duration::from_millis(50),
+            poll_interval_ceiling: Duration::from_millis(500),
+            lag_high_watermark: 100,
+            poll_hysteresis_ledgers: 10,
             index_diagnostic: false,
             max_events_per_poll: 200,
             redis_stream_maxlen: 10_000,

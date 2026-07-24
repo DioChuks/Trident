@@ -18,6 +18,7 @@ pub const PARSE_ERRORS_TOTAL: &str = "trident_indexer_parse_errors_total";
 pub const POLL_DURATION_SECONDS: &str = "trident_indexer_poll_duration_seconds";
 pub const POLL_ERRORS_TOTAL: &str = "trident_indexer_poll_errors_total";
 pub const RPC_RETRIES_TOTAL: &str = "trident_indexer_rpc_retries_total";
+pub const EFFECTIVE_POLL_INTERVAL_MS: &str = "trident_indexer_effective_poll_interval_ms";
 
 /// Install the global Prometheus recorder and start serving `/metrics` on
 /// `port`. Must be called once, before the streamer starts recording.
@@ -48,6 +49,10 @@ pub fn install(port: u16) -> Result<(), TridentError> {
         RPC_RETRIES_TOTAL,
         "Total RPC retries triggered by transient failures"
     );
+    describe_gauge!(
+        EFFECTIVE_POLL_INTERVAL_MS,
+        "Current adaptive poll interval in milliseconds (issue #198)"
+    );
 
     // Counters only render in the scrape output once touched at least once;
     // seed them at zero so /metrics is complete from the very first scrape.
@@ -57,6 +62,7 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     counter!(POLL_ERRORS_TOTAL).increment(0);
     counter!(RPC_RETRIES_TOTAL).increment(0);
     gauge!(LEDGER_LAG).set(0.0);
+    gauge!(EFFECTIVE_POLL_INTERVAL_MS).set(0.0);
 
     tracing::info!(port, "Metrics endpoint listening");
     Ok(())
@@ -64,6 +70,10 @@ pub fn install(port: u16) -> Result<(), TridentError> {
 
 pub fn set_ledger_lag(lag: i64) {
     gauge!(LEDGER_LAG).set(lag as f64);
+}
+
+pub fn set_effective_poll_interval(ms: u64) {
+    gauge!(EFFECTIVE_POLL_INTERVAL_MS).set(ms as f64);
 }
 
 pub fn record_events_processed(count: u64) {
