@@ -52,6 +52,12 @@ pub struct Config {
     pub alert_webhook_url: Option<String>,
     pub alert_lag_threshold: u64,
     pub alert_cooldown_minutes: u64,
+    /// statement_timeout for every DB connection (ms). Prevents runaway queries
+    /// from holding the pool indefinitely (#249).
+    pub statement_timeout_ms: u64,
+    /// idle_in_transaction_session_timeout (ms). Reclaims connections leaked by
+    /// open transactions (#249).
+    pub idle_in_transaction_timeout_ms: u64,
 }
 
 /// Default Postgres pool size for the indexer. It is a single writer with low
@@ -200,6 +206,18 @@ impl Config {
             alert_webhook_url,
             alert_lag_threshold,
             alert_cooldown_minutes,
+            statement_timeout_ms: parse_bounded_u64(
+                "DB_STATEMENT_TIMEOUT_MS",
+                30_000,
+                100,
+                3_600_000,
+            )?,
+            idle_in_transaction_timeout_ms: parse_bounded_u64(
+                "DB_IDLE_IN_TRANSACTION_TIMEOUT_MS",
+                10_000,
+                100,
+                3_600_000,
+            )?,
         })
     }
 }
