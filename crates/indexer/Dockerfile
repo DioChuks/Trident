@@ -3,46 +3,47 @@
 # ── builder ──────────────────────────────────────────────────────────────────
 FROM rust:1.88-slim AS builder
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    pkg-config \
-    libssl-dev \
+WORKDIR /app
+
+# Native build dependencies for -sys crates (openssl-sys needs pkg-config +
+# libssl-dev + a C toolchain).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential pkg-config libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /build
-
-# Cache dependency compilation separately from source changes.
-# Cargo.lock is gitignored; cargo will generate one if absent.
-COPY Cargo.toml ./
+# Cache dependency fetch separately from source compilation.
+COPY Cargo.toml Cargo.lock ./
+COPY proto/ proto/
 COPY crates/common/Cargo.toml crates/common/Cargo.toml
+COPY crates/api/Cargo.toml    crates/api/Cargo.toml
 COPY crates/indexer/Cargo.toml crates/indexer/Cargo.toml
-COPY crates/api/Cargo.toml crates/api/Cargo.toml
+COPY crates/backfill/Cargo.toml crates/backfill/Cargo.toml
+COPY sdk/rust/Cargo.toml sdk/rust/Cargo.toml
 
-# Dummy source files so `cargo build --release` can compile deps.
-RUN mkdir -p crates/common/src crates/indexer/src crates/api/src && \
-    echo "pub struct Dummy;" > crates/common/src/lib.rs && \
-    echo "fn main() {}" > crates/indexer/src/main.rs && \
-    echo "fn main() {}" > crates/api/src/main.rs && \
-    cargo build --release -p trident-indexer && \
-    rm -rf crates/common/src crates/indexer/src crates/api/src
+RUN mkdir -p crates/common/src crates/api/src crates/indexer/src crates/backfill/src sdk/rust/src \
+    && echo "pub fn _stub() {}" > crates/common/src/lib.rs \
+    && echo "fn main() {}"      > crates/api/src/main.rs \
+    && echo "fn main() {}"      > crates/indexer/src/main.rs \
+    && echo "fn main() {}"      > crates/backfill/src/main.rs \
+    && echo "pub fn _stub() {}" > sdk/rust/src/lib.rs \
+    && cargo build --release -p trident-indexer
 
-# Copy real source and rebuild only what changed.
-COPY crates/common/src crates/common/src
-COPY crates/indexer/src crates/indexer/src
-RUN mkdir -p crates/api/src && echo "fn main() {}" > crates/api/src/main.rs && \
-    touch crates/common/src/lib.rs crates/indexer/src/main.rs && \
-    cargo build --release -p trident-indexer
+COPY . .
+
+# Refresh mtimes so cargo rebuilds the real crates instead of reusing the
+# cached stub artifacts from the dependency-caching layer above.
+RUN find crates sdk -name '*.rs' -exec touch {} + \
+    && cargo build --release -p trident-indexer
 
 # ── runtime ──────────────────────────────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN useradd --system --no-create-home --uid 1001 trident
+COPY --from=builder /app/target/release/trident-indexer /usr/local/bin/trident-indexer
 
-COPY --from=builder /build/target/release/trident-indexer /usr/local/bin/trident-indexer
-
-USER trident
+EXPOSE 9090
 
 ENTRYPOINT ["/usr/local/bin/trident-indexer"]

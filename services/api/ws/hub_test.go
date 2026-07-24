@@ -1,125 +1,190 @@
 package ws
 
 import (
-	"net/http"
-	"net/http/httptest"
-	"strings"
+	"sync"
 	"testing"
-	"time"
-
-	"github.com/gorilla/websocket"
 )
 
-// dialWS upgrades a test HTTP server connection to WebSocket.
-func dialWS(t *testing.T, server *httptest.Server, path string) *websocket.Conn {
-	t.Helper()
-	url := "ws" + strings.TrimPrefix(server.URL, "http") + path
-	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
-	if err != nil {
-		t.Fatalf("dial %s: %v", url, err)
-	}
-	return conn
-}
-
-func TestHub_missingContractID_returns400(t *testing.T) {
-	h := NewHub()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Bypass upgrader — check the query param guard directly.
-		h.Handler(nil)(w, r)
-	}))
-	defer srv.Close()
-
-	resp, err := http.Get(srv.URL + "/ws")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("expected 400, got %d", resp.StatusCode)
-	}
-}
-
-func TestHub_connectDisconnect_lifecycle(t *testing.T) {
+// TestHub_RegisterAndBroadcast verifies that a registered client receives
+// messages broadcast to its contractID (issue #15 AC: fan-out delivery).
+func TestHub_RegisterAndBroadcast(t *testing.T) {
 	h := NewHub()
 
-	if h.ActiveConnections() != 0 {
-		t.Fatal("expected 0 connections before any client")
+	c := &client{
+		contractID: "contract-abc",
+		send:       make(chan []byte, 8),
 	}
-
-	// Simulate register/unregister directly (internal test).
-	c := &Client{hub: h, contractID: "CTEST"}
 	h.register(c)
 
-	if h.ActiveConnections() != 1 {
-		t.Fatalf("expected 1 connection after register, got %d", h.ActiveConnections())
-	}
+	msg := []byte(`{"event":"transfer"}`)
+	h.Broadcast("contract-abc", msg)
 
-	h.unregister(c)
-
-	if h.ActiveConnections() != 0 {
-		t.Fatalf("expected 0 connections after unregister, got %d", h.ActiveConnections())
+	select {
+	case got := <-c.send:
+		if string(got) != string(msg) {
+			t.Errorf("want %q, got %q", msg, got)
+		}
+	default:
+		t.Fatal("expected message in send channel, got none")
 	}
 }
 
-func TestHub_multipleClients(t *testing.T) {
+// TestHub_BroadcastDoesNotDeliverToOtherContracts verifies that messages are
+// only delivered to subscribers of the matching contractID.
+func TestHub_BroadcastDoesNotDeliverToOtherContracts(t *testing.T) {
 	h := NewHub()
 
-	clients := make([]*Client, 5)
+	c := &client{
+		contractID: "contract-xyz",
+		send:       make(chan []byte, 8),
+	}
+	h.register(c)
+
+	h.Broadcast("contract-abc", []byte(`{"event":"irrelevant"}`))
+
+	select {
+	case got := <-c.send:
+		t.Errorf("did not expect message for different contractID, got %q", got)
+	default:
+		// correct — nothing delivered
+	}
+}
+
+// TestHub_UnregisterClosesChannel verifies that after unregister the client's
+// send channel is closed so the write goroutine can exit cleanly (issue #15).
+func TestHub_UnregisterClosesChannel(t *testing.T) {
+	h := NewHub()
+
+	c := &client{
+		contractID: "contract-abc",
+		send:       make(chan []byte, 8),
+	}
+	h.register(c)
+	h.unregister(c)
+
+	// Channel must be closed; a receive on a closed empty channel returns immediately.
+	_, open := <-c.send
+	if open {
+		t.Error("expected send channel to be closed after unregister")
+	}
+}
+
+// TestHub_UnregisterIsIdempotent verifies that calling unregister twice does
+// not panic (double-close guard).
+func TestHub_UnregisterIsIdempotent(t *testing.T) {
+	h := NewHub()
+
+	c := &client{
+		contractID: "contract-abc",
+		send:       make(chan []byte, 8),
+	}
+	h.register(c)
+	h.unregister(c)
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("second unregister panicked: %v", r)
+		}
+	}()
+	h.unregister(c)
+}
+
+// TestHub_MultipleClientsPerContract verifies that all subscribers for the
+// same contractID receive the broadcast.
+func TestHub_MultipleClientsPerContract(t *testing.T) {
+	h := NewHub()
+
+	const n = 3
+	clients := make([]*client, n)
 	for i := range clients {
-		clients[i] = &Client{hub: h, contractID: "C"}
+		clients[i] = &client{contractID: "shared", send: make(chan []byte, 8)}
 		h.register(clients[i])
 	}
 
-	if h.ActiveConnections() != 5 {
-		t.Fatalf("expected 5 connections, got %d", h.ActiveConnections())
-	}
+	h.Broadcast("shared", []byte(`{"event":"mint"}`))
 
-	for _, c := range clients {
-		h.unregister(c)
-	}
-
-	if h.ActiveConnections() != 0 {
-		t.Fatal("expected 0 connections after all unregistered")
+	for i, c := range clients {
+		select {
+		case got := <-c.send:
+			if string(got) != `{"event":"mint"}` {
+				t.Errorf("client %d: unexpected message %q", i, got)
+			}
+		default:
+			t.Errorf("client %d: expected message, got none", i)
+		}
 	}
 }
 
-func TestHub_websocketConnect_receivesEvent(t *testing.T) {
-	redisURL := ""
-	// This sub-test requires TEST_REDIS_URL; skip otherwise.
-	// We still exercise the upgrade path and ping/pong.
-	_ = redisURL
-
+// TestHub_SlowClientDropsMessage verifies that a client with a full send
+// buffer does not block the broadcaster (drop-on-full semantics).
+func TestHub_SlowClientDropsMessage(t *testing.T) {
 	h := NewHub()
-	mux := http.NewServeMux()
 
-	// Handler that upgrades but immediately closes (no Redis needed).
-	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		contractID := r.URL.Query().Get("contractId")
-		if contractID == "" {
-			http.Error(w, "contractId required", http.StatusBadRequest)
-			return
+	// Buffer size 1 — fill it first so the next broadcast must drop.
+	c := &client{contractID: "contract-slow", send: make(chan []byte, 1)}
+	h.register(c)
+	c.send <- []byte("pre-fill")
+
+	// This must not block.
+	done := make(chan struct{})
+	go func() {
+		h.Broadcast("contract-slow", []byte("dropped"))
+		close(done)
+	}()
+
+	<-done
+
+	// Only the pre-filled message should be in the channel.
+	if len(c.send) != 1 {
+		t.Errorf("want 1 message in channel (pre-fill), got %d", len(c.send))
+	}
+}
+
+// TestHub_ConcurrentRegisterUnregister exercises the hub under the race
+// detector (issue #60 AC: concurrent connects/disconnects must be safe under
+// `go test -race`). 50 goroutines each register and immediately unregister a
+// client while a broadcaster runs concurrently. The run is clean when no data
+// race is reported and every client has been removed at the end.
+func TestHub_ConcurrentRegisterUnregister(t *testing.T) {
+	h := NewHub()
+
+	// Drive the broadcast path concurrently with the register/unregister churn.
+	stop := make(chan struct{})
+	broadcasterDone := make(chan struct{})
+	go func() {
+		defer close(broadcasterDone)
+		msg := []byte(`{"event":"transfer"}`)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				h.Broadcast("shared", msg)
+			}
 		}
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			t.Errorf("upgrade: %v", err)
-			return
-		}
-		h.register(&Client{hub: h, contractID: contractID})
-		// Close immediately to test disconnect lifecycle.
-		_ = conn.Close()
-	})
+	}()
 
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c := &client{contractID: "shared", send: make(chan []byte, 8)}
+			h.register(c)
+			h.unregister(c)
+		}()
+	}
+	wg.Wait()
 
-	conn := dialWS(t, srv, "/ws?contractId=CTEST")
-	defer func() { _ = conn.Close() }()
+	close(stop)
+	<-broadcasterDone
 
-	// Give the server goroutine time to register.
-	time.Sleep(50 * time.Millisecond)
-
-	// The connection will be closed server-side; reading triggers EOF.
-	_ = conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
-	_, _, _ = conn.ReadMessage() // expected to return error on close
+	// Every client registered above was also unregistered, so the hub must be
+	// empty. No broadcaster is running now, so reading under the lock is safe.
+	h.mu.RLock()
+	remaining := len(h.clients)
+	h.mu.RUnlock()
+	if remaining != 0 {
+		t.Errorf("want 0 clients after concurrent churn, got %d", remaining)
+	}
 }

@@ -17,7 +17,34 @@
 
 ---
 
+## Quick Start
+
+### Prerequisites
+Before running Trident locally, make sure you have the following installed:
+- **Docker** with Compose v2
+- **Rust** (via [rustup](https://rustup.rs))
+- **Go** (1.21+)
+- **Node.js** (20 LTS+)
+
+### Setup & Run
+Get the entire development stack running in seconds:
+```bash
+cp .env.example .env
+make dev
+```
+
+This command will:
+1. Start Postgres and Redis via Docker Compose.
+2. Wait for Postgres to be healthy.
+3. Apply all database migrations automatically.
+4. Compile and start the Rust indexer, the Rust gRPC API, and the Go REST API.
+
+Use `Ctrl+C` or `make stop` to cleanly shut down all services.
+
+---
+
 ## The Problem
+
 
 Soroban's RPC node is intentionally thin — no long-term event storage, no historical queries, no filtering. That's a reasonable protocol decision, but it forces every developer building on Stellar to solve the same infrastructure problem before they can build their actual product. Every serious team ends up writing their own event streaming pipeline, their own database schema, their own parser — in isolation, with no shared guarantees, and no easy recovery when something breaks.
 
@@ -75,6 +102,38 @@ Full historical event storage with no enforced retention limit, so a query again
 - [x] Repository scaffolded
 - [x] CI pipeline active
 - [ ] Phase 1 development begins
+
+---
+
+## Production Deployment
+
+Trident ships a docker-compose overlay for production that terminates TLS at nginx and hides the API port from the host.
+
+### Prerequisites
+
+TLS certificates must be placed in the `nginx_certs` Docker volume before starting the stack. The nginx service expects:
+
+- `/etc/nginx/certs/fullchain.pem`
+- `/etc/nginx/certs/privkey.pem`
+
+Populate the volume once (e.g. via Certbot or your own certificate pipeline) before the first `up`.
+
+### Start the stack
+
+```bash
+docker compose -f docker/docker-compose.yml -f docker/docker-compose.prod.yml up -d
+```
+
+This command merges the base compose (postgres, redis, indexer, api) with the production overlay (nginx, port hiding). The API is reachable only through nginx — direct access on port 3000 is disabled in production.
+
+### What the overlay changes
+
+| Service | Base | Prod overlay |
+|---------|------|--------------|
+| `nginx` | — | Added: ports 80 + 443, TLS termination |
+| `api` | `${PORT}:${PORT}` exposed | `ports: []` — no direct host access |
+
+nginx proxies all traffic to `api:3000` on the internal Docker network, upgrades WebSocket connections at `/ws`, and disables response buffering for the SSE stream at `/v1/events/stream`.
 
 ---
 

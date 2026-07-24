@@ -1,10 +1,10 @@
 import { z } from "zod";
-import { httpStatusToError, TridentError } from "./errors.js";
+import { parseApiError, TridentApiError, TridentError } from "./errors.js";
 import { createSubscription } from "./subscription.js";
 import { iterEvents as iterEventsImpl } from "./iterator.js";
 import type { IterEventsOptions } from "./iterator.js";
 
-export { TridentError } from "./errors.js";
+export { TridentError, TridentApiError } from "./errors.js";
 export type { TridentErrorCode } from "./errors.js";
 export { iterEvents, DEFAULT_MAX_PAGES } from "./iterator.js";
 export type { IterEventsOptions, QueryEventsFn } from "./iterator.js";
@@ -14,11 +14,14 @@ export type { IterEventsOptions, QueryEventsFn } from "./iterator.js";
 // ---------------------------------------------------------------------------
 
 export type Network = "mainnet" | "testnet" | "futurenet";
+export type TransportType = "rest" | "graphql";
 
 export interface TridentClientConfig {
   apiUrl: string;
   apiKey: string;
   network: Network;
+  webSocketImpl?: any;
+  transport?: TransportType;
 }
 
 // ---------------------------------------------------------------------------
@@ -54,6 +57,7 @@ export interface QueryEventsParams {
   ledgerTo?: number;
   after?: string;
   limit?: number;
+  eventType?: "contract" | "system" | "diagnostic";
 }
 
 export interface GetEventByIdParams {
@@ -96,8 +100,8 @@ const ApiEventSchema = z.object({
 
 const ApiListEventsResponseSchema = z.object({
   events: z.array(ApiEventSchema),
-  next_cursor: z.string().optional().default(""),
-  has_more: z.boolean().optional().default(false),
+  next_cursor: z.string().nullable(),
+  has_more: z.boolean(),
 });
 
 function apiEventToSorobanEvent(
@@ -129,9 +133,12 @@ function apiEventToSorobanEvent(
 
 export class TridentClient {
   private readonly config: TridentClientConfig;
+  private readonly transport: "rest" | "graphql";
+  private graphqlTransport?: any; // Lazy-loaded GraphQL transport
 
   constructor(config: TridentClientConfig) {
     this.config = config;
+    this.transport = config.transport ?? "rest";
   }
 
   private get headers(): Record<string, string> {
@@ -154,7 +161,7 @@ export class TridentClient {
 
     if (!res.ok) {
       const body = await res.text().catch(() => "");
-      throw httpStatusToError(res.status, body);
+      throw parseApiError(res.status, body);
     }
 
     const json: unknown = await res.json().catch((cause: unknown) => {
@@ -164,6 +171,16 @@ export class TridentClient {
     return schema.parse(json);
   }
 
+  private async getGraphQLTransport() {
+    if (this.graphqlTransport) {
+      return this.graphqlTransport;
+    }
+    // Lazy load GraphQL transport only when needed
+    const { GraphQLTransport } = await import("./transports/graphql.js");
+    this.graphqlTransport = new GraphQLTransport(this.config.apiUrl, this.config.apiKey);
+    return this.graphqlTransport;
+  }
+
   /**
    * Query historical Soroban events with optional filtering.
    *
@@ -171,6 +188,20 @@ export class TridentClient {
    * the next call to fetch the next page.
    */
   async queryEvents(params: QueryEventsParams): Promise<PaginatedEvents> {
+    if (this.transport === "graphql") {
+      const transport = await this.getGraphQLTransport();
+      return transport.queryEvents(
+        params.contractId,
+        params.topic0,
+        params.topic1,
+        params.ledgerFrom,
+        params.ledgerTo,
+        params.limit,
+        params.after,
+      );
+    }
+
+    // REST transport (default)
     const qs = new URLSearchParams();
     if (params.contractId) qs.set("contractId", params.contractId);
     if (params.topic0) qs.set("topic0", params.topic0);
@@ -181,14 +212,15 @@ export class TridentClient {
       qs.set("ledgerTo", String(params.ledgerTo));
     if (params.after) qs.set("cursor", params.after);
     if (params.limit !== undefined) qs.set("limit", String(params.limit));
+    if (params.eventType) qs.set("event_type", params.eventType);
 
     const url = `${this.config.apiUrl}/v1/events?${qs.toString()}`;
     const resp = await this.fetchJSON(url, ApiListEventsResponseSchema);
 
     return {
       events: resp.events.map(apiEventToSorobanEvent),
-      cursor: resp.next_cursor || null,
-      hasMore: resp.has_more ?? false,
+      cursor: resp.next_cursor,
+      hasMore: resp.has_more,
     };
   }
 
@@ -222,6 +254,12 @@ export class TridentClient {
    * Throws `TridentError` with code `NOT_FOUND` if no event exists.
    */
   async getEventById(params: GetEventByIdParams): Promise<SorobanEvent> {
+    if (this.transport === "graphql") {
+      const transport = await this.getGraphQLTransport();
+      return transport.getEventById(params.id);
+    }
+
+    // REST transport (default)
     const url = `${this.config.apiUrl}/v1/events/${encodeURIComponent(params.id)}`;
     const apiEvent = await this.fetchJSON(url, ApiEventSchema);
     return apiEventToSorobanEvent(apiEvent);
@@ -230,12 +268,39 @@ export class TridentClient {
   /**
    * Open a real-time WebSocket subscription to events emitted by a contract.
    *
-   * Replaces `https://` with `wss://` (and `http://` with `ws://`) to derive
-   * the WebSocket URL. Reconnects with exponential backoff (500ms–30s) on
-   * unexpected close. Returns a `Subscription` handle whose `unsubscribe()`
-   * closes the socket and cancels any pending reconnect.
+   * For GraphQL transport, requires graphql-ws to be installed.
+   * For REST transport, uses native WebSocket.
    */
   subscribeToContract(params: SubscribeToContractParams): Subscription {
+    if (params.topic0 !== undefined && params.topic0 === "") {
+      throw new TridentApiError(
+        400,
+        "INVALID_ARGUMENT",
+        "topic0 must not be an empty string; omit the field to receive all events",
+      );
+    }
+
+    if (this.transport === "graphql") {
+      // GraphQL subscriptions require graphql-ws
+      try {
+        // Attempt to import graphql-ws
+        require("graphql-ws");
+      } catch {
+        throw new TridentError(
+          "INTERNAL",
+          "GraphQL subscriptions require graphql-ws. Install it with: npm install graphql-ws",
+        );
+      }
+
+      // Use graphql-ws protocol for subscriptions
+      // This will be implemented via the graphql-ws client library
+      throw new TridentError(
+        "INTERNAL",
+        "GraphQL subscriptions are not yet fully implemented",
+      );
+    }
+
+    // REST transport (default) - use native WebSocket
     const wsBase = this.config.apiUrl
       .replace(/^https:\/\//, "wss://")
       .replace(/^http:\/\//, "ws://");
@@ -244,6 +309,6 @@ export class TridentClient {
     if (params.topic0) qs.set("topic0", params.topic0);
 
     const wsUrl = `${wsBase}/ws?${qs.toString()}`;
-    return createSubscription(wsUrl, params);
+    return createSubscription(wsUrl, params, this.config.webSocketImpl);
   }
 }
