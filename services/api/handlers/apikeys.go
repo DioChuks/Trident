@@ -21,6 +21,10 @@ type APIKeyConfig struct {
 	DB       *pgxpool.Pool
 	// Redis is used for cache invalidation on key revocation.
 	Redis *redis.Client
+	// InvalidateTier evicts a key's cached rate-limit tier (by key hash) after
+	// an admin tier change so the new limit applies promptly instead of after
+	// the tier-cache TTL. Wired to middleware.TierCache.Invalidate; nil-safe.
+	InvalidateTier func(keyHash string)
 }
 
 // APIKeyResponse is returned for list/create operations.
@@ -213,16 +217,17 @@ func UpdateAPIKey(cfg APIKeyConfig) http.HandlerFunc {
 		var k APIKeyResponse
 		var lastUsedAt *time.Time
 		var createdAt time.Time
+		var keyHash string
 		err := cfg.DB.QueryRow(r.Context(),
 			`UPDATE api_keys
 			 SET label           = COALESCE($2, label),
 			     rate_limit_tier = COALESCE($3, rate_limit_tier)
 			 WHERE id = $1 AND revoked_at IS NULL
 			 RETURNING id, key_prefix, label, network, rate_limit_tier,
-			           last_used_at, request_count, created_at`,
+			           last_used_at, request_count, created_at, key_hash`,
 			id, req.Label, req.RateLimitTier,
 		).Scan(&k.ID, &k.KeyPrefix, &k.Label, &k.Network, &k.RateLimitTier,
-			&lastUsedAt, &k.RequestCount, &createdAt)
+			&lastUsedAt, &k.RequestCount, &createdAt, &keyHash)
 		if err == pgx.ErrNoRows {
 			writeJSON(w, http.StatusNotFound, errorBody("api key not found"))
 			return
@@ -230,6 +235,12 @@ func UpdateAPIKey(cfg APIKeyConfig) http.HandlerFunc {
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, errorBody("failed to update api key"))
 			return
+		}
+
+		// A tier change must evict the cached tier so the new limit applies on
+		// the next request rather than after the tier-cache TTL (issue #229).
+		if req.RateLimitTier != nil && cfg.InvalidateTier != nil {
+			cfg.InvalidateTier(keyHash)
 		}
 
 		k.CreatedAt = createdAt.UTC().Format(time.RFC3339)

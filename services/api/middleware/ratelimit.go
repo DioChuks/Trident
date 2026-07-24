@@ -37,6 +37,11 @@ type RateLimitConfig struct {
 	Redis *redis.Client
 	DB    TierDB
 	Tiers map[string]TierConfig
+	// Cache holds resolved key->tier entries. Share a single instance (see
+	// NewTierCache) with the api-key admin handler so a tier change can evict
+	// the affected entry immediately instead of waiting for the TTL. When nil,
+	// TieredRateLimit creates a private cache.
+	Cache *TierCache
 	// SliderFn overrides the Redis sliding window. Set in tests.
 	SliderFn func(ctx context.Context, key string, limit, windowMs int64) (allowed bool, count int64, err error)
 }
@@ -61,27 +66,46 @@ type tierEntry struct {
 	exp  time.Time
 }
 
-type tierCache struct {
+// TierCache caches the resolved rate-limit tier per API-key hash for a short
+// TTL. It is safe for concurrent use. Share one instance between the rate-limit
+// middleware and the api-key admin handler so an admin tier change can evict the
+// stale entry with Invalidate — otherwise a new tier would not take effect until
+// the TTL expires (up to tierCacheTTL later).
+type TierCache struct {
 	mu      sync.RWMutex
 	entries map[string]tierEntry
 }
 
 const tierCacheTTL = 5 * time.Minute
 
-func (tc *tierCache) get(hash string) (string, bool) {
+// NewTierCache returns an empty, ready-to-use tier cache.
+func NewTierCache() *TierCache {
+	return &TierCache{entries: map[string]tierEntry{}}
+}
+
+func (tc *TierCache) get(hash string) (string, bool) {
 	tc.mu.RLock()
 	e, ok := tc.entries[hash]
 	tc.mu.RUnlock()
 	return e.tier, ok && time.Now().Before(e.exp)
 }
 
-func (tc *tierCache) set(hash, tier string) {
+func (tc *TierCache) set(hash, tier string) {
 	tc.mu.Lock()
 	tc.entries[hash] = tierEntry{tier: tier, exp: time.Now().Add(tierCacheTTL)}
 	tc.mu.Unlock()
 }
 
-func (tc *tierCache) resolve(ctx context.Context, apiKey string, db TierDB) string {
+// Invalidate drops the cached tier for the given API-key hash so the next
+// request re-resolves it from the database. Called by the admin api-key handler
+// after a rate_limit_tier change so the new limit applies promptly.
+func (tc *TierCache) Invalidate(hash string) {
+	tc.mu.Lock()
+	delete(tc.entries, hash)
+	tc.mu.Unlock()
+}
+
+func (tc *TierCache) resolve(ctx context.Context, apiKey string, db TierDB) string {
 	hash := hashKey(apiKey)
 	if t, ok := tc.get(hash); ok {
 		return t
@@ -150,7 +174,14 @@ func defaultTiers() map[string]TierConfig {
 // ---------------------------------------------------------------------------
 
 // TieredRateLimit enforces a Redis sliding-window rate limit per API key,
-// resolved to a tier via the database. Fails open on Redis errors.
+// resolved to a tier via the database.
+//
+// Fail-open policy (intentional): if the Redis sliding-window check errors
+// (Redis unavailable, timeout, script failure) the request is ALLOWED and the
+// event is logged at warn level. Availability is prioritised over strict
+// enforcement — a Redis outage must not take the whole API down. The tradeoff
+// is that limits are not enforced during such an outage. Tier resolution
+// likewise degrades gracefully: a DB error falls back to the "free" tier.
 func TieredRateLimit(cfg RateLimitConfig) func(http.Handler) http.Handler {
 	if cfg.Tiers == nil {
 		cfg.Tiers = defaultTiers()
@@ -165,7 +196,10 @@ func TieredRateLimit(cfg RateLimitConfig) func(http.Handler) http.Handler {
 			}
 		}
 	}
-	tc := &tierCache{entries: map[string]tierEntry{}}
+	tc := cfg.Cache
+	if tc == nil {
+		tc = NewTierCache()
+	}
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

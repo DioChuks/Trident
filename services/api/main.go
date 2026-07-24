@@ -159,10 +159,15 @@ func main() {
 		adminCfg.StatsFunc = newPgbouncerStats(adminURL)
 	}
 
+	// Shared tier cache so an admin tier change (PATCH /v1/api-keys/{id}) can
+	// evict the stale entry immediately instead of waiting for the TTL (#229).
+	tierCache := middleware.NewTierCache()
+
 	apiKeyCfg := handlers.APIKeyConfig{
-		AdminKey: os.Getenv("ADMIN_API_KEY"),
-		DB:       pool,
-		Redis:    redisClient,
+		AdminKey:       os.Getenv("ADMIN_API_KEY"),
+		DB:             pool,
+		Redis:          redisClient,
+		InvalidateTier: tierCache.Invalidate,
 	}
 
 	webhookDB, err := newDB()
@@ -210,7 +215,7 @@ func main() {
 	if pool != nil {
 		rlDB = pool
 	}
-	rlCfg := middleware.RateLimitConfig{Redis: redisClient, DB: rlDB}
+	rlCfg := middleware.RateLimitConfig{Redis: redisClient, DB: rlDB, Cache: tierCache}
 
 	// DB-backed auth middleware with Redis caching and env-var fallback.
 	var authDB middleware.DBAuthConfig

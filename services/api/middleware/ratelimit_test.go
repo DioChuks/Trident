@@ -244,6 +244,101 @@ func TestTieredRateLimit_Counters(t *testing.T) {
 	}
 }
 
+// TestTierCache_Invalidate_AppliesNewTierWithoutTTL asserts that after an admin
+// tier change, invalidating the shared cache makes the new tier take effect on
+// the next request instead of waiting for the 5-minute TTL (issue #229).
+func TestTierCache_Invalidate_AppliesNewTierWithoutTTL(t *testing.T) {
+	resetCounters()
+	db := &mockTierDB{tier: "free"}
+	cache := NewTierCache()
+
+	var capturedLimit int64
+	captureSlider := func(_ context.Context, _ string, limit, _ int64) (bool, int64, error) {
+		capturedLimit = limit
+		return true, 1, nil
+	}
+	cfg := RateLimitConfig{
+		DB:       db,
+		Cache:    cache,
+		SliderFn: captureSlider,
+		Tiers: map[string]TierConfig{
+			"free": {RPS: 10, Window: time.Second},
+			"pro":  {RPS: 100, Window: time.Second},
+		},
+	}
+	mw := TieredRateLimit(cfg)(noop())
+	const key = "switch-key"
+
+	// First request resolves and caches the "free" tier.
+	mw.ServeHTTP(httptest.NewRecorder(), apiKeyReq(key))
+	if capturedLimit != 10 {
+		t.Fatalf("initial tier: want limit 10 (free), got %d", capturedLimit)
+	}
+
+	// Admin promotes the key to "pro" in the DB. Without invalidation the cache
+	// still serves the stale "free" tier.
+	db.tier = "pro"
+	mw.ServeHTTP(httptest.NewRecorder(), apiKeyReq(key))
+	if capturedLimit != 10 {
+		t.Fatalf("before invalidation: cached tier should still apply (10), got %d", capturedLimit)
+	}
+
+	// Invalidate the entry (as UpdateAPIKey does) — the new tier applies now.
+	cache.Invalidate(hashKey(key))
+	mw.ServeHTTP(httptest.NewRecorder(), apiKeyReq(key))
+	if capturedLimit != 100 {
+		t.Fatalf("after invalidation: want new tier limit 100 (pro), got %d", capturedLimit)
+	}
+}
+
+// TestTieredRateLimit_BoundaryExactLimit asserts the request that exactly hits
+// the limit is allowed and the next one is rejected (issue #229 boundary case).
+func TestTieredRateLimit_BoundaryExactLimit(t *testing.T) {
+	resetCounters()
+	const limit = 3
+	var mu sync.Mutex
+	calls := 0
+	// Mimic the sliding window: allow while the pre-increment count is below the
+	// limit, returning the post-increment count; reject once the window is full.
+	slider := func(_ context.Context, _ string, lim, _ int64) (bool, int64, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if int64(calls) >= lim {
+			return false, lim, nil
+		}
+		calls++
+		return true, int64(calls), nil
+	}
+	cfg := RateLimitConfig{
+		SliderFn: slider,
+		Tiers:    map[string]TierConfig{"free": {RPS: limit, Window: time.Second}},
+	}
+	mw := TieredRateLimit(cfg)(noop())
+	const key = "boundary-key"
+
+	// The first `limit` requests are allowed; the last exactly hits the cap.
+	for i := 1; i <= limit; i++ {
+		rec := httptest.NewRecorder()
+		mw.ServeHTTP(rec, apiKeyReq(key))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("request %d/%d: want 200, got %d", i, limit, rec.Code)
+		}
+		if i == limit && rec.Header().Get("X-RateLimit-Remaining") != "0" {
+			t.Errorf("at exact limit: want remaining 0, got %q", rec.Header().Get("X-RateLimit-Remaining"))
+		}
+	}
+
+	// The next request over the limit is rejected.
+	rec := httptest.NewRecorder()
+	mw.ServeHTTP(rec, apiKeyReq(key))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("over limit: want 429, got %d", rec.Code)
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Error("429 must carry Retry-After")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // WSConnectionLimit tests
 // ---------------------------------------------------------------------------
