@@ -28,7 +28,9 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     PrometheusBuilder::new()
         .with_http_listener(addr)
         .install()
-        .map_err(|e| TridentError::config(anyhow::Error::new(e).context("failed to start metrics exporter")))?;
+        .map_err(|e| {
+            TridentError::config(anyhow::Error::new(e).context("failed to start metrics exporter"))
+        })?;
 
     describe_gauge!(
         LEDGER_LAG,

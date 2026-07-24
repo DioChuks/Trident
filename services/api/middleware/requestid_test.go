@@ -42,8 +42,8 @@ func TestRequestID_AcceptsIncomingHeader(t *testing.T) {
 // incoming id is replaced by a generated one.
 func TestRequestID_GeneratesWhenAbsentOrInvalid(t *testing.T) {
 	cases := map[string]string{
-		"absent":      "",
-		"whitespace":  "has space",
+		"absent":       "",
+		"whitespace":   "has space",
 		"control char": "bad\nid",
 	}
 	for name, incoming := range cases {

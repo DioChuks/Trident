@@ -1,4 +1,4 @@
-﻿//! # Alerting
+//! # Alerting
 //!
 //! Fires an outbound webhook when the indexer falls behind the chain tip by
 //! more than `ALERT_LAG_THRESHOLD` ledgers, and sends a recovery webhook when
@@ -93,7 +93,9 @@ impl Alerter {
                 reqwest::Client::builder()
                     .timeout(Duration::from_secs(WEBHOOK_TIMEOUT_SECS))
                     .build()
-                    .map_err(|e| TridentError::config(anyhow::Error::new(e).context("alerting HTTP client")))?,
+                    .map_err(|e| {
+                        TridentError::config(anyhow::Error::new(e).context("alerting HTTP client"))
+                    })?,
             )
         } else {
             None

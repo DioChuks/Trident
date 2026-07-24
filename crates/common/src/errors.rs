@@ -59,35 +59,49 @@ pub enum Severity {
 impl TridentError {
     /// Construct an [`RpcError`](TridentError::RpcError) without ledger context.
     pub fn rpc(source: impl Into<anyhow::Error>) -> Self {
-        TridentError::RpcError { source: source.into(), ledger: None }
+        TridentError::RpcError {
+            source: source.into(),
+            ledger: None,
+        }
     }
 
     /// Construct an [`RpcError`](TridentError::RpcError) tagged with the ledger
     /// being processed when the failure occurred.
     pub fn rpc_at(source: impl Into<anyhow::Error>, ledger: u64) -> Self {
-        TridentError::RpcError { source: source.into(), ledger: Some(ledger) }
+        TridentError::RpcError {
+            source: source.into(),
+            ledger: Some(ledger),
+        }
     }
 
     /// Construct a [`ParseError`](TridentError::ParseError).
     pub fn parse(source: impl Into<anyhow::Error>) -> Self {
-        TridentError::ParseError { source: source.into() }
+        TridentError::ParseError {
+            source: source.into(),
+        }
     }
 
     /// Construct a [`StorageError`](TridentError::StorageError).
     pub fn storage(source: impl Into<anyhow::Error>) -> Self {
-        TridentError::StorageError { source: source.into() }
+        TridentError::StorageError {
+            source: source.into(),
+        }
     }
 
     /// Construct a [`ConfigError`](TridentError::ConfigError).
     pub fn config(source: impl Into<anyhow::Error>) -> Self {
-        TridentError::ConfigError { source: source.into() }
+        TridentError::ConfigError {
+            source: source.into(),
+        }
     }
 
     /// Classify how a processing loop should react to this error.
     pub fn severity(&self) -> Severity {
         match self {
             // Transient infrastructure failures — retrying may succeed.
-            TridentError::RpcError { .. } | TridentError::StorageError { .. } => Severity::Retryable,
+            TridentError::RpcError { .. } | TridentError::StorageError { .. } => {
+                Severity::Retryable
+            }
             // Malformed input — retrying is pointless; skip the item.
             TridentError::ParseError { .. } => Severity::Skip,
             // Misconfiguration — cannot make progress; halt.

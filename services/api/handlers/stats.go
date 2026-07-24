@@ -46,15 +46,15 @@ var (
 func MetricsHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-		_, _ = fmt.Fprintf(w,"# HELP trident_indexer_lag_ledgers Number of ledgers the indexer is behind the chain tip.\n")
-		_, _ = fmt.Fprintf(w,"# TYPE trident_indexer_lag_ledgers gauge\n")
-		_, _ = fmt.Fprintf(w,"trident_indexer_lag_ledgers %g\n", metricLagLedgers.Get())
-		_, _ = fmt.Fprintf(w,"# HELP trident_indexer_last_poll_timestamp_seconds Unix timestamp of the last successful indexer poll.\n")
-		_, _ = fmt.Fprintf(w,"# TYPE trident_indexer_last_poll_timestamp_seconds gauge\n")
-		_, _ = fmt.Fprintf(w,"trident_indexer_last_poll_timestamp_seconds %g\n", metricLastPollTimestamp.Get())
-		_, _ = fmt.Fprintf(w,"# HELP trident_indexer_events_total Cumulative events indexed.\n")
-		_, _ = fmt.Fprintf(w,"# TYPE trident_indexer_events_total gauge\n")
-		_, _ = fmt.Fprintf(w,"trident_indexer_events_total %g\n", metricEventsTotal.Get())
+		_, _ = fmt.Fprintf(w, "# HELP trident_indexer_lag_ledgers Number of ledgers the indexer is behind the chain tip.\n")
+		_, _ = fmt.Fprintf(w, "# TYPE trident_indexer_lag_ledgers gauge\n")
+		_, _ = fmt.Fprintf(w, "trident_indexer_lag_ledgers %g\n", metricLagLedgers.Get())
+		_, _ = fmt.Fprintf(w, "# HELP trident_indexer_last_poll_timestamp_seconds Unix timestamp of the last successful indexer poll.\n")
+		_, _ = fmt.Fprintf(w, "# TYPE trident_indexer_last_poll_timestamp_seconds gauge\n")
+		_, _ = fmt.Fprintf(w, "trident_indexer_last_poll_timestamp_seconds %g\n", metricLastPollTimestamp.Get())
+		_, _ = fmt.Fprintf(w, "# HELP trident_indexer_events_total Cumulative events indexed.\n")
+		_, _ = fmt.Fprintf(w, "# TYPE trident_indexer_events_total gauge\n")
+		_, _ = fmt.Fprintf(w, "trident_indexer_events_total %g\n", metricEventsTotal.Get())
 	}
 }
 
@@ -266,7 +266,6 @@ func IndexerStats(db DBPool) http.HandlerFunc {
 	}
 }
 
-
 // ---------------------------------------------------------------------------
 // Contract Analytics Endpoint
 // ---------------------------------------------------------------------------
@@ -281,11 +280,11 @@ type ContractStats struct {
 
 // ContractsStatsResponse is the JSON response for GET /v1/stats/contracts
 type ContractsStatsResponse struct {
-	Contracts  []*ContractStats `json:"contracts"`
-	FromLedger int64            `json:"from_ledger"`
-	ToLedger   int64            `json:"to_ledger"`
-	Network    string           `json:"network"`
-	GeneratedAt string          `json:"generated_at"`
+	Contracts   []*ContractStats `json:"contracts"`
+	FromLedger  int64            `json:"from_ledger"`
+	ToLedger    int64            `json:"to_ledger"`
+	Network     string           `json:"network"`
+	GeneratedAt string           `json:"generated_at"`
 }
 
 // ContractsStats handles GET /v1/stats/contracts (analytics endpoint).

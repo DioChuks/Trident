@@ -61,7 +61,11 @@ impl AdaptivePoll {
     pub fn new(cfg: AdaptivePollConfig) -> Self {
         // Start at the ceiling (assume caught up until proven otherwise).
         let last_interval = cfg.ceiling;
-        Self { cfg, last_lag: None, last_interval }
+        Self {
+            cfg,
+            last_lag: None,
+            last_interval,
+        }
     }
 
     /// Compute the interval for the current `lag`, honouring the hysteresis
@@ -142,7 +146,7 @@ mod tests {
     fn hysteresis_holds_interval_for_small_lag_jitter() {
         let mut ap = AdaptivePoll::new(cfg());
         let first = ap.next_interval(50); // establishes baseline
-        // A jitter of < 10 ledgers must not change the interval.
+                                          // A jitter of < 10 ledgers must not change the interval.
         assert_eq!(ap.next_interval(53), first);
         assert_eq!(ap.next_interval(45), first);
     }
@@ -161,7 +165,7 @@ mod tests {
     fn extremes_apply_immediately_despite_hysteresis() {
         let mut ap = AdaptivePoll::new(cfg());
         ap.next_interval(5); // small lag near ceiling
-        // Reaching the high watermark must snap to floor even within the deadband window.
+                             // Reaching the high watermark must snap to floor even within the deadband window.
         assert_eq!(ap.next_interval(100), Duration::from_millis(250));
         // Caught up snaps to ceiling immediately.
         assert_eq!(ap.next_interval(0), Duration::from_millis(5000));

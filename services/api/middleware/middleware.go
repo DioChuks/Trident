@@ -41,17 +41,17 @@ func (w *LoggingResponseWriter) WriteHeader(code int) {
 func StructuredLogging(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		
+
 		// Get request ID from context (set by the RequestID middleware).
 		requestID := httputil.RequestIDFromContext(r.Context())
 
 		// Wrap response writer to capture status code
 		wrapped := &LoggingResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
-		
+
 		next.ServeHTTP(wrapped, r)
-		
+
 		duration := time.Since(start)
-		
+
 		slog.InfoContext(r.Context(),
 			"http_request",
 			slog.String("request_id", requestID),

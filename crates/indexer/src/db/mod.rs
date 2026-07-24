@@ -52,10 +52,9 @@ pub async fn insert_event(pool: &PgPool, event: &SorobanEvent) -> Result<(), Tri
     };
     let topics = serde_json::to_value(&event.topics)
         .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("topics serialise")))?;
-    let ledger_ts: DateTime<Utc> = event
-        .ledger_timestamp
-        .parse()
-        .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("ledger timestamp parse")))?;
+    let ledger_ts: DateTime<Utc> = event.ledger_timestamp.parse().map_err(|e| {
+        TridentError::storage(anyhow::Error::new(e).context("ledger timestamp parse"))
+    })?;
 
     sqlx::query(
         r#"
@@ -117,9 +116,9 @@ pub async fn insert_ledger_metadata(
     ledger_timestamp: &str,
     event_count: i32,
 ) -> Result<(), TridentError> {
-    let ts: DateTime<Utc> = ledger_timestamp
-        .parse()
-        .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("ledger timestamp parse")))?;
+    let ts: DateTime<Utc> = ledger_timestamp.parse().map_err(|e| {
+        TridentError::storage(anyhow::Error::new(e).context("ledger timestamp parse"))
+    })?;
 
     sqlx::query(
         r#"

@@ -83,15 +83,15 @@ impl RpcClient {
             .await
             .map_err(|e| TridentError::rpc(anyhow::Error::new(e).context("HTTP request failed")))?;
 
-        let body: JsonRpcResponse<GetEventsResult> = resp
-            .json()
-            .await
-            .map_err(|e| TridentError::rpc(anyhow::Error::new(e).context("Failed to decode RPC response")))?;
+        let body: JsonRpcResponse<GetEventsResult> = resp.json().await.map_err(|e| {
+            TridentError::rpc(anyhow::Error::new(e).context("Failed to decode RPC response"))
+        })?;
 
         if let Some(err) = body.error {
             return Err(TridentError::rpc(anyhow::anyhow!(
                 "RPC error {}: {}",
-                err.code, err.message
+                err.code,
+                err.message
             )));
         }
 

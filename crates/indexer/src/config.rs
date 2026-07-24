@@ -62,7 +62,8 @@ impl Config {
             )));
         }
         let lag_high_watermark = parse_bounded_u64("LAG_HIGH_WATERMARK", 100, 1, 100_000_000)?;
-        let poll_hysteresis_ledgers = parse_bounded_u64("POLL_HYSTERESIS_LEDGERS", 10, 0, 1_000_000)?;
+        let poll_hysteresis_ledgers =
+            parse_bounded_u64("POLL_HYSTERESIS_LEDGERS", 10, 0, 1_000_000)?;
 
         let index_diagnostic = std::env::var("INDEX_DIAGNOSTIC")
             .map(|v| v.eq_ignore_ascii_case("true"))
@@ -139,11 +140,9 @@ fn parse_bounded_u64(key: &str, default: u64, min: u64, max: u64) -> Result<u64,
 fn parse_pool_size(key: &str, default: u32) -> Result<u32, TridentError> {
     match std::env::var(key) {
         Err(_) => Ok(default),
-        Ok(raw) => {
-            raw.parse::<u32>().ok().filter(|&n| n > 0).ok_or_else(|| {
-                TridentError::config(anyhow::anyhow!("{key} must be a positive integer"))
-            })
-        }
+        Ok(raw) => raw.parse::<u32>().ok().filter(|&n| n > 0).ok_or_else(|| {
+            TridentError::config(anyhow::anyhow!("{key} must be a positive integer"))
+        }),
     }
 }
 

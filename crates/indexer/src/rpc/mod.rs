@@ -137,17 +137,19 @@ impl RpcClient {
             .json(&req)
             .send()
             .await
-            .map_err(|e| TridentError::rpc(anyhow::Error::new(e).context("getLedgers HTTP failed")))?;
+            .map_err(|e| {
+                TridentError::rpc(anyhow::Error::new(e).context("getLedgers HTTP failed"))
+            })?;
 
-        let body: JsonRpcResponse<GetLedgersResult> = resp
-            .json()
-            .await
-            .map_err(|e| TridentError::rpc(anyhow::Error::new(e).context("getLedgers decode failed")))?;
+        let body: JsonRpcResponse<GetLedgersResult> = resp.json().await.map_err(|e| {
+            TridentError::rpc(anyhow::Error::new(e).context("getLedgers decode failed"))
+        })?;
 
         if let Some(err) = body.error {
             return Err(TridentError::rpc(anyhow::anyhow!(
                 "getLedgers RPC error {}: {}",
-                err.code, err.message
+                err.code,
+                err.message
             )));
         }
 
@@ -194,15 +196,15 @@ impl RpcClient {
             .await
             .map_err(|e| TridentError::rpc(anyhow::Error::new(e).context("HTTP request failed")))?;
 
-        let body: JsonRpcResponse<GetEventsResult> = resp
-            .json()
-            .await
-            .map_err(|e| TridentError::rpc(anyhow::Error::new(e).context("Failed to decode RPC response")))?;
+        let body: JsonRpcResponse<GetEventsResult> = resp.json().await.map_err(|e| {
+            TridentError::rpc(anyhow::Error::new(e).context("Failed to decode RPC response"))
+        })?;
 
         if let Some(err) = body.error {
             return Err(TridentError::rpc(anyhow::anyhow!(
                 "RPC error {}: {}",
-                err.code, err.message
+                err.code,
+                err.message
             )));
         }
 
