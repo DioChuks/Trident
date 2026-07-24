@@ -18,14 +18,14 @@ use uuid::Uuid;
 /// See docs/deployment.md (issue #87).
 pub async fn connect_pool(database_url: &str, pool_size: u32) -> Result<PgPool, TridentError> {
     let connect_options = PgConnectOptions::from_str(database_url)
-        .map_err(|e| TridentError::ConfigError(format!("invalid DATABASE_URL: {e}")))?
+        .map_err(|e| TridentError::config(anyhow::Error::new(e).context("invalid DATABASE_URL")))?
         .statement_cache_capacity(0);
 
     PgPoolOptions::new()
         .max_connections(pool_size)
         .connect_with(connect_options)
         .await
-        .map_err(|e| TridentError::StorageError(format!("connect_pool: {e}")))
+        .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("connect_pool")))
 }
 
 // Stable namespace for deterministic event UUIDs (UUIDv5).
@@ -51,11 +51,11 @@ pub async fn insert_event(pool: &PgPool, event: &SorobanEvent) -> Result<(), Tri
         EventType::Diagnostic => "diagnostic",
     };
     let topics = serde_json::to_value(&event.topics)
-        .map_err(|e| TridentError::StorageError(format!("topics serialise: {e}")))?;
+        .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("topics serialise")))?;
     let ledger_ts: DateTime<Utc> = event
         .ledger_timestamp
         .parse()
-        .map_err(|e| TridentError::StorageError(format!("ledger timestamp parse: {e}")))?;
+        .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("ledger timestamp parse")))?;
 
     sqlx::query(
         r#"
@@ -77,7 +77,7 @@ pub async fn insert_event(pool: &PgPool, event: &SorobanEvent) -> Result<(), Tri
     .bind(&event.data)
     .execute(pool)
     .await
-    .map_err(|e| TridentError::StorageError(format!("insert_event: {e}")))?;
+    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("insert_event")))?;
 
     Ok(())
 }
@@ -88,11 +88,11 @@ pub async fn get_cursor(pool: &PgPool) -> Result<u64, TridentError> {
         sqlx::query_as("SELECT value FROM system_state WHERE key = 'latest_ledger_cursor'")
             .fetch_one(pool)
             .await
-            .map_err(|e| TridentError::StorageError(format!("get_cursor: {e}")))?;
+            .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("get_cursor")))?;
 
     row.0
         .parse::<u64>()
-        .map_err(|e| TridentError::StorageError(format!("cursor parse: {e}")))
+        .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("cursor parse")))
 }
 
 /// Persist the latest processed ledger sequence so the streamer can resume
@@ -104,7 +104,7 @@ pub async fn set_cursor(pool: &PgPool, ledger: u64) -> Result<(), TridentError> 
     .bind(ledger.to_string())
     .execute(pool)
     .await
-    .map_err(|e| TridentError::StorageError(format!("set_cursor: {e}")))?;
+    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("set_cursor")))?;
 
     Ok(())
 }
@@ -119,7 +119,7 @@ pub async fn insert_ledger_metadata(
 ) -> Result<(), TridentError> {
     let ts: DateTime<Utc> = ledger_timestamp
         .parse()
-        .map_err(|e| TridentError::StorageError(format!("ledger timestamp parse: {e}")))?;
+        .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("ledger timestamp parse")))?;
 
     sqlx::query(
         r#"
@@ -134,7 +134,7 @@ pub async fn insert_ledger_metadata(
     .bind(event_count)
     .execute(pool)
     .await
-    .map_err(|e| TridentError::StorageError(format!("insert_ledger_metadata: {e}")))?;
+    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("insert_ledger_metadata")))?;
 
     Ok(())
 }
@@ -170,7 +170,7 @@ pub async fn update_health_stats(
     .bind(poll_ms)
     .execute(pool)
     .await
-    .map_err(|e| TridentError::StorageError(format!("update_health_stats: {e}")))?;
+    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("update_health_stats")))?;
 
     Ok(())
 }
@@ -190,7 +190,7 @@ pub async fn load_indexed_contracts(
     .bind(network)
     .fetch_all(pool)
     .await
-    .map_err(|e| TridentError::StorageError(format!("load_indexed_contracts: {e}")))?;
+    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("load_indexed_contracts")))?;
 
     Ok(rows.into_iter().map(|(id,)| id).collect())
 }
@@ -202,7 +202,7 @@ pub async fn get_alert_state(pool: &PgPool) -> Result<crate::alerting::AlertStat
     )
     .fetch_one(pool)
     .await
-    .map_err(|e| TridentError::StorageError(format!("get_alert_state: {e}")))?;
+    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("get_alert_state")))?;
 
     Ok(crate::alerting::AlertState {
         last_alert_at: row.0,
@@ -228,7 +228,7 @@ pub async fn set_alert_state(
     .bind(state.alert_fired)
     .execute(pool)
     .await
-    .map_err(|e| TridentError::StorageError(format!("set_alert_state: {e}")))?;
+    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("set_alert_state")))?;
 
     Ok(())
 }
@@ -254,7 +254,7 @@ pub async fn insert_parse_error(
     .bind(error_message)
     .execute(pool)
     .await
-    .map_err(|e| TridentError::StorageError(format!("insert_parse_error: {e}")))?;
+    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("insert_parse_error")))?;
 
     Ok(())
 }

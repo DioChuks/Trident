@@ -17,11 +17,11 @@ pub async fn insert_event(pool: &PgPool, event: &SorobanEvent) -> Result<(), Tri
         trident_common::EventType::Diagnostic => "diagnostic",
     };
     let topics = serde_json::to_value(&event.topics)
-        .map_err(|e| TridentError::StorageError(format!("topics serialise: {e}")))?;
+        .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("topics serialise")))?;
     let ledger_ts: chrono::DateTime<chrono::Utc> = event
         .ledger_timestamp
         .parse()
-        .map_err(|e| TridentError::StorageError(format!("ledger timestamp parse: {e}")))?;
+        .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("ledger timestamp parse")))?;
 
     sqlx::query(
         r#"
@@ -43,7 +43,7 @@ pub async fn insert_event(pool: &PgPool, event: &SorobanEvent) -> Result<(), Tri
     .bind(&event.data)
     .execute(pool)
     .await
-    .map_err(|e| TridentError::StorageError(format!("insert_event: {e}")))?;
+    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("insert_event")))?;
 
     Ok(())
 }

@@ -14,7 +14,7 @@ impl Config {
         let grpc_addr = collect_required("GRPC_ADDR", &mut missing);
 
         if !missing.is_empty() {
-            return Err(TridentError::ConfigError(format!(
+            return Err(TridentError::config(anyhow::anyhow!(
                 "[trident-api] missing required env vars:\n{}",
                 missing.join("\n")
             )));

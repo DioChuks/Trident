@@ -70,7 +70,7 @@ impl Parser {
         let ledger_sequence: u64 = raw
             .ledger
             .parse()
-            .map_err(|_| TridentError::ParseError(format!("invalid ledger: {}", raw.ledger)))?;
+            .map_err(|_| TridentError::parse(anyhow::anyhow!("invalid ledger: {}", raw.ledger)))?;
 
         let event_index: u32 = raw
             .id
@@ -97,7 +97,7 @@ fn parse_event_type(raw: &str) -> Result<EventType, TridentError> {
         "contract" => Ok(EventType::Contract),
         "system" => Ok(EventType::System),
         "diagnostic" => Ok(EventType::Diagnostic),
-        other => Err(TridentError::ParseError(format!(
+        other => Err(TridentError::parse(anyhow::anyhow!(
             "unknown event type: {other}"
         ))),
     }
@@ -106,10 +106,10 @@ fn parse_event_type(raw: &str) -> Result<EventType, TridentError> {
 fn decode_scval(b64: &str) -> Result<ScVal, TridentError> {
     let bytes = STANDARD
         .decode(b64)
-        .map_err(|e| TridentError::ParseError(format!("base64 decode: {e}")))?;
+        .map_err(|e| TridentError::parse(anyhow::Error::new(e).context("base64 decode")))?;
     let mut cursor = std::io::Cursor::new(bytes);
     ScVal::read_xdr(&mut Limited::new(&mut cursor, Limits::none()))
-        .map_err(|e| TridentError::ParseError(format!("XDR decode ScVal: {e}")))
+        .map_err(|e| TridentError::parse(anyhow::Error::new(e).context("XDR decode ScVal")))
 }
 
 pub fn scval_to_string(val: &ScVal) -> String {

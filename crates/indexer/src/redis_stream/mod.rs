@@ -12,7 +12,7 @@ pub async fn publish_event(
     maxlen: u64,
 ) -> Result<(), TridentError> {
     let topics = serde_json::to_string(&event.topics)
-        .map_err(|e| TridentError::StorageError(format!("topics serialise: {e}")))?;
+        .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("topics serialise")))?;
     let data = event.data.to_string();
     let event_type = format!("{:?}", event.event_type).to_lowercase();
 
@@ -33,7 +33,7 @@ pub async fn publish_event(
             ],
         )
         .await
-        .map_err(|e| TridentError::StorageError(format!("redis xadd: {e}")))?;
+        .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("redis xadd")))?;
 
     Ok(())
 }

@@ -31,7 +31,7 @@ impl Config {
         let stellar_rpc_url = collect_required("STELLAR_RPC_URL", &mut missing);
 
         if !missing.is_empty() {
-            return Err(TridentError::ConfigError(format!(
+            return Err(TridentError::config(anyhow::anyhow!(
                 "[trident-indexer] missing required env vars:\n{}",
                 missing.join("\n")
             )));
@@ -93,12 +93,12 @@ fn parse_bounded_u64(key: &str, default: u64, min: u64, max: u64) -> Result<u64,
         Err(_) => Ok(default),
         Ok(raw) => {
             let v: u64 = raw.parse().map_err(|_| {
-                TridentError::ConfigError(format!(
+                TridentError::config(anyhow::anyhow!(
                     "[indexer] {key} must be a positive integer, got {raw:?}"
                 ))
             })?;
             if v < min || v > max {
-                return Err(TridentError::ConfigError(format!(
+                return Err(TridentError::config(anyhow::anyhow!(
                     "[indexer] {key} must be between {min} and {max}, got {v}"
                 )));
             }
@@ -115,7 +115,7 @@ fn parse_pool_size(key: &str, default: u32) -> Result<u32, TridentError> {
         Err(_) => Ok(default),
         Ok(raw) => {
             raw.parse::<u32>().ok().filter(|&n| n > 0).ok_or_else(|| {
-                TridentError::ConfigError(format!("{key} must be a positive integer"))
+                TridentError::config(anyhow::anyhow!("{key} must be a positive integer"))
             })
         }
     }

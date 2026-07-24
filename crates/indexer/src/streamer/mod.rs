@@ -22,7 +22,7 @@ use sqlx::PgPool;
 use tokio_retry::{strategy::ExponentialBackoff, Retry};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
-use trident_common::TridentError;
+use trident_common::{Severity, TridentError};
 
 use crate::{
     alerting::{AlertContext, Alerter},
@@ -151,9 +151,22 @@ impl Streamer {
                     }
                 }
                 Err(e) => {
-                    // Log but do not crash — the cursor is safe, next poll will retry.
                     metrics::record_poll_error();
-                    tracing::error!(error = %e, "Poll cycle failed, will retry next interval");
+                    // Branch on the structured classification: transient failures
+                    // are retried on the next interval (the cursor is safe), poison
+                    // input is skipped, and fatal errors halt the streamer.
+                    match e.severity() {
+                        Severity::Fatal => {
+                            tracing::error!(error = %e, "Fatal error, halting streamer");
+                            return Err(e);
+                        }
+                        Severity::Retryable => {
+                            tracing::warn!(error = %e, "Transient poll failure, will retry next interval");
+                        }
+                        Severity::Skip => {
+                            tracing::warn!(error = %e, "Non-retryable poll failure, skipping cycle");
+                        }
+                    }
                 }
             }
 

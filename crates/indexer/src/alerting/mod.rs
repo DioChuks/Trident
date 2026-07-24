@@ -93,7 +93,7 @@ impl Alerter {
                 reqwest::Client::builder()
                     .timeout(Duration::from_secs(WEBHOOK_TIMEOUT_SECS))
                     .build()
-                    .map_err(|e| TridentError::ConfigError(format!("alerting HTTP client: {e}")))?,
+                    .map_err(|e| TridentError::config(anyhow::Error::new(e).context("alerting HTTP client")))?,
             )
         } else {
             None
