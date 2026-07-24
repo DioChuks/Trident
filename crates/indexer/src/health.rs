@@ -1,5 +1,8 @@
-/// Minimal HTTP server providing /healthz (liveness), /readyz (readiness), and
-/// /metrics endpoints on a single port (#206, #218).
+/// Minimal HTTP server providing /healthz (liveness) and /readyz (readiness)
+/// endpoints on HEALTH_PORT (default 8080) (#206).
+///
+/// Prometheus /metrics are served separately by metrics-exporter-prometheus on
+/// METRICS_PORT (default 9090). This server handles only Kubernetes probes.
 ///
 /// The server runs in its own tokio task and is never intentionally stopped —
 /// the process exiting is the shutdown mechanism. This is intentional for an
@@ -18,7 +21,7 @@ pub async fn serve(addr: SocketAddr, db: PgPool, redis_url: String) {
             return;
         }
     };
-    tracing::info!("health/metrics server listening on {addr}");
+    tracing::info!("health server listening on {addr}");
 
     loop {
         let (stream, _) = match listener.accept().await {
@@ -67,7 +70,6 @@ async fn handle_conn(stream: tokio::net::TcpStream, db: PgPool, redis_url: Strin
             let (code, phrase, body) = readyz(&db, &redis_url).await;
             (code, phrase, "text/plain", body)
         }
-        "/metrics" => (200, "OK", "text/plain; version=0.0.4", crate::metrics::gather_text()),
         _ => (404, "Not Found", "text/plain", "not found\n".into()),
     };
 
@@ -112,7 +114,7 @@ async fn check_redis(redis_url: &str) -> bool {
     };
     match client.get_multiplexed_async_connection().await {
         Ok(mut conn) => redis::cmd("PING")
-            .query_async::<redis::Value>(&mut conn)
+            .query_async::<_, redis::Value>(&mut conn)
             .await
             .is_ok(),
         Err(_) => false,
