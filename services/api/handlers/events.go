@@ -50,7 +50,7 @@ func SetEventsClient(client gen.EventsClient) {
 // Returns 400 on any validation failure.
 func ListEvents(w http.ResponseWriter, r *http.Request) {
 	if eventsClient == nil {
-		httputil.WriteError(w, http.StatusServiceUnavailable, httputil.INTERNAL, "gRPC backend unavailable")
+		httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.INTERNAL, "gRPC backend unavailable")
 		return
 	}
 
@@ -64,7 +64,7 @@ func ListEvents(w http.ResponseWriter, r *http.Request) {
 		q.Get("event_type"),
 	)
 	if verr != nil {
-		httputil.WriteError(w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
+		httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
 		return
 	}
 
@@ -73,7 +73,7 @@ func ListEvents(w http.ResponseWriter, r *http.Request) {
 	if raw := q.Get("cursor"); raw != "" {
 		decoded, err := cursor.Decode(raw)
 		if err != nil {
-			httputil.WriteError(w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, "invalid cursor")
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, "invalid cursor")
 			return
 		}
 		pagingToken = decoded
@@ -107,7 +107,7 @@ func ListEvents(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		statusCode, code := httputil.GRPCToHTTP(err)
 		slog.ErrorContext(r.Context(), "grpc ListEvents failed", "err", err)
-		httputil.WriteError(w, statusCode, code, "failed to fetch events")
+		httputil.WriteErrorCtx(r.Context(), w, statusCode, code, "failed to fetch events")
 		return
 	}
 
@@ -137,13 +137,13 @@ func ListEvents(w http.ResponseWriter, r *http.Request) {
 // data exposure. Returns 400 when the format is invalid.
 func GetEvent(w http.ResponseWriter, r *http.Request) {
 	if eventsClient == nil {
-		httputil.WriteError(w, http.StatusServiceUnavailable, httputil.INTERNAL, "gRPC backend unavailable")
+		httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.INTERNAL, "gRPC backend unavailable")
 		return
 	}
 
 	id := r.PathValue("id")
 	if verr := validation.ValidateEventID(id); verr != nil {
-		httputil.WriteError(w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
+		httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
 		return
 	}
 
@@ -160,7 +160,7 @@ func GetEvent(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		statusCode, code := httputil.GRPCToHTTP(err)
 		slog.ErrorContext(r.Context(), "grpc GetEvent failed", "err", err)
-		httputil.WriteError(w, statusCode, code, "event not found")
+		httputil.WriteErrorCtx(r.Context(), w, statusCode, code, "event not found")
 		return
 	}
 

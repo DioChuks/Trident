@@ -137,17 +137,19 @@ impl RpcClient {
             .json(&req)
             .send()
             .await
-            .map_err(|e| TridentError::RpcError(format!("getLedgers HTTP failed: {e}")))?;
+            .map_err(|e| {
+                TridentError::rpc(anyhow::Error::new(e).context("getLedgers HTTP failed"))
+            })?;
 
-        let body: JsonRpcResponse<GetLedgersResult> = resp
-            .json()
-            .await
-            .map_err(|e| TridentError::RpcError(format!("getLedgers decode failed: {e}")))?;
+        let body: JsonRpcResponse<GetLedgersResult> = resp.json().await.map_err(|e| {
+            TridentError::rpc(anyhow::Error::new(e).context("getLedgers decode failed"))
+        })?;
 
         if let Some(err) = body.error {
-            return Err(TridentError::RpcError(format!(
+            return Err(TridentError::rpc(anyhow::anyhow!(
                 "getLedgers RPC error {}: {}",
-                err.code, err.message
+                err.code,
+                err.message
             )));
         }
 
@@ -192,23 +194,23 @@ impl RpcClient {
             .json(&req)
             .send()
             .await
-            .map_err(|e| TridentError::RpcError(format!("HTTP request failed: {e}")))?;
+            .map_err(|e| TridentError::rpc(anyhow::Error::new(e).context("HTTP request failed")))?;
 
-        let body: JsonRpcResponse<GetEventsResult> = resp
-            .json()
-            .await
-            .map_err(|e| TridentError::RpcError(format!("Failed to decode RPC response: {e}")))?;
+        let body: JsonRpcResponse<GetEventsResult> = resp.json().await.map_err(|e| {
+            TridentError::rpc(anyhow::Error::new(e).context("Failed to decode RPC response"))
+        })?;
 
         if let Some(err) = body.error {
-            return Err(TridentError::RpcError(format!(
+            return Err(TridentError::rpc(anyhow::anyhow!(
                 "RPC error {}: {}",
-                err.code, err.message
+                err.code,
+                err.message
             )));
         }
 
         let result = body
             .result
-            .ok_or_else(|| TridentError::RpcError("Empty result in RPC response".into()))?;
+            .ok_or_else(|| TridentError::rpc(anyhow::anyhow!("Empty result in RPC response")))?;
 
         Ok(EventsPage {
             events: result.events,

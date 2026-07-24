@@ -30,13 +30,13 @@ func Stream(rdb streamRedisClient) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		contractID := r.URL.Query().Get("contractId")
 		if contractID == "" {
-			httputil.WriteError(w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, "contractId is required")
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, "contractId is required")
 			return
 		}
 
 		flusher, ok := w.(http.Flusher)
 		if !ok {
-			httputil.WriteError(w, http.StatusInternalServerError, httputil.INTERNAL, "streaming is not supported")
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "streaming is not supported")
 			return
 		}
 
@@ -46,7 +46,7 @@ func Stream(rdb streamRedisClient) http.HandlerFunc {
 				return
 			}
 			slog.Error("sse: failed to read Redis Stream tail", "err", err)
-			httputil.WriteError(w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "event stream is unavailable")
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "event stream is unavailable")
 			return
 		}
 

@@ -1,24 +1,27 @@
 package middleware
 
 import (
-	"context"
 	"log/slog"
 	"net/http"
 	"time"
 
+	"github.com/Depo-dev/trident/services/api/internal/httputil"
 	"github.com/google/uuid"
 )
 
 const RequestIDHeader = "X-Request-ID"
 
-const RequestIDCtxKey contextKey = "request_id"
-
-// RequestID middleware attaches a UUID to the request context and response header
+// RequestID middleware accepts a valid incoming X-Request-Id (so a caller can
+// correlate a request end-to-end) or generates a UUID when absent/invalid,
+// attaches it to the request context, and echoes it on the response header.
 func RequestID(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		id := uuid.New().String()
+		id := r.Header.Get(RequestIDHeader)
+		if !httputil.ValidRequestID(id) {
+			id = uuid.New().String()
+		}
 		w.Header().Set(RequestIDHeader, id)
-		ctx := context.WithValue(r.Context(), RequestIDCtxKey, id)
+		ctx := httputil.ContextWithRequestID(r.Context(), id)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
@@ -38,20 +41,17 @@ func (w *LoggingResponseWriter) WriteHeader(code int) {
 func StructuredLogging(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		
-		// Get request ID from context
-		requestID := ""
-		if id, ok := r.Context().Value(RequestIDCtxKey).(string); ok {
-			requestID = id
-		}
+
+		// Get request ID from context (set by the RequestID middleware).
+		requestID := httputil.RequestIDFromContext(r.Context())
 
 		// Wrap response writer to capture status code
 		wrapped := &LoggingResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
-		
+
 		next.ServeHTTP(wrapped, r)
-		
+
 		duration := time.Since(start)
-		
+
 		slog.InfoContext(r.Context(),
 			"http_request",
 			slog.String("request_id", requestID),

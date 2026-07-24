@@ -9,6 +9,14 @@ pub struct Config {
     pub stellar_rpc_url: String,
     pub network: String,
     pub poll_interval: Duration,
+    /// Shortest adaptive poll interval, applied when lag >= `lag_high_watermark`.
+    pub poll_interval_floor: Duration,
+    /// Longest adaptive poll interval, applied when the indexer is caught up.
+    pub poll_interval_ceiling: Duration,
+    /// Lag (ledgers) at or above which the floor interval applies.
+    pub lag_high_watermark: u64,
+    /// Hysteresis deadband (ledgers) suppressing interval churn on lag jitter.
+    pub poll_hysteresis_ledgers: u64,
     pub index_diagnostic: bool,
     pub max_events_per_poll: u32,
     pub redis_stream_maxlen: u64,
@@ -31,7 +39,7 @@ impl Config {
         let stellar_rpc_url = collect_required("STELLAR_RPC_URL", &mut missing);
 
         if !missing.is_empty() {
-            return Err(TridentError::ConfigError(format!(
+            return Err(TridentError::config(anyhow::anyhow!(
                 "[trident-indexer] missing required env vars:\n{}",
                 missing.join("\n")
             )));
@@ -41,6 +49,21 @@ impl Config {
 
         let poll_interval_ms = parse_bounded_u64("POLL_INTERVAL_MS", 1000, 100, 60_000)?;
         let max_events_per_poll = parse_bounded_u64("MAX_EVENTS_PER_POLL", 200, 1, 10_000)?;
+
+        // Adaptive poll interval bounds (issue #198). Defaults: poll every 250ms
+        // while far behind, back off to 5s once caught up, cross over at 100
+        // ledgers of lag, with a 10-ledger hysteresis deadband.
+        let poll_interval_floor_ms = parse_bounded_u64("POLL_INTERVAL_FLOOR_MS", 250, 50, 60_000)?;
+        let poll_interval_ceiling_ms =
+            parse_bounded_u64("POLL_INTERVAL_CEILING_MS", 5000, 100, 600_000)?;
+        if poll_interval_ceiling_ms <= poll_interval_floor_ms {
+            return Err(TridentError::config(anyhow::anyhow!(
+                "[indexer] POLL_INTERVAL_CEILING_MS ({poll_interval_ceiling_ms}) must exceed POLL_INTERVAL_FLOOR_MS ({poll_interval_floor_ms})"
+            )));
+        }
+        let lag_high_watermark = parse_bounded_u64("LAG_HIGH_WATERMARK", 100, 1, 100_000_000)?;
+        let poll_hysteresis_ledgers =
+            parse_bounded_u64("POLL_HYSTERESIS_LEDGERS", 10, 0, 1_000_000)?;
 
         let index_diagnostic = std::env::var("INDEX_DIAGNOSTIC")
             .map(|v| v.eq_ignore_ascii_case("true"))
@@ -59,6 +82,10 @@ impl Config {
             stellar_rpc_url: stellar_rpc_url.unwrap(),
             network,
             poll_interval: Duration::from_millis(poll_interval_ms),
+            poll_interval_floor: Duration::from_millis(poll_interval_floor_ms),
+            poll_interval_ceiling: Duration::from_millis(poll_interval_ceiling_ms),
+            lag_high_watermark,
+            poll_hysteresis_ledgers,
             index_diagnostic,
             max_events_per_poll: max_events_per_poll as u32,
             redis_stream_maxlen: std::env::var("REDIS_STREAM_MAXLEN")
@@ -93,12 +120,12 @@ fn parse_bounded_u64(key: &str, default: u64, min: u64, max: u64) -> Result<u64,
         Err(_) => Ok(default),
         Ok(raw) => {
             let v: u64 = raw.parse().map_err(|_| {
-                TridentError::ConfigError(format!(
+                TridentError::config(anyhow::anyhow!(
                     "[indexer] {key} must be a positive integer, got {raw:?}"
                 ))
             })?;
             if v < min || v > max {
-                return Err(TridentError::ConfigError(format!(
+                return Err(TridentError::config(anyhow::anyhow!(
                     "[indexer] {key} must be between {min} and {max}, got {v}"
                 )));
             }
@@ -113,11 +140,9 @@ fn parse_bounded_u64(key: &str, default: u64, min: u64, max: u64) -> Result<u64,
 fn parse_pool_size(key: &str, default: u32) -> Result<u32, TridentError> {
     match std::env::var(key) {
         Err(_) => Ok(default),
-        Ok(raw) => {
-            raw.parse::<u32>().ok().filter(|&n| n > 0).ok_or_else(|| {
-                TridentError::ConfigError(format!("{key} must be a positive integer"))
-            })
-        }
+        Ok(raw) => raw.parse::<u32>().ok().filter(|&n| n > 0).ok_or_else(|| {
+            TridentError::config(anyhow::anyhow!("{key} must be a positive integer"))
+        }),
     }
 }
 

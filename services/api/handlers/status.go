@@ -16,12 +16,12 @@ var processStartTime = time.Now()
 
 // StatusResponse is the JSON response for GET /internal/status.
 type StatusResponse struct {
-	IndexerLagLedgers  int64 `json:"indexer_lag_ledgers"`
-	ActiveWSClients    int   `json:"active_ws_clients"`
-	RedisStreamDepth   int64 `json:"redis_stream_depth"`
-	DBPoolOpenConns    int32 `json:"db_pool_open_conns"`
-	ParseErrors24h     int64 `json:"parse_errors_24h"`
-	UptimeSeconds      int64 `json:"uptime_seconds"`
+	IndexerLagLedgers int64 `json:"indexer_lag_ledgers"`
+	ActiveWSClients   int   `json:"active_ws_clients"`
+	RedisStreamDepth  int64 `json:"redis_stream_depth"`
+	DBPoolOpenConns   int32 `json:"db_pool_open_conns"`
+	ParseErrors24h    int64 `json:"parse_errors_24h"`
+	UptimeSeconds     int64 `json:"uptime_seconds"`
 }
 
 // internalStatusDeps wraps dependencies for the status handler.
@@ -56,12 +56,12 @@ func InternalStatus() http.HandlerFunc {
 		// Check X-Internal-Key header.
 		expectedKey := os.Getenv("INTERNAL_API_KEY")
 		if expectedKey == "" {
-			httputil.WriteError(w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "INTERNAL_API_KEY not configured")
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "INTERNAL_API_KEY not configured")
 			return
 		}
 		providedKey := r.Header.Get("X-Internal-Key")
 		if providedKey != expectedKey {
-			httputil.WriteError(w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "invalid X-Internal-Key")
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "invalid X-Internal-Key")
 			return
 		}
 

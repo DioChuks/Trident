@@ -1,20 +1,176 @@
 use thiserror::Error;
 
+/// Structured error taxonomy for the indexer and related services.
+///
+/// Each variant carries its underlying `#[source]` error (preserving the full
+/// error chain for logs — no lossy `to_string()`) plus optional context such as
+/// the ledger being processed. The [`TridentError::retryable`] and
+/// [`TridentError::severity`] classifiers let the streamer decide whether a
+/// failure should be retried, the offending item skipped, or the process
+/// halted.
 #[derive(Debug, Error)]
 pub enum TridentError {
     /// Failure communicating with or parsing a response from Stellar RPC.
-    #[error("RPC error: {0}")]
-    RpcError(String),
+    /// Typically transient (timeouts, resets, 5xx) and therefore retryable.
+    #[error("RPC error{}: {source}", .ledger.map(|l| format!(" at ledger {l}")).unwrap_or_default())]
+    RpcError {
+        #[source]
+        source: anyhow::Error,
+        /// The ledger sequence being fetched when the failure occurred, if known.
+        ledger: Option<u64>,
+    },
 
-    /// Failure decoding or normalising raw XDR event data.
-    #[error("Parse error: {0}")]
-    ParseError(String),
+    /// Failure decoding or normalising raw XDR event data. A poison message —
+    /// retrying will not help, so the item is skipped.
+    #[error("Parse error: {source}")]
+    ParseError {
+        #[source]
+        source: anyhow::Error,
+    },
 
-    /// Failure reading from or writing to PostgreSQL or Redis.
-    #[error("Storage error: {0}")]
-    StorageError(String),
+    /// Failure reading from or writing to PostgreSQL or Redis. Connection-level
+    /// failures are transient and retryable.
+    #[error("Storage error: {source}")]
+    StorageError {
+        #[source]
+        source: anyhow::Error,
+    },
 
-    /// Missing or invalid configuration value.
-    #[error("Config error: {0}")]
-    ConfigError(String),
+    /// Missing or invalid configuration value. Fatal — the process cannot make
+    /// progress and should halt.
+    #[error("Config error: {source}")]
+    ConfigError {
+        #[source]
+        source: anyhow::Error,
+    },
+}
+
+/// How a failure should be handled by a processing loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Severity {
+    /// Transient — retry the operation.
+    Retryable,
+    /// Poison input — skip this item and continue.
+    Skip,
+    /// Unrecoverable — halt the process.
+    Fatal,
+}
+
+impl TridentError {
+    /// Construct an [`RpcError`](TridentError::RpcError) without ledger context.
+    pub fn rpc(source: impl Into<anyhow::Error>) -> Self {
+        TridentError::RpcError {
+            source: source.into(),
+            ledger: None,
+        }
+    }
+
+    /// Construct an [`RpcError`](TridentError::RpcError) tagged with the ledger
+    /// being processed when the failure occurred.
+    pub fn rpc_at(source: impl Into<anyhow::Error>, ledger: u64) -> Self {
+        TridentError::RpcError {
+            source: source.into(),
+            ledger: Some(ledger),
+        }
+    }
+
+    /// Construct a [`ParseError`](TridentError::ParseError).
+    pub fn parse(source: impl Into<anyhow::Error>) -> Self {
+        TridentError::ParseError {
+            source: source.into(),
+        }
+    }
+
+    /// Construct a [`StorageError`](TridentError::StorageError).
+    pub fn storage(source: impl Into<anyhow::Error>) -> Self {
+        TridentError::StorageError {
+            source: source.into(),
+        }
+    }
+
+    /// Construct a [`ConfigError`](TridentError::ConfigError).
+    pub fn config(source: impl Into<anyhow::Error>) -> Self {
+        TridentError::ConfigError {
+            source: source.into(),
+        }
+    }
+
+    /// Classify how a processing loop should react to this error.
+    pub fn severity(&self) -> Severity {
+        match self {
+            // Transient infrastructure failures — retrying may succeed.
+            TridentError::RpcError { .. } | TridentError::StorageError { .. } => {
+                Severity::Retryable
+            }
+            // Malformed input — retrying is pointless; skip the item.
+            TridentError::ParseError { .. } => Severity::Skip,
+            // Misconfiguration — cannot make progress; halt.
+            TridentError::ConfigError { .. } => Severity::Fatal,
+        }
+    }
+
+    /// Whether the failing operation should be retried. Connection resets and
+    /// timeouts (RPC/storage) are retryable; schema/decoding and config errors
+    /// are not.
+    pub fn retryable(&self) -> bool {
+        self.severity() == Severity::Retryable
+    }
+
+    /// Whether this error is fatal and the process should halt.
+    pub fn fatal(&self) -> bool {
+        self.severity() == Severity::Fatal
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rpc_errors_are_retryable() {
+        let err = TridentError::rpc(anyhow::anyhow!("connection reset"));
+        assert_eq!(err.severity(), Severity::Retryable);
+        assert!(err.retryable());
+        assert!(!err.fatal());
+    }
+
+    #[test]
+    fn storage_errors_are_retryable() {
+        let err = TridentError::storage(anyhow::anyhow!("pool timeout"));
+        assert_eq!(err.severity(), Severity::Retryable);
+        assert!(err.retryable());
+    }
+
+    #[test]
+    fn parse_errors_are_skipped_not_retried() {
+        let err = TridentError::parse(anyhow::anyhow!("bad XDR"));
+        assert_eq!(err.severity(), Severity::Skip);
+        assert!(!err.retryable());
+        assert!(!err.fatal());
+    }
+
+    #[test]
+    fn config_errors_are_fatal() {
+        let err = TridentError::config(anyhow::anyhow!("missing DATABASE_URL"));
+        assert_eq!(err.severity(), Severity::Fatal);
+        assert!(err.fatal());
+        assert!(!err.retryable());
+    }
+
+    #[test]
+    fn source_chain_is_preserved() {
+        use std::error::Error;
+        let root = std::io::Error::new(std::io::ErrorKind::TimedOut, "socket timeout");
+        let err = TridentError::storage(anyhow::Error::new(root).context("insert_event"));
+        // The #[source] chain is intact — no lossy stringify.
+        let src = err.source().expect("source present");
+        assert!(src.to_string().contains("insert_event"));
+    }
+
+    #[test]
+    fn rpc_error_carries_ledger_context() {
+        let err = TridentError::rpc_at(anyhow::anyhow!("504"), 12345);
+        assert!(err.to_string().contains("ledger 12345"));
+        assert!(err.retryable());
+    }
 }

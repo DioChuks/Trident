@@ -3884,6 +3884,7 @@ dependencies = [
 name = "trident-api"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "chrono",
  "opentelemetry",
  "opentelemetry-otlp",
@@ -3908,6 +3909,7 @@ dependencies = [
 name = "trident-backfill"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "base64 0.22.1",
  "chrono",
  "clap",
@@ -3931,6 +3933,7 @@ dependencies = [
 name = "trident-common"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "chrono",
  "serde",
  "serde_json",
@@ -3943,6 +3946,7 @@ dependencies = [
 name = "trident-indexer"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "base64 0.22.1",
  "chrono",
  "console-subscriber",

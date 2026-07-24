@@ -12,6 +12,7 @@ tokio-console = ["dep:console-subscriber"]
 
 [dependencies]
 trident-common = { path = "../common" }
+anyhow = "1"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

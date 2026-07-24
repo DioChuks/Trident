@@ -159,10 +159,15 @@ func main() {
 		adminCfg.StatsFunc = newPgbouncerStats(adminURL)
 	}
 
+	// Shared tier cache so an admin tier change (PATCH /v1/api-keys/{id}) can
+	// evict the stale entry immediately instead of waiting for the TTL (#229).
+	tierCache := middleware.NewTierCache()
+
 	apiKeyCfg := handlers.APIKeyConfig{
-		AdminKey: os.Getenv("ADMIN_API_KEY"),
-		DB:       pool,
-		Redis:    redisClient,
+		AdminKey:       os.Getenv("ADMIN_API_KEY"),
+		DB:             pool,
+		Redis:          redisClient,
+		InvalidateTier: tierCache.Invalidate,
 	}
 
 	webhookDB, err := newDB()
@@ -210,7 +215,7 @@ func main() {
 	if pool != nil {
 		rlDB = pool
 	}
-	rlCfg := middleware.RateLimitConfig{Redis: redisClient, DB: rlDB}
+	rlCfg := middleware.RateLimitConfig{Redis: redisClient, DB: rlDB, Cache: tierCache}
 
 	// DB-backed auth middleware with Redis caching and env-var fallback.
 	var authDB middleware.DBAuthConfig
@@ -219,13 +224,18 @@ func main() {
 	}
 	authDB.Redis = redisClient
 
-	handler := middleware.Chain(mux, middleware.StructuredLogging, middleware.RequestID)
-	handler = middleware.TieredRateLimit(rlCfg)(handler)
+	handler := middleware.TieredRateLimit(rlCfg)(mux)
 	if auditWriter != nil {
 		handler = middleware.AuditMiddleware(auditWriter)(handler)
 	}
 	handler = middleware.NewDBAuth(authDB)(handler)
 	handler = middleware.NewCORSFromEnv()(middleware.NewTimeoutFromEnv()(handler))
+	// RequestID + StructuredLogging are outermost so every response — including
+	// auth and rate-limit rejections — is assigned a request id, echoes it on
+	// X-Request-ID, and is captured in structured logs (issue #226). RequestID
+	// must precede StructuredLogging so the id is in context when the log line
+	// is emitted.
+	handler = middleware.Chain(handler, middleware.RequestID, middleware.StructuredLogging)
 
 	// Opt-in, internal-only pprof server (off unless PPROF_ENABLED=true). It is
 	// never mounted on the public mux above (#299).
