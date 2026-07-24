@@ -57,7 +57,7 @@ impl Config {
         let poll_interval_ceiling_ms =
             parse_bounded_u64("POLL_INTERVAL_CEILING_MS", 5000, 100, 600_000)?;
         if poll_interval_ceiling_ms <= poll_interval_floor_ms {
-            return Err(TridentError::ConfigError(format!(
+            return Err(TridentError::config(anyhow::anyhow!(
                 "[indexer] POLL_INTERVAL_CEILING_MS ({poll_interval_ceiling_ms}) must exceed POLL_INTERVAL_FLOOR_MS ({poll_interval_floor_ms})"
             )));
         }
