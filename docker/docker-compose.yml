@@ -1,5 +1,3 @@
-version: "3.9"
-
 # Production compose — runs all four services.
 # All secrets are passed via environment variables; never hardcode values here.
 
@@ -27,40 +25,111 @@ services:
     command: redis-server --appendonly yes
     restart: unless-stopped
 
+  # ---------------------------------------------------------------------------
+  # PgBouncer — transaction-mode connection pooler (issue #87)
+  #
+  # Every service connects here (pgbouncer:6432) instead of Postgres directly.
+  # PgBouncer multiplexes the many short-lived application connections over a
+  # small set of real Postgres connections, so Postgres never approaches its
+  # max_connections limit even with several Go API replicas.
+  #
+  # Transaction mode holds a server connection only for the duration of a
+  # transaction; idle client connections cost nothing. See docs/deployment.md
+  # for the prepared-statement / session-variable caveats this implies.
+  # ---------------------------------------------------------------------------
+  pgbouncer:
+    image: pgbouncer/pgbouncer:1.22
+    environment:
+      DATABASES_HOST: postgres
+      DATABASES_PORT: 5432
+      DATABASES_DBNAME: ${POSTGRES_DB}
+      DATABASES_USER: ${POSTGRES_USER}
+      DATABASES_PASSWORD: ${POSTGRES_PASSWORD}
+      PGBOUNCER_LISTEN_PORT: 6432
+      PGBOUNCER_AUTH_TYPE: scram-sha-256
+      PGBOUNCER_POOL_MODE: transaction
+      PGBOUNCER_MAX_CLIENT_CONN: 1000
+      # DEFAULT_POOL_SIZE must be >= the sum of every service's per-instance
+      # pool size times its replica count. With the defaults below
+      # (indexer 3 + gRPC API 10 + 3 Go API replicas * 5 = 28) a value of 20
+      # is the per-(user,db) ceiling PgBouncer keeps open to Postgres; raise it
+      # together with Postgres max_connections when scaling out.
+      PGBOUNCER_DEFAULT_POOL_SIZE: 20
+      PGBOUNCER_MIN_POOL_SIZE: 5
+      PGBOUNCER_SERVER_TLS_SSLMODE: prefer
+      # Allow the application user to read SHOW POOLS / SHOW STATS from the
+      # admin console (consumed by GET /v1/admin/db).
+      PGBOUNCER_ADMIN_USERS: ${POSTGRES_USER}
+      PGBOUNCER_STATS_USERS: ${POSTGRES_USER}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
   indexer:
     build:
-      context: ../crates/indexer
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: crates/indexer/Dockerfile
     environment:
-      DATABASE_URL: ${DATABASE_URL}
+      # Route through PgBouncer, never postgres:5432 directly.
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@pgbouncer:6432/${POSTGRES_DB}
+      INDEXER_DB_POOL_SIZE: ${INDEXER_DB_POOL_SIZE:-3}
       REDIS_URL: ${REDIS_URL}
       STELLAR_RPC_URL: ${STELLAR_RPC_URL}
       NETWORK: ${NETWORK}
       POLL_INTERVAL_MS: ${POLL_INTERVAL_MS}
       INDEX_DIAGNOSTIC: ${INDEX_DIAGNOSTIC}
+      METRICS_PORT: ${METRICS_PORT}
       LOG_LEVEL: ${LOG_LEVEL}
+    ports:
+      - "${METRICS_PORT}:${METRICS_PORT}"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${METRICS_PORT}/metrics"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
     depends_on:
-      postgres:
-        condition: service_healthy
+      pgbouncer:
+        condition: service_started
       redis:
         condition: service_started
     restart: unless-stopped
 
   api:
     build:
-      context: ../services/api
-      dockerfile: Dockerfile
+      # Root context: services/api/Dockerfile uses repo-root-relative COPY
+      # paths (COPY services/api/...), matching the standalone CI image build.
+      context: ..
+      dockerfile: services/api/Dockerfile
     environment:
-      DATABASE_URL: ${DATABASE_URL}
+      # Route through PgBouncer, never postgres:5432 directly.
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@pgbouncer:6432/${POSTGRES_DB}
+      GO_API_DB_POOL_SIZE: ${GO_API_DB_POOL_SIZE:-5}
+      # PgBouncer admin console — backs GET /v1/admin/db.
+      PGBOUNCER_ADMIN_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@pgbouncer:6432/pgbouncer
+      ADMIN_API_KEY: ${ADMIN_API_KEY}
       REDIS_URL: ${REDIS_URL}
       PORT: ${PORT}
       API_KEY_SALT: ${API_KEY_SALT}
+      API_KEY_HASHES: ${API_KEY_HASHES}
       LOG_LEVEL: ${LOG_LEVEL}
     ports:
       - "${PORT}:${PORT}"
+    # Probe the health endpoint we just implemented. wget is used instead of
+    # curl because it is available in the scratch/alpine base images without
+    # adding an extra layer. The 4-second timeout matches the handler's
+    # 3-second per-check timeout plus one second of slack.
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider",
+             "http://localhost:${PORT}/v1/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
     depends_on:
-      postgres:
-        condition: service_healthy
+      pgbouncer:
+        condition: service_started
       redis:
         condition: service_started
       indexer:

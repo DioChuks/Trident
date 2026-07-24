@@ -13,79 +13,47 @@ import (
 
 func hashKey(salt, key string) string {
 	mac := hmac.New(sha256.New, []byte(salt))
-	mac.Write([]byte(key))
+	_, _ = mac.Write([]byte(key))
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
-func okHandler(w http.ResponseWriter, _ *http.Request) {
-	w.WriteHeader(http.StatusOK)
-}
-
-func TestAPIKey_validKeyPasses(t *testing.T) {
-	const salt = "testsalt"
-	const key = "my-secret-key"
-
+func TestAPIKey(t *testing.T) {
+	const (
+		salt = "test-salt"
+		key  = "valid-key"
+	)
 	t.Setenv("API_KEY_SALT", salt)
 	t.Setenv("API_KEY_HASHES", hashKey(salt, key))
 
-	handler := middleware.APIKey(http.HandlerFunc(okHandler))
+	handler := middleware.APIKey(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/events", nil)
-	req.Header.Set("X-API-Key", key)
-	rec := httptest.NewRecorder()
-
-	handler.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", rec.Code)
+	tests := []struct {
+		name       string
+		path       string
+		key        string
+		wantStatus int
+	}{
+		{name: "valid protected request", path: "/v1/events/stream", key: key, wantStatus: http.StatusNoContent},
+		{name: "missing key", path: "/v1/events/stream", wantStatus: http.StatusUnauthorized},
+		{name: "invalid key", path: "/v1/events/stream", key: "wrong", wantStatus: http.StatusUnauthorized},
+		{name: "health is public", path: "/v1/health", wantStatus: http.StatusNoContent},
 	}
-}
 
-func TestAPIKey_missingHeader_returns401(t *testing.T) {
-	t.Setenv("API_KEY_SALT", "testsalt")
-	t.Setenv("API_KEY_HASHES", "somehash")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tt.path, nil)
+			if tt.key != "" {
+				req.Header.Set("X-API-Key", tt.key)
+			}
+			rec := httptest.NewRecorder()
 
-	handler := middleware.APIKey(http.HandlerFunc(okHandler))
+			handler.ServeHTTP(rec, req)
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/events", nil)
-	rec := httptest.NewRecorder()
-
-	handler.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401, got %d", rec.Code)
-	}
-}
-
-func TestAPIKey_invalidKey_returns401(t *testing.T) {
-	t.Setenv("API_KEY_SALT", "testsalt")
-	t.Setenv("API_KEY_HASHES", hashKey("testsalt", "correct-key"))
-
-	handler := middleware.APIKey(http.HandlerFunc(okHandler))
-
-	req := httptest.NewRequest(http.MethodGet, "/v1/events", nil)
-	req.Header.Set("X-API-Key", "wrong-key")
-	rec := httptest.NewRecorder()
-
-	handler.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401, got %d", rec.Code)
-	}
-}
-
-func TestAPIKey_healthSkipsAuth(t *testing.T) {
-	t.Setenv("API_KEY_SALT", "testsalt")
-	t.Setenv("API_KEY_HASHES", "") // no valid keys
-
-	handler := middleware.APIKey(http.HandlerFunc(okHandler))
-
-	req := httptest.NewRequest(http.MethodGet, "/v1/health", nil)
-	rec := httptest.NewRecorder()
-
-	handler.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200 on /v1/health without key, got %d", rec.Code)
+			if rec.Code != tt.wantStatus {
+				t.Fatalf("status: got %d, want %d", rec.Code, tt.wantStatus)
+			}
+		})
 	}
 }

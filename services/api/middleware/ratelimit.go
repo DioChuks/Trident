@@ -1,78 +1,245 @@
 package middleware
 
 import (
+	"context"
+	"fmt"
+	"log/slog"
+	"math"
 	"net/http"
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
+	"time"
 
-	"golang.org/x/time/rate"
+	"github.com/Depo-dev/trident/services/api/internal/httputil"
+	"github.com/jackc/pgx/v5"
+	"github.com/redis/go-redis/v9"
 )
 
-type rateLimitStore struct {
-	mu       sync.Mutex
-	limiters map[string]*rate.Limiter
-	rps      rate.Limit
-	burst    int
+// ---------------------------------------------------------------------------
+// Public types
+// ---------------------------------------------------------------------------
+
+// TierConfig defines the sliding-window rate limit for a single tier.
+type TierConfig struct {
+	RPS    int
+	Window time.Duration
 }
 
-func newRateLimitStore(rps rate.Limit, burst int) *rateLimitStore {
-	return &rateLimitStore{
-		limiters: make(map[string]*rate.Limiter),
-		rps:      rps,
-		burst:    burst,
+// TierDB can query the rate_limit_tier for an API key hash.
+type TierDB interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// RateLimitConfig configures TieredRateLimit.
+type RateLimitConfig struct {
+	Redis *redis.Client
+	DB    TierDB
+	Tiers map[string]TierConfig
+	// SliderFn overrides the Redis sliding window. Set in tests.
+	SliderFn func(ctx context.Context, key string, limit, windowMs int64) (allowed bool, count int64, err error)
+}
+
+// ---------------------------------------------------------------------------
+// Prometheus-compatible counters
+// ---------------------------------------------------------------------------
+
+var rlAllowed, rlRejected atomic.Int64
+
+// RateLimitMetrics returns (allowed, rejected) request counters since startup.
+func RateLimitMetrics() (allowed, rejected int64) {
+	return rlAllowed.Load(), rlRejected.Load()
+}
+
+// ---------------------------------------------------------------------------
+// Tier cache
+// ---------------------------------------------------------------------------
+
+type tierEntry struct {
+	tier string
+	exp  time.Time
+}
+
+type tierCache struct {
+	mu      sync.RWMutex
+	entries map[string]tierEntry
+}
+
+const tierCacheTTL = 5 * time.Minute
+
+func (tc *tierCache) get(hash string) (string, bool) {
+	tc.mu.RLock()
+	e, ok := tc.entries[hash]
+	tc.mu.RUnlock()
+	return e.tier, ok && time.Now().Before(e.exp)
+}
+
+func (tc *tierCache) set(hash, tier string) {
+	tc.mu.Lock()
+	tc.entries[hash] = tierEntry{tier: tier, exp: time.Now().Add(tierCacheTTL)}
+	tc.mu.Unlock()
+}
+
+func (tc *tierCache) resolve(ctx context.Context, apiKey string, db TierDB) string {
+	hash := hashKey(apiKey)
+	if t, ok := tc.get(hash); ok {
+		return t
 	}
-}
-
-func (s *rateLimitStore) get(key string) *rate.Limiter {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if lim, ok := s.limiters[key]; ok {
-		return lim
-	}
-
-	lim := rate.NewLimiter(s.rps, s.burst)
-	s.limiters[key] = lim
-	return lim
-}
-
-// RateLimit returns an HTTP middleware that enforces a per-API-key token bucket
-// limit.  Exceeding the limit returns 429 with a Retry-After: 1 header.
-//
-// Default limits (100 req/s, burst 200) are overridden by RATE_LIMIT_RPS and
-// RATE_LIMIT_BURST env vars.
-func RateLimit(next http.Handler) http.Handler {
-	rps := rate.Limit(100)
-	burst := 200
-
-	if v := os.Getenv("RATE_LIMIT_RPS"); v != "" {
-		if n, err := strconv.ParseFloat(v, 64); err == nil {
-			rps = rate.Limit(n)
+	tier := "free"
+	if db != nil {
+		ctx2, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+		defer cancel()
+		var t string
+		if err := db.QueryRow(ctx2,
+			`SELECT rate_limit_tier FROM api_keys WHERE key_hash = $1`, hash,
+		).Scan(&t); err == nil && t != "" {
+			tier = t
 		}
 	}
-	if v := os.Getenv("RATE_LIMIT_BURST"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			burst = n
+	tc.set(hash, tier)
+	return tier
+}
+
+// ---------------------------------------------------------------------------
+// Redis sliding-window Lua script
+// ---------------------------------------------------------------------------
+
+const slidingWindowLua = `
+local key   = KEYS[1]
+local now   = tonumber(ARGV[1])
+local wms   = tonumber(ARGV[2])
+local limit = tonumber(ARGV[3])
+redis.call('ZREMRANGEBYSCORE', key, 0, now - wms)
+local cnt = redis.call('ZCARD', key)
+if cnt >= limit then
+  return {0, cnt}
+end
+redis.call('ZADD', key, now, now .. ':' .. math.random(1, 2147483647))
+redis.call('EXPIRE', key, math.ceil(wms / 1000) + 1)
+return {1, cnt + 1}
+`
+
+func redisSlider(rc *redis.Client) func(ctx context.Context, key string, limit, windowMs int64) (bool, int64, error) {
+	return func(ctx context.Context, key string, limit, windowMs int64) (bool, int64, error) {
+		nowMs := time.Now().UnixMilli()
+		res, err := rc.Eval(ctx, slidingWindowLua, []string{key}, nowMs, windowMs, limit).Slice()
+		if err != nil {
+			return false, 0, fmt.Errorf("redis eval: %w", err)
+		}
+		return res[0].(int64) == 1, res[1].(int64), nil
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Default tier configuration
+// ---------------------------------------------------------------------------
+
+func defaultTiers() map[string]TierConfig {
+	w := time.Second
+	return map[string]TierConfig{
+		"free":     {RPS: envInt("RATE_LIMIT_FREE_RPS", 10), Window: w},
+		"pro":      {RPS: envInt("RATE_LIMIT_PRO_RPS", 100), Window: w},
+		"internal": {RPS: envInt("RATE_LIMIT_INTERNAL_RPS", 1000), Window: w},
+		"standard": {RPS: envInt("RATE_LIMIT_PRO_RPS", 100), Window: w},
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TieredRateLimit middleware
+// ---------------------------------------------------------------------------
+
+// TieredRateLimit enforces a Redis sliding-window rate limit per API key,
+// resolved to a tier via the database. Fails open on Redis errors.
+func TieredRateLimit(cfg RateLimitConfig) func(http.Handler) http.Handler {
+	if cfg.Tiers == nil {
+		cfg.Tiers = defaultTiers()
+	}
+	slide := cfg.SliderFn
+	if slide == nil {
+		if cfg.Redis != nil {
+			slide = redisSlider(cfg.Redis)
+		} else {
+			slide = func(_ context.Context, _ string, _, _ int64) (bool, int64, error) {
+				return true, 0, nil
+			}
 		}
 	}
+	tc := &tierCache{entries: map[string]tierEntry{}}
 
-	store := newRateLimitStore(rps, burst)
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			key := r.Header.Get("X-API-Key")
+			if key == "" {
+				next.ServeHTTP(w, r)
+				return
+			}
 
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		key := r.Header.Get("X-API-Key")
-		if key == "" {
-			// No key: the auth middleware will handle this; pass through here.
+			tier := tc.resolve(r.Context(), key, cfg.DB)
+			tcfg, ok := cfg.Tiers[tier]
+			if !ok {
+				tcfg = cfg.Tiers["free"]
+			}
+
+			redisKey := fmt.Sprintf("ratelimit:%s", hashKey(key))
+			windowMs := int64(tcfg.Window / time.Millisecond)
+			limit := int64(tcfg.RPS)
+
+			allowed, count, err := slide(r.Context(), redisKey, limit, windowMs)
+			if err != nil {
+				slog.Warn("rate limit check failed; failing open", "err", err)
+				rlAllowed.Add(1)
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			resetAt := time.Now().Add(tcfg.Window).Unix()
+			remaining := max(int64(0), limit-count)
+			w.Header().Set("X-RateLimit-Limit", strconv.FormatInt(limit, 10))
+			w.Header().Set("X-RateLimit-Remaining", strconv.FormatInt(remaining, 10))
+			w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(resetAt, 10))
+
+			if !allowed {
+				rlRejected.Add(1)
+				retryAfter := int64(math.Ceil(tcfg.Window.Seconds()))
+				w.Header().Set("Retry-After", strconv.FormatInt(retryAfter, 10))
+				httputil.WriteError(w, http.StatusTooManyRequests, httputil.RATE_LIMITED, "rate limit exceeded")
+				return
+			}
+
+			rlAllowed.Add(1)
 			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket connection limiter
+// ---------------------------------------------------------------------------
+
+var wsConns atomic.Int64
+
+// WSConnectionLimit rejects new WebSocket connections once active connections
+// exceed MAX_WS_CONNECTIONS (default 1000).
+func WSConnectionLimit(next http.Handler) http.Handler {
+	limit := int64(envInt("MAX_WS_CONNECTIONS", 1000))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := wsConns.Add(1)
+		defer wsConns.Add(-1)
+		if n > limit {
+			httputil.WriteError(w, http.StatusTooManyRequests, httputil.RATE_LIMITED, "too many WebSocket connections")
 			return
 		}
-
-		if !store.get(key).Allow() {
-			w.Header().Set("Retry-After", "1")
-			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
-			return
-		}
-
 		next.ServeHTTP(w, r)
 	})
+}
+
+// WSActiveConnections returns the current number of active WebSocket connections.
+func WSActiveConnections() int64 { return wsConns.Load() }
+
+func envInt(key string, def int) int {
+	if v, err := strconv.Atoi(os.Getenv(key)); err == nil {
+		return v
+	}
+	return def
 }

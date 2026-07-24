@@ -1,5 +1,8 @@
 -- Trident PostgreSQL Schema
--- Canonical definition. Migrations in ./migrations/ mirror this file incrementally.
+-- Convenience full-schema snapshot for local/dev bootstrap and documentation.
+-- The migration chain in ./migrations/ (0001-0009) is the source of truth and is
+-- what CI and production apply; this file must mirror the end state of that chain.
+-- Keep in sync whenever a migration is added.
 
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
@@ -15,6 +18,7 @@ CREATE TABLE IF NOT EXISTS soroban_events (
     transaction_hash    TEXT        NOT NULL,
     event_index         INTEGER     NOT NULL,
     event_type          TEXT        NOT NULL CHECK (event_type IN ('contract', 'system', 'diagnostic')),
+    network             TEXT        NOT NULL DEFAULT 'testnet',
     topics              JSONB       NOT NULL DEFAULT '[]',
     topic_0             TEXT        GENERATED ALWAYS AS (topics ->> 0) STORED,
     topic_1             TEXT        GENERATED ALWAYS AS (topics ->> 1) STORED,
@@ -22,30 +26,16 @@ CREATE TABLE IF NOT EXISTS soroban_events (
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Single-column indexes
-CREATE INDEX IF NOT EXISTS idx_soroban_events_contract_id       ON soroban_events (contract_id);
-CREATE INDEX IF NOT EXISTS idx_soroban_events_ledger_sequence   ON soroban_events (ledger_sequence);
-CREATE INDEX IF NOT EXISTS idx_soroban_events_ledger_timestamp  ON soroban_events (ledger_timestamp);
-CREATE INDEX IF NOT EXISTS idx_soroban_events_topic_0           ON soroban_events (topic_0);
-CREATE INDEX IF NOT EXISTS idx_soroban_events_topic_1           ON soroban_events (topic_1);
-
--- Composite index covering the most common query pattern: events for a
--- contract filtered by primary topic (e.g. all "transfer" events for token X)
-CREATE INDEX IF NOT EXISTS idx_soroban_events_contract_topic_0  ON soroban_events (contract_id, topic_0);
-
--- JSONB containment (`topics @> ...` / `data @> ...`) is intentionally NOT
--- indexed for the MVP. The API exposes topic filtering only through the
--- generated `topic_0`/`topic_1` columns (btree-indexed above); no handler
--- issues a `@>` containment query, so a GIN index would only add
--- write-amplification on this high-ingest table with no read benefit.
--- See docs/db/jsonb-index-strategy.md for the full decision + EXPLAIN evidence.
--- If arbitrary containment filters are added later, reintroduce:
---   CREATE INDEX idx_soroban_events_topics_gin ON soroban_events USING GIN (topics jsonb_path_ops);
-
--- Unique constraint: a given event position within a transaction is immutable
-ALTER TABLE soroban_events
-    ADD CONSTRAINT uq_soroban_events_tx_index
-    UNIQUE (transaction_hash, event_index);
+-- Indexes — canonical set produced by migrations 0004 and 0009.
+-- network isolation (0004)
+CREATE INDEX IF NOT EXISTS idx_soroban_events_network          ON soroban_events (network);
+CREATE INDEX IF NOT EXISTS idx_soroban_events_network_contract ON soroban_events (network, contract_id);
+-- high-cardinality query patterns (0009)
+CREATE INDEX IF NOT EXISTS idx_soroban_events_contract_ledger  ON soroban_events (contract_id, ledger_sequence DESC);
+CREATE INDEX IF NOT EXISTS idx_soroban_events_contract_topic0  ON soroban_events (contract_id, topic_0)
+    WHERE topic_0 IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_soroban_events_id_desc          ON soroban_events (id DESC);
+CREATE INDEX IF NOT EXISTS idx_soroban_events_ledger_timestamp ON soroban_events (ledger_timestamp DESC);
 
 -- ---------------------------------------------------------------------------
 -- system_state
@@ -53,9 +43,18 @@ ALTER TABLE soroban_events
 -- re-scanning from genesis.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS system_state (
-    key         TEXT PRIMARY KEY,
-    value       TEXT NOT NULL,
-    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    key                   TEXT PRIMARY KEY,
+    value                 TEXT        NOT NULL,
+    updated_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    -- indexer health columns (migration 0002)
+    last_poll_at          TIMESTAMPTZ,
+    last_ledger_indexed   BIGINT,
+    events_indexed_total  BIGINT      NOT NULL DEFAULT 0,
+    events_in_last_poll   INT         NOT NULL DEFAULT 0,
+    poll_duration_ms      INT         NOT NULL DEFAULT 0,
+    -- alerting state columns (migration 0003)
+    last_alert_at         TIMESTAMPTZ,
+    alert_fired           BOOLEAN     NOT NULL DEFAULT FALSE
 );
 
 -- Seed the cursor row so the indexer can always do an UPDATE rather than
@@ -95,3 +94,93 @@ CREATE TABLE IF NOT EXISTS ledger_metadata (
 );
 
 CREATE INDEX IF NOT EXISTS idx_ledger_metadata_timestamp ON ledger_metadata (ledger_timestamp);
+
+-- ---------------------------------------------------------------------------
+-- api_keys
+-- Canonical definition; mirrors migration 0005_api_keys.sql.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS api_keys (
+    id               UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    key_hash         TEXT        NOT NULL UNIQUE,   -- SHA-256 hex of full key
+    key_prefix       TEXT        NOT NULL,           -- first 16 chars of plaintext key (for display)
+    label            TEXT        NOT NULL DEFAULT '',
+    network          TEXT        NOT NULL DEFAULT 'mainnet',
+    rate_limit_tier  TEXT        NOT NULL DEFAULT 'standard',
+    created_by       TEXT,                           -- optional creator identifier
+    last_used_at     TIMESTAMPTZ,
+    request_count    BIGINT      NOT NULL DEFAULT 0,
+    revoked_at       TIMESTAMPTZ,                    -- NULL means active; set to revoke
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_api_keys_key_hash ON api_keys (key_hash);
+CREATE INDEX IF NOT EXISTS idx_api_keys_active ON api_keys (key_hash)
+    WHERE revoked_at IS NULL;
+
+-- ---------------------------------------------------------------------------
+-- audit_log
+-- Per-request audit trail for API key usage (migration 0006).
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS audit_log (
+    id           BIGSERIAL   PRIMARY KEY,
+    api_key_id   UUID        REFERENCES api_keys(id) ON DELETE SET NULL,
+    endpoint     TEXT        NOT NULL,
+    method       TEXT        NOT NULL,
+    ip           INET,
+    user_agent   TEXT,
+    status_code  INT         NOT NULL,
+    duration_ms  INT         NOT NULL,
+    result_count INT,
+    request_id   TEXT        NOT NULL,
+    network      TEXT,
+    ts           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_log_key_ts ON audit_log (api_key_id, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_log_ts     ON audit_log (ts DESC);
+
+-- ---------------------------------------------------------------------------
+-- parse_errors
+-- Audit trail for events that failed XDR decoding (migration 0008).
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS parse_errors (
+    id               UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    ledger_sequence  BIGINT      NOT NULL,
+    event_index      INT         NOT NULL,
+    raw_payload      TEXT        NOT NULL,
+    error_message    TEXT        NOT NULL,
+    occurred_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_parse_errors_occurred_at ON parse_errors (occurred_at DESC);
+
+-- ---------------------------------------------------------------------------
+-- webhook_subscriptions
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS webhook_subscriptions (
+    id           UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    api_key_id   UUID        NOT NULL REFERENCES api_keys(id) ON DELETE CASCADE,
+    contract_id  TEXT        NOT NULL,
+    topic0       TEXT,
+    target_url   TEXT        NOT NULL,
+    secret       TEXT        NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    paused_at    TIMESTAMPTZ,
+    network      TEXT        NOT NULL DEFAULT 'testnet'
+);
+
+CREATE TABLE IF NOT EXISTS webhook_deliveries (
+    id              BIGSERIAL   PRIMARY KEY,
+    subscription_id UUID        NOT NULL REFERENCES webhook_subscriptions(id) ON DELETE CASCADE,
+    event_id        UUID        NOT NULL REFERENCES soroban_events(id),
+    attempt         INT         NOT NULL DEFAULT 1,
+    status_code     INT,
+    response_body   TEXT,
+    delivered_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    success         BOOLEAN     NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_webhook_subscriptions_contract_id ON webhook_subscriptions (contract_id);
+CREATE INDEX IF NOT EXISTS idx_webhook_subscriptions_paused_at ON webhook_subscriptions (paused_at);
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_subscription_id ON webhook_deliveries (subscription_id);
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_delivered_at ON webhook_deliveries (delivered_at);

@@ -1,22 +1,70 @@
+use opentelemetry_otlp::WithExportConfig;
 use tokio_util::sync::CancellationToken;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::EnvFilter;
 
+mod alerting;
 mod config;
 mod db;
+mod metrics;
 mod parser;
 mod redis_stream;
 mod rpc;
 mod streamer;
 
+fn init_tracer() -> Option<opentelemetry_sdk::trace::Tracer> {
+    let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok()?;
+    let sampling_ratio = std::env::var("OTEL_SAMPLING_RATIO")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.1);
+
+    opentelemetry::global::set_text_map_propagator(
+        opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+    );
+
+    match opentelemetry_otlp::new_pipeline()
+        .tracing()
+        .with_exporter(
+            opentelemetry_otlp::new_exporter()
+                .tonic()
+                .with_endpoint(endpoint),
+        )
+        .with_trace_config(
+            opentelemetry_sdk::trace::Config::default()
+                .with_sampler(opentelemetry_sdk::trace::Sampler::TraceIdRatioBased(
+                    sampling_ratio,
+                ))
+                .with_resource(opentelemetry_sdk::Resource::new(vec![
+                    opentelemetry::KeyValue::new("service.name", "trident-indexer"),
+                ])),
+        )
+        .install_batch(opentelemetry_sdk::runtime::Tokio)
+    {
+        Ok(tracer) => Some(tracer),
+        Err(e) => {
+            eprintln!("Failed to initialise OpenTelemetry tracer: {e}");
+            None
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    init_tracing();
+    init_tracing(init_tracer());
 
     tracing::info!("Trident indexer starting");
 
-    let cfg = config::Config::from_env()?;
+    let cfg = config::Config::from_env().unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    });
 
-    let db_pool = sqlx::PgPool::connect(&cfg.database_url).await?;
-    tracing::info!("Database connected");
+    metrics::install(cfg.metrics_port)?;
+
+    let db_pool = db::connect_pool(&cfg.database_url, cfg.db_pool_size).await?;
+    tracing::info!(pool_size = cfg.db_pool_size, "Database connected via pool");
 
     let redis_client = redis::Client::open(cfg.redis_url.as_str())?;
     let redis_conn = redis_client.get_multiplexed_async_connection().await?;
@@ -50,7 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         shutdown_trigger.cancel();
     });
 
-    let mut s = streamer::Streamer::new(cfg, db_pool, redis_conn);
+    let mut s = streamer::Streamer::new(cfg, db_pool, redis_conn).await?;
     s.run(shutdown).await?;
 
     tracing::info!("Trident indexer stopped");
@@ -65,15 +113,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// built, and even then it stays off unless `TOKIO_CONSOLE_ENABLED=true`. The
 /// console server binds to `127.0.0.1:6669` by default (see console-subscriber
 /// docs / `TOKIO_CONSOLE_BIND`), so it is not publicly reachable.
-fn init_tracing() {
+fn init_tracing(tracer: Option<opentelemetry_sdk::trace::Tracer>) {
+    // Shared JSON log schema (#294) composed with OpenTelemetry trace export
+    // (#290) so log lines and traces share the same correlation ids.
+    let otel_layer = tracer.map(|t| tracing_opentelemetry::layer().with_tracer(t));
+
     #[cfg(feature = "tokio-console")]
     if std::env::var("TOKIO_CONSOLE_ENABLED").as_deref() == Ok("true") {
-        use tracing_subscriber::prelude::*;
+        use tracing_subscriber::Layer;
         let console_layer = console_subscriber::spawn();
-        // Keep the shared JSON log schema alongside the console profiler.
         let json_layer =
             trident_common::logging::JsonLayer::new("trident-indexer", std::io::stdout)
                 .with_filter(default_filter());
+        // OTel export is intentionally omitted while attached to tokio-console —
+        // this is a local debug mode, not a production tracing path.
         tracing_subscriber::registry()
             .with(console_layer)
             .with(json_layer)
@@ -84,7 +137,14 @@ fn init_tracing() {
         return;
     }
 
-    trident_common::logging::init("trident-indexer");
+    tracing_subscriber::registry()
+        .with(EnvFilter::from_default_env())
+        .with(trident_common::logging::JsonLayer::new(
+            "trident-indexer",
+            std::io::stdout,
+        ))
+        .with(otel_layer)
+        .init();
 }
 
 #[cfg(feature = "tokio-console")]
