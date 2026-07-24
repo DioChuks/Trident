@@ -56,12 +56,12 @@ func InternalStatus() http.HandlerFunc {
 		// Check X-Internal-Key header.
 		expectedKey := os.Getenv("INTERNAL_API_KEY")
 		if expectedKey == "" {
-			httputil.WriteError(w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "INTERNAL_API_KEY not configured")
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "INTERNAL_API_KEY not configured")
 			return
 		}
 		providedKey := r.Header.Get("X-Internal-Key")
 		if providedKey != expectedKey {
-			httputil.WriteError(w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "invalid X-Internal-Key")
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "invalid X-Internal-Key")
 			return
 		}
 

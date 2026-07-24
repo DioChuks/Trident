@@ -203,7 +203,7 @@ func TieredRateLimit(cfg RateLimitConfig) func(http.Handler) http.Handler {
 				rlRejected.Add(1)
 				retryAfter := int64(math.Ceil(tcfg.Window.Seconds()))
 				w.Header().Set("Retry-After", strconv.FormatInt(retryAfter, 10))
-				httputil.WriteError(w, http.StatusTooManyRequests, httputil.RATE_LIMITED, "rate limit exceeded")
+				httputil.WriteErrorCtx(r.Context(), w, http.StatusTooManyRequests, httputil.RATE_LIMITED, "rate limit exceeded")
 				return
 			}
 
@@ -227,7 +227,7 @@ func WSConnectionLimit(next http.Handler) http.Handler {
 		n := wsConns.Add(1)
 		defer wsConns.Add(-1)
 		if n > limit {
-			httputil.WriteError(w, http.StatusTooManyRequests, httputil.RATE_LIMITED, "too many WebSocket connections")
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusTooManyRequests, httputil.RATE_LIMITED, "too many WebSocket connections")
 			return
 		}
 		next.ServeHTTP(w, r)

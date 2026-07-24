@@ -33,18 +33,18 @@ type BatchEventsResponse struct {
 // returns found events plus a missing array for any IDs that were not indexed.
 func BatchGetEvents(w http.ResponseWriter, r *http.Request) {
 	if eventsClient == nil {
-		httputil.WriteError(w, http.StatusServiceUnavailable, httputil.INTERNAL, "gRPC backend unavailable")
+		httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.INTERNAL, "gRPC backend unavailable")
 		return
 	}
 
 	var req batchRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httputil.WriteError(w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, "request body must be valid JSON")
+		httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, "request body must be valid JSON")
 		return
 	}
 
 	if len(req.IDs) > batchEventsMaxIDs {
-		httputil.WriteError(w, http.StatusBadRequest, httputil.INVALID_ARGUMENT,
+		httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT,
 			"maximum 100 IDs per request")
 		return
 	}
@@ -57,7 +57,7 @@ func BatchGetEvents(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if len(invalid) > 0 {
-		httputil.WriteError(w, http.StatusBadRequest, httputil.INVALID_ARGUMENT,
+		httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT,
 			fmt.Sprintf("one or more IDs are not valid UUID v4: %s", strings.Join(invalid, ", ")))
 		return
 	}

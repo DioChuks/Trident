@@ -205,7 +205,7 @@ type IndexerStatsResponse struct {
 func IndexerStats(db DBPool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if db == nil {
-			httputil.WriteError(w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "database unavailable")
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "database unavailable")
 			return
 		}
 
@@ -215,7 +215,7 @@ func IndexerStats(db DBPool) http.HandlerFunc {
 		stats, err := queryIndexerStats(ctx, db)
 		if err != nil {
 			slog.Error("stats: DB query failed", "err", err)
-			httputil.WriteError(w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "database query failed")
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "database query failed")
 			return
 		}
 
@@ -303,7 +303,7 @@ type ContractsStatsResponse struct {
 func ContractsStats(db DBPool, rdb *redis.Client) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if db == nil {
-			httputil.WriteError(w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "database unavailable")
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "database unavailable")
 			return
 		}
 
@@ -317,7 +317,7 @@ func ContractsStats(db DBPool, rdb *redis.Client) http.HandlerFunc {
 			q.Get("limit"),
 		)
 		if verr != nil {
-			httputil.WriteError(w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
 			return
 		}
 
@@ -343,7 +343,7 @@ func ContractsStats(db DBPool, rdb *redis.Client) http.HandlerFunc {
 		stats, err := queryContractStats(ctx, db, params)
 		if err != nil {
 			slog.ErrorContext(r.Context(), "database query failed", "err", err)
-			httputil.WriteError(w, http.StatusInternalServerError, httputil.INTERNAL, "failed to fetch statistics")
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "failed to fetch statistics")
 			return
 		}
 
@@ -371,7 +371,7 @@ func ContractsStats(db DBPool, rdb *redis.Client) http.HandlerFunc {
 		body, err := json.Marshal(response)
 		if err != nil {
 			slog.ErrorContext(r.Context(), "json marshal failed", "err", err)
-			httputil.WriteError(w, http.StatusInternalServerError, httputil.INTERNAL, "internal error")
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "internal error")
 			return
 		}
 
