@@ -49,6 +49,7 @@ pub struct Config {
     pub db_batch_size: usize,
     pub redis_stream_maxlen: u64,
     pub metrics_port: u16,
+    pub health_port: u16,
     pub alert_webhook_url: Option<String>,
     pub alert_lag_threshold: u64,
     pub alert_cooldown_minutes: u64,
@@ -203,6 +204,10 @@ impl Config {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(9090),
+            health_port: std::env::var("HEALTH_PORT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(8080),
             alert_webhook_url,
             alert_lag_threshold,
             alert_cooldown_minutes,
