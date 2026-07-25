@@ -17,6 +17,16 @@ pub struct Config {
     pub lag_high_watermark: u64,
     /// Hysteresis deadband (ledgers) suppressing interval churn on lag jitter.
     pub poll_hysteresis_ledgers: u64,
+    /// TCP connect timeout for RPC HTTP requests (issue #214).
+    pub rpc_connect_timeout: Duration,
+    /// Overall request timeout (connect, headers and body) for RPC calls (issue #214).
+    pub rpc_request_timeout: Duration,
+    /// How long an idle pooled connection is kept before it is dropped (issue #214).
+    pub rpc_pool_idle_timeout: Duration,
+    /// Maximum idle keep-alive connections retained per RPC host (issue #214).
+    pub rpc_pool_max_idle_per_host: usize,
+    /// TCP keep-alive probe interval for pooled RPC sockets (issue #214).
+    pub rpc_tcp_keepalive: Duration,
     pub index_diagnostic: bool,
     pub max_events_per_poll: u32,
     pub redis_stream_maxlen: u64,
@@ -65,6 +75,26 @@ impl Config {
         let poll_hysteresis_ledgers =
             parse_bounded_u64("POLL_HYSTERESIS_LEDGERS", 10, 0, 1_000_000)?;
 
+        // RPC HTTP client timeouts and connection reuse (issue #214). Without an
+        // explicit timeout a hung TCP connection blocks a poll forever: the retry
+        // wrapper only reacts to returned errors, never to a call that never
+        // returns. Defaults: 5s connect, 30s overall request.
+        let rpc_connect_timeout_ms =
+            parse_bounded_u64("RPC_CONNECT_TIMEOUT_MS", 5_000, 100, 60_000)?;
+        let rpc_request_timeout_ms =
+            parse_bounded_u64("RPC_REQUEST_TIMEOUT_MS", 30_000, 500, 600_000)?;
+        if rpc_request_timeout_ms < rpc_connect_timeout_ms {
+            return Err(TridentError::config(anyhow::anyhow!(
+                "[indexer] RPC_REQUEST_TIMEOUT_MS ({rpc_request_timeout_ms}) must be >= RPC_CONNECT_TIMEOUT_MS ({rpc_connect_timeout_ms})"
+            )));
+        }
+        let rpc_pool_idle_timeout_ms =
+            parse_bounded_u64("RPC_POOL_IDLE_TIMEOUT_MS", 90_000, 1_000, 600_000)?;
+        let rpc_pool_max_idle_per_host =
+            parse_bounded_u64("RPC_POOL_MAX_IDLE_PER_HOST", 8, 1, 1_024)? as usize;
+        let rpc_tcp_keepalive_ms =
+            parse_bounded_u64("RPC_TCP_KEEPALIVE_MS", 60_000, 1_000, 600_000)?;
+
         let index_diagnostic = std::env::var("INDEX_DIAGNOSTIC")
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
@@ -86,6 +116,11 @@ impl Config {
             poll_interval_ceiling: Duration::from_millis(poll_interval_ceiling_ms),
             lag_high_watermark,
             poll_hysteresis_ledgers,
+            rpc_connect_timeout: Duration::from_millis(rpc_connect_timeout_ms),
+            rpc_request_timeout: Duration::from_millis(rpc_request_timeout_ms),
+            rpc_pool_idle_timeout: Duration::from_millis(rpc_pool_idle_timeout_ms),
+            rpc_pool_max_idle_per_host,
+            rpc_tcp_keepalive: Duration::from_millis(rpc_tcp_keepalive_ms),
             index_diagnostic,
             max_events_per_poll: max_events_per_poll as u32,
             redis_stream_maxlen: std::env::var("REDIS_STREAM_MAXLEN")
@@ -361,6 +396,63 @@ mod tests {
             env::remove_var("POLL_INTERVAL_MS");
             let cfg = Config::from_env().unwrap();
             assert_eq!(cfg.max_events_per_poll, 10000);
+        });
+    }
+
+    #[test]
+    fn rpc_timeouts_have_sensible_defaults() {
+        let vars = required_vars();
+        with_env(&vars, || {
+            for key in [
+                "RPC_CONNECT_TIMEOUT_MS",
+                "RPC_REQUEST_TIMEOUT_MS",
+                "RPC_POOL_IDLE_TIMEOUT_MS",
+                "RPC_POOL_MAX_IDLE_PER_HOST",
+                "RPC_TCP_KEEPALIVE_MS",
+            ] {
+                env::remove_var(key);
+            }
+            let cfg = Config::from_env().unwrap();
+            assert_eq!(cfg.rpc_connect_timeout.as_millis(), 5_000);
+            assert_eq!(cfg.rpc_request_timeout.as_millis(), 30_000);
+            assert_eq!(cfg.rpc_pool_idle_timeout.as_millis(), 90_000);
+            assert_eq!(cfg.rpc_pool_max_idle_per_host, 8);
+            assert_eq!(cfg.rpc_tcp_keepalive.as_millis(), 60_000);
+        });
+    }
+
+    #[test]
+    fn rpc_timeouts_are_env_configurable() {
+        let mut vars = required_vars();
+        vars.push(("RPC_CONNECT_TIMEOUT_MS", "1500"));
+        vars.push(("RPC_REQUEST_TIMEOUT_MS", "9000"));
+        vars.push(("RPC_POOL_MAX_IDLE_PER_HOST", "32"));
+        with_env(&vars, || {
+            let cfg = Config::from_env().unwrap();
+            assert_eq!(cfg.rpc_connect_timeout.as_millis(), 1_500);
+            assert_eq!(cfg.rpc_request_timeout.as_millis(), 9_000);
+            assert_eq!(cfg.rpc_pool_max_idle_per_host, 32);
+        });
+    }
+
+    #[test]
+    fn rpc_request_timeout_below_connect_timeout_is_rejected() {
+        let mut vars = required_vars();
+        vars.push(("RPC_CONNECT_TIMEOUT_MS", "10000"));
+        vars.push(("RPC_REQUEST_TIMEOUT_MS", "1000"));
+        with_env(&vars, || {
+            let err = Config::from_env().unwrap_err();
+            assert!(err.to_string().contains("RPC_REQUEST_TIMEOUT_MS"));
+        });
+    }
+
+    #[test]
+    fn rpc_timeout_out_of_bounds_is_rejected() {
+        let mut vars = required_vars();
+        vars.push(("RPC_CONNECT_TIMEOUT_MS", "0"));
+        with_env(&vars, || {
+            let err = Config::from_env().unwrap_err();
+            assert!(err.to_string().contains("RPC_CONNECT_TIMEOUT_MS"));
         });
     }
 
