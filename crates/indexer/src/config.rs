@@ -18,6 +18,9 @@ pub struct Config {
     /// Hysteresis deadband (ledgers) suppressing interval churn on lag jitter.
     pub poll_hysteresis_ledgers: u64,
     pub index_diagnostic: bool,
+    /// Topic patterns pushed into the `getEvents` RPC filter alongside the
+    /// contract allowlist (issue #203). Empty means "no topic narrowing".
+    pub topic_filters: Vec<Vec<String>>,
     pub max_events_per_poll: u32,
     pub redis_stream_maxlen: u64,
     pub metrics_port: u16,
@@ -69,6 +72,17 @@ impl Config {
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
+        // Optional server-side topic narrowing (issue #203), e.g.
+        // INDEX_TOPIC_FILTERS="transfer/*/*,mint/*/*". Only applied when a
+        // contract allowlist is configured; an invalid spec is a hard error
+        // rather than a silent fallback to unfiltered indexing.
+        let topic_filters = match std::env::var("INDEX_TOPIC_FILTERS") {
+            Ok(spec) => crate::rpc::filters::parse_topic_filters(&spec).map_err(|e| {
+                TridentError::config(anyhow::anyhow!("[indexer] INDEX_TOPIC_FILTERS: {e}"))
+            })?,
+            Err(_) => Vec::new(),
+        };
+
         let alert_webhook_url = std::env::var("ALERT_WEBHOOK_URL")
             .ok()
             .filter(|s| !s.is_empty());
@@ -87,6 +101,7 @@ impl Config {
             lag_high_watermark,
             poll_hysteresis_ledgers,
             index_diagnostic,
+            topic_filters,
             max_events_per_poll: max_events_per_poll as u32,
             redis_stream_maxlen: std::env::var("REDIS_STREAM_MAXLEN")
                 .ok()
@@ -361,6 +376,37 @@ mod tests {
             env::remove_var("POLL_INTERVAL_MS");
             let cfg = Config::from_env().unwrap();
             assert_eq!(cfg.max_events_per_poll, 10000);
+        });
+    }
+
+    #[test]
+    fn topic_filters_default_to_empty() {
+        let vars = required_vars();
+        with_env(&vars, || {
+            env::remove_var("INDEX_TOPIC_FILTERS");
+            let cfg = Config::from_env().unwrap();
+            assert!(cfg.topic_filters.is_empty());
+        });
+    }
+
+    #[test]
+    fn topic_filters_parsed_from_spec() {
+        let mut vars = required_vars();
+        vars.push(("INDEX_TOPIC_FILTERS", "transfer/*/*"));
+        with_env(&vars, || {
+            let cfg = Config::from_env().unwrap();
+            assert_eq!(cfg.topic_filters.len(), 1);
+            assert_eq!(cfg.topic_filters[0].len(), 3);
+        });
+    }
+
+    #[test]
+    fn invalid_topic_filter_spec_is_rejected() {
+        let mut vars = required_vars();
+        vars.push(("INDEX_TOPIC_FILTERS", "a/b/c/d/e"));
+        with_env(&vars, || {
+            let err = Config::from_env().unwrap_err();
+            assert!(err.to_string().contains("INDEX_TOPIC_FILTERS"));
         });
     }
 
