@@ -75,6 +75,9 @@ fn stream_channel_buffer() -> usize {
 /// stream) and `$` (live tail) are also accepted. Anything else is rejected
 /// rather than passed through, because Redis would answer a malformed ID with a
 /// connection-level error that the subscriber would see as an opaque failure.
+// `Status` is the error type the gRPC surface must return; boxing it here would
+// only move the size to the caller.
+#[allow(clippy::result_large_err)]
 fn validate_start_id(start_id: &str) -> Result<String, Status> {
     if start_id.is_empty() {
         return Ok(STREAM_ID_LIVE_TAIL.to_string());
@@ -155,6 +158,117 @@ fn resolve_network(network: &str) -> &str {
         DEFAULT_NETWORK
     } else {
         network
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Redis stream consumer (issue #236)
+// ---------------------------------------------------------------------------
+
+/// What one subscriber asked for.
+struct StreamSubscription {
+    contract_id: String,
+    topic_0: Option<String>,
+    /// Validated Redis stream ID to read from.
+    start_id: String,
+}
+
+/// Read one field of a stream entry as a string, defaulting to empty.
+fn entry_field(entry: &redis::streams::StreamId, field: &str) -> String {
+    entry
+        .map
+        .get(field)
+        .and_then(|v| {
+            if let redis::Value::Data(b) = v {
+                String::from_utf8(b.clone()).ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default()
+}
+
+/// Consume the indexer's Redis stream and push matching events to one
+/// subscriber until the client goes away.
+///
+/// Returns as soon as the receiving half is dropped — including while parked in
+/// a blocking XREAD — so a disconnected client leaves no task behind.
+async fn run_stream_consumer(
+    mut redis: redis::aio::ConnectionManager,
+    tx: tokio::sync::mpsc::Sender<Result<Event, Status>>,
+    subscription: StreamSubscription,
+) {
+    let StreamSubscription {
+        contract_id,
+        topic_0,
+        start_id,
+    } = subscription;
+    let mut last_id = start_id;
+
+    let opts = StreamReadOptions::default()
+        .block(XREAD_BLOCK_MS)
+        .count(100);
+
+    loop {
+        let ids = [last_id.clone()];
+        let reply: redis::RedisResult<StreamReadReply> = tokio::select! {
+            biased;
+            _ = tx.closed() => return,
+            reply = redis.xread_options(&[REDIS_STREAM_KEY], &ids, &opts) => reply,
+        };
+
+        match reply {
+            Ok(StreamReadReply { keys }) => {
+                for stream_key in keys {
+                    for entry in stream_key.ids {
+                        last_id = entry.id.clone();
+
+                        if entry_field(&entry, "contract_id") != contract_id {
+                            continue;
+                        }
+
+                        let topics: Vec<String> =
+                            serde_json::from_str(&entry_field(&entry, "topics"))
+                                .unwrap_or_default();
+
+                        if let Some(ref t0) = topic_0 {
+                            if topics.first().map(String::as_str) != Some(t0.as_str()) {
+                                continue;
+                            }
+                        }
+
+                        let event = Event {
+                            id: String::new(),
+                            contract_id: entry_field(&entry, "contract_id"),
+                            ledger_sequence: entry_field(&entry, "ledger_sequence")
+                                .parse()
+                                .unwrap_or(0),
+                            ledger_timestamp: entry_field(&entry, "ledger_timestamp"),
+                            transaction_hash: entry_field(&entry, "transaction_hash"),
+                            event_index: entry_field(&entry, "event_index").parse().unwrap_or(0),
+                            event_type: entry_field(&entry, "event_type"),
+                            topics,
+                            data: entry_field(&entry, "data"),
+                            created_at: String::new(),
+                        };
+
+                        // Blocks once the bounded buffer fills, which is the
+                        // backpressure: a slow client stops us reading Redis
+                        // rather than growing an unbounded queue.
+                        if tx.send(Ok(event)).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Redis XREAD error in stream_events, retrying");
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                    _ = tx.closed() => return,
+                }
+            }
+        }
     }
 }
 
@@ -320,88 +434,21 @@ impl Events for EventsServiceImpl {
             Some(req.topic_0)
         };
 
-        let (tx, rx) = tokio::sync::mpsc::channel(STREAM_CHANNEL_BUF);
-        let mut redis = self.redis.clone();
+        // Resume from where the client left off when it supplies a start_id
+        // (issue #236); otherwise tail the stream live.
+        let last_id = validate_start_id(&req.start_id)?;
 
-        tokio::spawn(async move {
-            let mut last_id = "$".to_string();
-            let opts = StreamReadOptions::default().block(5_000).count(100);
+        let (tx, rx) = tokio::sync::mpsc::channel(stream_channel_buffer());
 
-            loop {
-                let reply: redis::RedisResult<StreamReadReply> = redis
-                    .xread_options(&[REDIS_STREAM_KEY], &[&last_id], &opts)
-                    .await;
-
-                match reply {
-                    Ok(StreamReadReply { keys }) => {
-                        for stream_key in keys {
-                            for entry in stream_key.ids {
-                                last_id = entry.id.clone();
-
-                                let get = |field: &str| -> String {
-                                    entry
-                                        .map
-                                        .get(field)
-                                        .and_then(|v| {
-                                            if let redis::Value::Data(b) = v {
-                                                String::from_utf8(b.clone()).ok()
-                                            } else {
-                                                None
-                                            }
-                                        })
-                                        .unwrap_or_default()
-                                };
-
-                                if get("contract_id") != contract_id {
-                                    continue;
-                                }
-
-                                if let Some(ref t0) = topic_0_filter {
-                                    let topics_json = get("topics");
-                                    let topics: Vec<String> =
-                                        serde_json::from_str(&topics_json).unwrap_or_default();
-                                    if topics.first().map(String::as_str) != Some(t0.as_str()) {
-                                        continue;
-                                    }
-                                }
-
-                                let topics_json = get("topics");
-                                let topics: Vec<String> =
-                                    serde_json::from_str(&topics_json).unwrap_or_default();
-
-                                let event = Event {
-                                    id: String::new(),
-                                    contract_id: get("contract_id"),
-                                    ledger_sequence: get("ledger_sequence").parse().unwrap_or(0),
-                                    ledger_timestamp: get("ledger_timestamp"),
-                                    transaction_hash: get("transaction_hash"),
-                                    event_index: get("event_index").parse().unwrap_or(0),
-                                    event_type: get("event_type"),
-                                    topics,
-                                    data: get("data"),
-                                    created_at: String::new(),
-                                };
-
-                                if tx.send(Ok(event)).await.is_err() {
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Redis XREAD error in stream_events, retrying");
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        if tx.is_closed() {
-                            return;
-                        }
-                    }
-                }
-
-                if tx.is_closed() {
-                    return;
-                }
-            }
-        });
+        tokio::spawn(run_stream_consumer(
+            self.redis.clone(),
+            tx,
+            StreamSubscription {
+                contract_id,
+                topic_0: topic_0_filter,
+                start_id: last_id,
+            },
+        ));
 
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
             rx,
@@ -666,6 +713,7 @@ mod tests {
         let req = Request::new(StreamEventsRequest {
             contract_id: "CTEST_STREAM".to_string(),
             topic_0: String::new(),
+            start_id: String::new(),
         });
 
         let mut stream = svc.stream_events(req).await.unwrap().into_inner();
@@ -707,5 +755,126 @@ mod tests {
 
         assert_eq!(event.contract_id, "CTEST_STREAM");
         assert_eq!(event.ledger_sequence, 777);
+    }
+
+    // -----------------------------------------------------------------------
+    // Resume, cancellation, and buffering (issue #236)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn empty_start_id_means_live_tail() {
+        assert_eq!(validate_start_id("").unwrap(), "$");
+    }
+
+    #[test]
+    fn explicit_stream_ids_are_accepted() {
+        assert_eq!(validate_start_id("$").unwrap(), "$");
+        assert_eq!(validate_start_id("0").unwrap(), "0");
+        assert_eq!(
+            validate_start_id("1700000000000-0").unwrap(),
+            "1700000000000-0"
+        );
+    }
+
+    #[test]
+    fn malformed_start_ids_are_rejected() {
+        for bad in ["abc", "123", "1-2-3", "-1", "1-", "1700000000000-x"] {
+            let err =
+                validate_start_id(bad).expect_err(&format!("{bad:?} should have been rejected"));
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_resumes_from_a_supplied_start_id() {
+        let (db_url, redis_url) = require_services!();
+        let svc = make_svc(&db_url, &redis_url).await;
+
+        let mut pub_conn = redis::Client::open(redis_url.as_str())
+            .unwrap()
+            .get_multiplexed_async_connection()
+            .await
+            .unwrap();
+
+        let contract = format!("CRESUME_{}", Uuid::new_v4());
+
+        // Published *before* subscribing: a live tail would never see this.
+        let first_id: String = redis::cmd("XADD")
+            .arg(REDIS_STREAM_KEY)
+            .arg("*")
+            .arg("contract_id")
+            .arg(&contract)
+            .arg("ledger_sequence")
+            .arg("500")
+            .arg("ledger_timestamp")
+            .arg("2024-01-01T00:00:00Z")
+            .arg("transaction_hash")
+            .arg("txresume")
+            .arg("event_index")
+            .arg("0")
+            .arg("event_type")
+            .arg("contract")
+            .arg("topics")
+            .arg(r#"["transfer"]"#)
+            .arg("data")
+            .arg("null")
+            .query_async(&mut pub_conn)
+            .await
+            .unwrap();
+
+        // Resume from just before that entry by decrementing the sequence part.
+        let (ms, _seq) = first_id.split_once('-').unwrap();
+        let resume_from = format!("{}-0", ms.parse::<u64>().unwrap() - 1);
+
+        let req = Request::new(StreamEventsRequest {
+            contract_id: contract.clone(),
+            topic_0: String::new(),
+            start_id: resume_from,
+        });
+        let mut stream = svc.stream_events(req).await.unwrap().into_inner();
+
+        let event: Event = tokio::time::timeout(Duration::from_secs(8), stream.next())
+            .await
+            .expect("timed out waiting for the replayed event")
+            .expect("stream ended unexpectedly")
+            .expect("stream returned error");
+
+        assert_eq!(event.contract_id, contract);
+        assert_eq!(
+            event.ledger_sequence, 500,
+            "resume must replay the entry published before subscribing"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_the_receiver_stops_the_consumer() {
+        let (_db_url, redis_url) = require_services!();
+        let redis = redis::Client::open(redis_url.as_str())
+            .unwrap()
+            .get_connection_manager()
+            .await
+            .unwrap();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let handle = tokio::spawn(run_stream_consumer(
+            redis,
+            tx,
+            StreamSubscription {
+                contract_id: "CTEST_CANCEL".to_string(),
+                topic_0: None,
+                start_id: "$".to_string(),
+            },
+        ));
+
+        // Let the consumer park inside a blocking XREAD first.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(rx);
+
+        // It selects on tx.closed(), so it must return well inside one XREAD
+        // block window (5s) rather than idling until that read returns.
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("consumer did not stop after the receiver was dropped")
+            .expect("consumer task panicked");
     }
 }
