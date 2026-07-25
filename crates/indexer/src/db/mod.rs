@@ -8,6 +8,8 @@ use sqlx::PgPool;
 use trident_common::{EventType, SorobanEvent, TridentError};
 use uuid::Uuid;
 
+use crate::parser::token_events::TokenEvent;
+
 /// Build a bounded Postgres connection pool sized for this service.
 ///
 /// `statement_cache_capacity(0)` disables sqlx's named-prepared-statement cache.
@@ -52,8 +54,17 @@ pub struct LedgerMeta<'a> {
 ///
 /// Bundling the events with the cursor advance is what stops a crash between
 /// the two from leaving the cursor ahead of the data it claims to cover.
+/// A decoded token event paired with the indexed event it projects (issue #211).
+pub struct TokenProjection<'a> {
+    pub event: &'a SorobanEvent,
+    pub token: &'a TokenEvent,
+}
+
 pub struct PageCommit<'a> {
     pub events: &'a [SorobanEvent],
+    /// Normalised token-event rows for this page. Every referenced event must
+    /// also appear in `events` — the projection is foreign-keyed to it.
+    pub token_events: &'a [TokenProjection<'a>],
     /// New cursor value, when the page advanced it.
     pub cursor: Option<u64>,
     /// Ledger metadata row, written only when the cursor advanced.
@@ -172,6 +183,98 @@ where
     Ok(())
 }
 
+/// Insert a batch of decoded token events into the `token_events` projection
+/// (issue #211).
+///
+/// Keyed by the originating event's UUID, so replaying a page re-projects the
+/// same rows and `ON CONFLICT DO NOTHING` absorbs them.
+pub async fn insert_token_events_batch<'e, E>(
+    executor: E,
+    projections: &[TokenProjection<'_>],
+) -> Result<(), TridentError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    if projections.is_empty() {
+        return Ok(());
+    }
+
+    let mut event_ids = Vec::with_capacity(projections.len());
+    let mut contract_ids = Vec::with_capacity(projections.len());
+    let mut event_types = Vec::with_capacity(projections.len());
+    let mut from_addresses = Vec::with_capacity(projections.len());
+    let mut to_addresses = Vec::with_capacity(projections.len());
+    let mut spender_addresses = Vec::with_capacity(projections.len());
+    let mut admin_addresses = Vec::with_capacity(projections.len());
+    let mut amounts = Vec::with_capacity(projections.len());
+    let mut expiration_ledgers = Vec::with_capacity(projections.len());
+    let mut ledger_sequences = Vec::with_capacity(projections.len());
+    let mut ledger_timestamps = Vec::with_capacity(projections.len());
+    let mut transaction_hashes = Vec::with_capacity(projections.len());
+    let mut event_indexes = Vec::with_capacity(projections.len());
+
+    for projection in projections {
+        let event = projection.event;
+        let token = projection.token;
+        let ledger_ts: DateTime<Utc> = event.ledger_timestamp.parse().map_err(|e| {
+            TridentError::storage(anyhow::Error::new(e).context("ledger timestamp parse"))
+        })?;
+
+        event_ids.push(event_uuid(
+            &event.contract_id,
+            event.ledger_sequence,
+            event.event_index,
+        ));
+        contract_ids.push(event.contract_id.clone());
+        event_types.push(token.event_type.as_str().to_string());
+        from_addresses.push(token.from.clone());
+        to_addresses.push(token.to.clone());
+        spender_addresses.push(token.spender.clone());
+        admin_addresses.push(token.admin.clone());
+        amounts.push(token.amount.clone());
+        expiration_ledgers.push(token.expiration_ledger);
+        ledger_sequences.push(event.ledger_sequence as i64);
+        ledger_timestamps.push(ledger_ts);
+        transaction_hashes.push(event.transaction_hash.clone());
+        event_indexes.push(event.event_index as i32);
+    }
+
+    sqlx::query(
+        r#"
+        INSERT INTO token_events
+            (event_id, contract_id, event_type, from_address, to_address,
+             spender_address, admin_address, amount, expiration_ledger,
+             ledger_sequence, ledger_timestamp, transaction_hash, event_index)
+        SELECT * FROM UNNEST(
+            $1::uuid[], $2::text[], $3::text[], $4::text[], $5::text[],
+            $6::text[], $7::text[], $8::text[], $9::bigint[],
+            $10::bigint[], $11::timestamptz[], $12::text[], $13::int[]
+        )
+        ON CONFLICT (event_id) DO NOTHING
+        "#,
+    )
+    .bind(&event_ids)
+    .bind(&contract_ids)
+    .bind(&event_types)
+    .bind(&from_addresses)
+    .bind(&to_addresses)
+    .bind(&spender_addresses)
+    .bind(&admin_addresses)
+    .bind(&amounts)
+    .bind(&expiration_ledgers)
+    .bind(&ledger_sequences)
+    .bind(&ledger_timestamps)
+    .bind(&transaction_hashes)
+    .bind(&event_indexes)
+    .execute(executor)
+    .await
+    .map_err(|e| {
+        TridentError::storage(anyhow::Error::new(e).context("insert_token_events_batch"))
+    })?;
+
+    Ok(())
+}
+
 /// Persist one RPC page — events, cursor, and ledger metadata — in a single
 /// transaction (issue #199).
 ///
@@ -188,6 +291,12 @@ pub async fn commit_page(pool: &PgPool, commit: PageCommit<'_>) -> Result<(), Tr
 
     for chunk in commit.events.chunks(batch_size) {
         insert_events_batch(&mut *tx, chunk).await?;
+    }
+
+    // Projection rows are foreign-keyed to soroban_events, so they must follow
+    // the event insert inside the same transaction.
+    for chunk in commit.token_events.chunks(batch_size) {
+        insert_token_events_batch(&mut *tx, chunk).await?;
     }
 
     if let Some(cursor) = commit.cursor {
@@ -487,6 +596,7 @@ mod tests {
         fn commit(events: &[SorobanEvent]) -> PageCommit<'_> {
             PageCommit {
                 events,
+                token_events: &[],
                 cursor: Some(900),
                 ledger: Some(LedgerMeta {
                     sequence: 900,
