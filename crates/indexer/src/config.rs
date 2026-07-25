@@ -22,6 +22,8 @@ pub struct Config {
     /// contract allowlist (issue #203). Empty means "no topic narrowing".
     pub topic_filters: Vec<Vec<String>>,
     pub max_events_per_poll: u32,
+    /// Maximum rows per batched INSERT when committing a page (issue #199).
+    pub db_batch_size: usize,
     pub redis_stream_maxlen: u64,
     pub metrics_port: u16,
     pub alert_webhook_url: Option<String>,
@@ -52,6 +54,10 @@ impl Config {
 
         let poll_interval_ms = parse_bounded_u64("POLL_INTERVAL_MS", 1000, 100, 60_000)?;
         let max_events_per_poll = parse_bounded_u64("MAX_EVENTS_PER_POLL", 200, 1, 10_000)?;
+        // Rows per batched INSERT (issue #199). Large enough that a default
+        // 200-event page commits in one statement, bounded so a huge page
+        // cannot build an unbounded statement.
+        let db_batch_size = parse_bounded_u64("DB_BATCH_SIZE", 1_000, 1, 10_000)?;
 
         // Adaptive poll interval bounds (issue #198). Defaults: poll every 250ms
         // while far behind, back off to 5s once caught up, cross over at 100
@@ -103,6 +109,7 @@ impl Config {
             index_diagnostic,
             topic_filters,
             max_events_per_poll: max_events_per_poll as u32,
+            db_batch_size: db_batch_size as usize,
             redis_stream_maxlen: std::env::var("REDIS_STREAM_MAXLEN")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -376,6 +383,36 @@ mod tests {
             env::remove_var("POLL_INTERVAL_MS");
             let cfg = Config::from_env().unwrap();
             assert_eq!(cfg.max_events_per_poll, 10000);
+        });
+    }
+
+    #[test]
+    fn db_batch_size_defaults_to_1000() {
+        let vars = required_vars();
+        with_env(&vars, || {
+            env::remove_var("DB_BATCH_SIZE");
+            let cfg = Config::from_env().unwrap();
+            assert_eq!(cfg.db_batch_size, 1_000);
+        });
+    }
+
+    #[test]
+    fn db_batch_size_custom_value() {
+        let mut vars = required_vars();
+        vars.push(("DB_BATCH_SIZE", "250"));
+        with_env(&vars, || {
+            let cfg = Config::from_env().unwrap();
+            assert_eq!(cfg.db_batch_size, 250);
+        });
+    }
+
+    #[test]
+    fn db_batch_size_zero_is_rejected() {
+        let mut vars = required_vars();
+        vars.push(("DB_BATCH_SIZE", "0"));
+        with_env(&vars, || {
+            let err = Config::from_env().unwrap_err();
+            assert!(err.to_string().contains("DB_BATCH_SIZE"));
         });
     }
 
