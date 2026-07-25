@@ -6,7 +6,14 @@ pub struct Config {
     pub database_url: String,
     pub db_pool_size: u32,
     pub redis_url: String,
+    /// Primary RPC endpoint — always the first entry of `stellar_rpc_urls`.
     pub stellar_rpc_url: String,
+    /// Prioritised RPC endpoints used for health-based failover (issue #213).
+    pub stellar_rpc_urls: Vec<String>,
+    /// Consecutive failures on the active endpoint before failing over (issue #213).
+    pub rpc_failover_threshold: u32,
+    /// How long a failed endpoint is parked before it is probed again (issue #213).
+    pub rpc_endpoint_cooldown: Duration,
     pub network: String,
     pub poll_interval: Duration,
     /// Shortest adaptive poll interval, applied when lag >= `lag_high_watermark`.
@@ -46,7 +53,17 @@ impl Config {
 
         let database_url = collect_required("DATABASE_URL", &mut missing);
         let redis_url = collect_required("REDIS_URL", &mut missing);
-        let stellar_rpc_url = collect_required("STELLAR_RPC_URL", &mut missing);
+
+        // Endpoint list for failover (issue #213). STELLAR_RPC_URLS is the
+        // prioritised, comma-separated form; STELLAR_RPC_URL remains valid as a
+        // single-value alias so existing deployments keep working unchanged.
+        let stellar_rpc_urls = parse_endpoint_list(
+            std::env::var("STELLAR_RPC_URLS").ok(),
+            std::env::var("STELLAR_RPC_URL").ok(),
+        )?;
+        if stellar_rpc_urls.is_empty() {
+            missing.push("STELLAR_RPC_URL (or STELLAR_RPC_URLS)");
+        }
 
         if !missing.is_empty() {
             return Err(TridentError::config(anyhow::anyhow!(
@@ -95,6 +112,12 @@ impl Config {
         let rpc_tcp_keepalive_ms =
             parse_bounded_u64("RPC_TCP_KEEPALIVE_MS", 60_000, 1_000, 600_000)?;
 
+        // Failover tuning (issue #213): park an endpoint after this many
+        // consecutive failures, and probe it again after the cooldown.
+        let rpc_failover_threshold = parse_bounded_u64("RPC_FAILOVER_THRESHOLD", 3, 1, 100)? as u32;
+        let rpc_endpoint_cooldown_ms =
+            parse_bounded_u64("RPC_ENDPOINT_COOLDOWN_MS", 30_000, 1_000, 3_600_000)?;
+
         let index_diagnostic = std::env::var("INDEX_DIAGNOSTIC")
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
@@ -109,7 +132,10 @@ impl Config {
             database_url: database_url.unwrap(),
             db_pool_size: parse_pool_size("INDEXER_DB_POOL_SIZE", DEFAULT_DB_POOL_SIZE)?,
             redis_url: redis_url.unwrap(),
-            stellar_rpc_url: stellar_rpc_url.unwrap(),
+            stellar_rpc_url: stellar_rpc_urls[0].clone(),
+            stellar_rpc_urls,
+            rpc_failover_threshold,
+            rpc_endpoint_cooldown: Duration::from_millis(rpc_endpoint_cooldown_ms),
             network,
             poll_interval: Duration::from_millis(poll_interval_ms),
             poll_interval_floor: Duration::from_millis(poll_interval_floor_ms),
@@ -149,6 +175,40 @@ fn collect_required<'a>(key: &'a str, missing: &mut Vec<&'a str>) -> Option<Stri
     }
 }
 
+/// Build the prioritised endpoint list from `STELLAR_RPC_URLS` (comma-separated)
+/// falling back to the single-value `STELLAR_RPC_URL` alias (issue #213).
+///
+/// Duplicates are dropped so a repeated URL cannot mask a real failover target,
+/// and a list that contains only blanks is rejected rather than silently
+/// collapsing to "no endpoints".
+fn parse_endpoint_list(
+    list: Option<String>,
+    single: Option<String>,
+) -> Result<Vec<String>, TridentError> {
+    let raw = match list.filter(|s| !s.trim().is_empty()) {
+        Some(s) => s,
+        None => single.unwrap_or_default(),
+    };
+
+    let mut urls: Vec<String> = Vec::new();
+    for part in raw.split(',') {
+        let url = part.trim();
+        if url.is_empty() {
+            continue;
+        }
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            return Err(TridentError::config(anyhow::anyhow!(
+                "[indexer] Stellar RPC endpoint {url:?} must start with http:// or https://"
+            )));
+        }
+        if !urls.iter().any(|existing| existing == url) {
+            urls.push(url.to_string());
+        }
+    }
+
+    Ok(urls)
+}
+
 /// Parse an env var as u64 with a default and inclusive [min, max] bounds.
 fn parse_bounded_u64(key: &str, default: u64, min: u64, max: u64) -> Result<u64, TridentError> {
     match std::env::var(key) {
@@ -186,7 +246,18 @@ mod tests {
     use super::*;
     use std::env;
 
+    /// Process environment is global state shared by every test thread, so all
+    /// env-mutating tests serialise on this lock. Without it one test clearing
+    /// `REDIS_URL` can fail an unrelated test mid-`from_env`.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        // A panicking test must not poison the lock for the rest of the suite.
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn with_env<F: FnOnce()>(pairs: &[(&str, &str)], f: F) {
+        let _guard = env_guard();
         for (k, v) in pairs {
             env::set_var(k, v);
         }
@@ -206,6 +277,7 @@ mod tests {
 
     #[test]
     fn missing_all_required_vars_lists_all_in_error() {
+        let _guard = env_guard();
         env::remove_var("DATABASE_URL");
         env::remove_var("REDIS_URL");
         env::remove_var("STELLAR_RPC_URL");
@@ -227,6 +299,7 @@ mod tests {
 
     #[test]
     fn missing_single_required_var_names_it() {
+        let _guard = env_guard();
         env::set_var("DATABASE_URL", "postgres://localhost/test");
         env::set_var("STELLAR_RPC_URL", "https://soroban-testnet.stellar.org");
         env::remove_var("REDIS_URL");
@@ -396,6 +469,70 @@ mod tests {
             env::remove_var("POLL_INTERVAL_MS");
             let cfg = Config::from_env().unwrap();
             assert_eq!(cfg.max_events_per_poll, 10000);
+        });
+    }
+
+    #[test]
+    fn endpoint_list_prefers_the_multi_value_form() {
+        let urls = parse_endpoint_list(
+            Some("https://a.example, https://b.example".into()),
+            Some("https://legacy.example".into()),
+        )
+        .unwrap();
+        assert_eq!(urls, vec!["https://a.example", "https://b.example"]);
+    }
+
+    #[test]
+    fn endpoint_list_falls_back_to_single_value_alias() {
+        let urls = parse_endpoint_list(None, Some("https://legacy.example".into())).unwrap();
+        assert_eq!(urls, vec!["https://legacy.example"]);
+    }
+
+    #[test]
+    fn endpoint_list_drops_duplicates_and_blanks() {
+        let urls = parse_endpoint_list(
+            Some("https://a.example,,  ,https://a.example,https://b.example".into()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(urls, vec!["https://a.example", "https://b.example"]);
+    }
+
+    #[test]
+    fn endpoint_list_rejects_non_http_scheme() {
+        let err = parse_endpoint_list(Some("ftp://a.example".into()), None).unwrap_err();
+        assert!(err.to_string().contains("http://"));
+    }
+
+    #[test]
+    fn endpoint_list_is_empty_when_nothing_is_configured() {
+        assert!(parse_endpoint_list(None, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn multiple_endpoints_are_read_from_env() {
+        let mut vars = required_vars();
+        vars.push((
+            "STELLAR_RPC_URLS",
+            "https://primary.example,https://secondary.example",
+        ));
+        with_env(&vars, || {
+            let cfg = Config::from_env().unwrap();
+            assert_eq!(cfg.stellar_rpc_urls.len(), 2);
+            assert_eq!(cfg.stellar_rpc_url, "https://primary.example");
+            env::remove_var("STELLAR_RPC_URLS");
+        });
+    }
+
+    #[test]
+    fn failover_knobs_have_defaults() {
+        let vars = required_vars();
+        with_env(&vars, || {
+            env::remove_var("RPC_FAILOVER_THRESHOLD");
+            env::remove_var("RPC_ENDPOINT_COOLDOWN_MS");
+            let cfg = Config::from_env().unwrap();
+            assert_eq!(cfg.rpc_failover_threshold, 3);
+            assert_eq!(cfg.rpc_endpoint_cooldown.as_millis(), 30_000);
         });
     }
 
