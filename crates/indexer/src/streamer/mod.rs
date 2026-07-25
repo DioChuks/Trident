@@ -31,7 +31,7 @@ use crate::{
     parser::Parser,
     poll::{AdaptivePoll, AdaptivePollConfig},
     redis_stream,
-    rpc::RpcClient,
+    rpc::{filters::build_event_filters, FilterPlan, RpcClient},
 };
 /// How often (in poll loop iterations) we re-query `indexed_contracts`.
 /// At the default 5 s poll interval this is ≈ 60 s — matches the env-var default.
@@ -46,6 +46,9 @@ pub struct Streamer {
     /// `None`  → index all contracts (empty `indexed_contracts` table).
     /// `Some`  → allowlist; events from unlisted contracts are skipped.
     contract_filter: Option<HashSet<String>>,
+    /// Server-side `getEvents` filters derived from `contract_filter` (issue
+    /// #203). Rebuilt whenever the allowlist is reloaded.
+    filter_plan: FilterPlan,
     /// Counts poll cycles so we know when to refresh the filter.
     poll_count: u32,
     /// Outbound webhook alerter (issue #75). No-op when URL is not configured.
@@ -65,6 +68,7 @@ impl Streamer {
         let rpc = RpcClient::new(config.stellar_rpc_url.clone());
         let parser = Parser::new(config.index_diagnostic);
         let contract_filter = Self::load_filter(&db, &config.network).await?;
+        let filter_plan = plan_filters(contract_filter.as_ref(), &config.topic_filters);
         let alerter = Alerter::from_config(
             config.alert_webhook_url.clone(),
             config.alert_lag_threshold,
@@ -84,6 +88,7 @@ impl Streamer {
             rpc,
             parser,
             contract_filter,
+            filter_plan,
             poll_count: 0,
             alerter,
             last_chain_tip: 0,
@@ -110,6 +115,7 @@ impl Streamer {
     pub async fn refresh_contract_filter(&mut self) -> Result<(), TridentError> {
         match Self::load_filter(&self.db, &self.config.network).await {
             Ok(filter) => {
+                self.filter_plan = plan_filters(filter.as_ref(), &self.config.topic_filters);
                 self.contract_filter = filter;
                 Ok(())
             }
@@ -217,16 +223,24 @@ impl Streamer {
         let mut page_cursor: Option<String> = None;
         let mut total = 0;
 
+        // Snapshot the server-side filters for the whole cycle (issue #203) so
+        // the request shape is stable across pages and the borrow does not
+        // conflict with the mutable state updated inside the loop.
+        let filters = self.filter_plan.filters.clone();
+
         loop {
             let (sl, pc) = page_request_params(*cursor, page_cursor.as_deref());
             let mut attempt = 0u32;
             let limit = self.config.max_events_per_poll;
+            // Server-side narrowing (issue #203). Empty in index-all mode; the
+            // client-side allowlist check below stays as the safety net.
+            let filters = filters.as_slice();
             let page = Retry::start(retry_strategy.clone(), || {
                 attempt += 1;
                 if attempt > 1 {
                     metrics::record_rpc_retry();
                 }
-                async { self.rpc.get_events(sl, pc.clone(), limit).await }
+                async { self.rpc.get_events(sl, pc.clone(), limit, filters).await }
                     .instrument(tracing::info_span!("rpc_get_events"))
             })
             .await?;
@@ -412,6 +426,35 @@ impl Streamer {
     }
 }
 
+/// Build the server-side `getEvents` filter plan for the current allowlist and
+/// log how the request will be narrowed (issue #203).
+///
+/// A `degraded` plan means the allowlist is too large to express within the
+/// RPC's filter caps, so we index everything and rely on the client-side
+/// allowlist check in `poll_once` — correct, just less efficient.
+fn plan_filters(allowlist: Option<&HashSet<String>>, topic_filters: &[Vec<String>]) -> FilterPlan {
+    let plan = build_event_filters(allowlist, topic_filters);
+
+    if plan.degraded {
+        tracing::warn!(
+            contracts = allowlist.map(|s| s.len()).unwrap_or(0),
+            max = crate::rpc::filters::MAX_FILTERABLE_CONTRACTS,
+            "Allowlist exceeds the RPC filter caps; falling back to index-all with client-side filtering"
+        );
+    } else if plan.filters.is_empty() {
+        tracing::info!("No contract allowlist; requesting all events (index-all mode)");
+    } else {
+        tracing::info!(
+            filters = plan.filters.len(),
+            contracts = allowlist.map(|s| s.len()).unwrap_or(0),
+            topic_patterns = topic_filters.len(),
+            "Server-side getEvents filtering active"
+        );
+    }
+
+    plan
+}
+
 /// Decide the `(startLedger, cursor)` params for a single RPC page request.
 ///
 /// `startLedger` and `cursor` are mutually exclusive in the Soroban `getEvents`
@@ -555,6 +598,7 @@ mod tests {
             lag_high_watermark: 100,
             poll_hysteresis_ledgers: 10,
             index_diagnostic: false,
+            topic_filters: Vec::new(),
             max_events_per_poll: 200,
             redis_stream_maxlen: 10_000,
             metrics_port: 0,
