@@ -266,13 +266,17 @@ impl Streamer {
             // rather than paying a round-trip per row.
             let mut page_events: Vec<trident_common::SorobanEvent> =
                 Vec::with_capacity(page.events.len());
+            // Token projections keyed by position in `page_events` (issue #211).
+            // Indices, not references, because `page_events` is still growing.
+            let mut page_tokens: Vec<(usize, crate::parser::token_events::TokenEvent)> = Vec::new();
             for raw in &page.events {
                 let parse_result = {
                     let _span = tracing::info_span!("parse_events").entered();
-                    self.parser.parse_event(raw)
+                    self.parser.parse_event_with_projection(raw)
                 };
                 match parse_result {
-                    Ok(Some(event)) => {
+                    Ok(Some(parsed)) => {
+                        let event = parsed.event;
                         // Contract allowlist filtering (issue #47).
                         // None → index all; Some(set) → only listed contracts.
                         if let Some(ref filter) = self.contract_filter {
@@ -284,6 +288,9 @@ impl Streamer {
                                 skipped_in_page += 1;
                                 continue;
                             }
+                        }
+                        if let Some(token) = parsed.token {
+                            page_tokens.push((page_events.len(), token));
                         }
                         page_events.push(event);
                         total += 1;
@@ -372,10 +379,20 @@ impl Streamer {
             // One transaction for the whole page: events, cursor, and ledger
             // metadata land together or not at all, so a crash can never leave
             // the cursor ahead of the events it claims to cover (issue #199).
+            // Resolve the projection indices now that `page_events` is final.
+            let token_projections: Vec<db::TokenProjection<'_>> = page_tokens
+                .iter()
+                .map(|(index, token)| db::TokenProjection {
+                    event: &page_events[*index],
+                    token,
+                })
+                .collect();
+
             db::commit_page(
                 &self.db,
                 db::PageCommit {
                     events: &page_events,
+                    token_events: &token_projections,
                     cursor: next_cursor,
                     ledger: next_cursor.map(|_| db::LedgerMeta {
                         sequence: ledger_sequence,
@@ -399,9 +416,13 @@ impl Streamer {
             // Publish only after the commit so a subscriber can never observe an
             // event that a rolled-back transaction never persisted.
             for event in &page_events {
-                redis_stream::publish_event(&mut self.redis, event, self.config.redis_stream_maxlen)
-                    .instrument(tracing::info_span!("redis_xadd"))
-                    .await?;
+                redis_stream::publish_event(
+                    &mut self.redis,
+                    event,
+                    self.config.redis_stream_maxlen,
+                )
+                .instrument(tracing::info_span!("redis_xadd"))
+                .await?;
             }
 
             // An incomplete page means we have caught up to the chain tip.

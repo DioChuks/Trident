@@ -285,7 +285,10 @@ mod tests {
         let encoded = &patterns[0][0];
         assert_ne!(encoded, "transfer", "segment must be XDR-encoded");
         let bytes = STANDARD.decode(encoded).expect("valid base64");
-        assert!(bytes.ends_with(b"transfer\0\0\0\0"), "XDR-padded symbol body");
+        assert!(
+            bytes.ends_with(b"transfer\0\0\0\0"),
+            "XDR-padded symbol body"
+        );
     }
 
     #[test]

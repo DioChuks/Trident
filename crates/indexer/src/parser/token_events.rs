@@ -1,4 +1,4 @@
-﻿use serde_json::{json, Value as Json};
+use serde_json::{json, Value as Json};
 use tracing::debug;
 
 use super::{scaddress_to_string, scval_to_string};
@@ -464,9 +464,9 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn vec_val(items: Vec<ScVal>) -> ScVal {
-        ScVal::Vec(Some(
-            stellar_xdr::curr::ScVec(stellar_xdr::curr::VecM::try_from(items).unwrap()),
-        ))
+        ScVal::Vec(Some(stellar_xdr::curr::ScVec(
+            stellar_xdr::curr::VecM::try_from(items).unwrap(),
+        )))
     }
 
     #[test]
@@ -533,7 +533,10 @@ mod tests {
     fn typed_amounts_stay_strings_at_i128_extremes() {
         let topics = vec![sym("transfer"), account_addr(1), account_addr(2)];
         let event = decode_token_event(&topics, &i128_val(i128::MAX)).expect("decode");
-        assert_eq!(event.amount.as_deref(), Some(i128::MAX.to_string().as_str()));
+        assert_eq!(
+            event.amount.as_deref(),
+            Some(i128::MAX.to_string().as_str())
+        );
     }
 
     #[test]
