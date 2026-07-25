@@ -822,6 +822,126 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Server-side getEvents filtering (issue #203)
+    // -----------------------------------------------------------------------
+
+    /// Register the allowlist rows the streamer reads on refresh, scoped to the
+    /// network the test config uses.
+    async fn set_allowlist(pool: &sqlx::PgPool, contract_ids: &[&str]) {
+        sqlx::query("DELETE FROM indexed_contracts WHERE network = 'testnet' OR network IS NULL")
+            .execute(pool)
+            .await
+            .unwrap();
+        for id in contract_ids {
+            sqlx::query(
+                "INSERT INTO indexed_contracts (contract_id, network) VALUES ($1, 'testnet')
+                 ON CONFLICT (contract_id, network) DO NOTHING",
+            )
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn get_events_request_carries_allowlist_contract_filter() {
+        let (db_url, redis_url) = require_services!();
+        let server = MockServer::start().await;
+
+        // The mock only matches when the outbound body contains the expected
+        // filter block. If the filter were missing, nothing would match and the
+        // poll would fail — this assertion cannot silently pass.
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(serde_json::json!({
+                "method": "getEvents",
+                "params": {
+                    "filters": [{
+                        "type": "contract",
+                        "contractIds": ["CFILTER_A", "CFILTER_B"]
+                    }]
+                }
+            })))
+            .respond_with(rpc_ok(events_page(600, 0)))
+            .expect(1..)
+            .mount(&server)
+            .await;
+
+        let mut s = make_streamer(&db_url, &redis_url, server.uri()).await;
+        reset_db(&s.db).await;
+        set_allowlist(&s.db, &["CFILTER_A", "CFILTER_B"]).await;
+        s.refresh_contract_filter().await.unwrap();
+
+        let mut cursor = 0u64;
+        s.poll_once(&mut cursor).await.unwrap();
+
+        set_allowlist(&s.db, &[]).await;
+    }
+
+    #[tokio::test]
+    async fn get_events_request_sends_empty_filters_in_index_all_mode() {
+        let (db_url, redis_url) = require_services!();
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(serde_json::json!({
+                "method": "getEvents",
+                "params": { "filters": [] }
+            })))
+            .respond_with(rpc_ok(events_page(601, 0)))
+            .expect(1..)
+            .mount(&server)
+            .await;
+
+        let mut s = make_streamer(&db_url, &redis_url, server.uri()).await;
+        reset_db(&s.db).await;
+        set_allowlist(&s.db, &[]).await;
+        s.refresh_contract_filter().await.unwrap();
+
+        let mut cursor = 0u64;
+        s.poll_once(&mut cursor).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_allowlist_degrades_to_unfiltered_request() {
+        let (db_url, redis_url) = require_services!();
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(serde_json::json!({
+                "method": "getEvents",
+                "params": { "filters": [] }
+            })))
+            .respond_with(rpc_ok(events_page(602, 0)))
+            .expect(1..)
+            .mount(&server)
+            .await;
+
+        let ids: Vec<String> = (0..crate::rpc::filters::MAX_FILTERABLE_CONTRACTS + 1)
+            .map(|i| format!("CBIG_{i:03}"))
+            .collect();
+        let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+
+        let mut s = make_streamer(&db_url, &redis_url, server.uri()).await;
+        reset_db(&s.db).await;
+        set_allowlist(&s.db, &id_refs).await;
+        s.refresh_contract_filter().await.unwrap();
+
+        assert!(
+            s.filter_plan.degraded,
+            "an allowlist past the RPC caps must degrade to index-all"
+        );
+
+        let mut cursor = 0u64;
+        s.poll_once(&mut cursor).await.unwrap();
+
+        set_allowlist(&s.db, &[]).await;
+    }
+
     #[tokio::test]
     async fn full_page_triggers_followup_poll_partial_page_stops() {
         let (db_url, redis_url) = require_services!();
