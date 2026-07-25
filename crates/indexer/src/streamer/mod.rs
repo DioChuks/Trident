@@ -31,7 +31,7 @@ use crate::{
     parser::Parser,
     poll::{AdaptivePoll, AdaptivePollConfig},
     redis_stream,
-    rpc::RpcClient,
+    rpc::{RpcClient, RpcHttpSettings},
 };
 /// How often (in poll loop iterations) we re-query `indexed_contracts`.
 /// At the default 5 s poll interval this is ≈ 60 s — matches the env-var default.
@@ -62,7 +62,16 @@ impl Streamer {
         db: PgPool,
         redis: redis::aio::MultiplexedConnection,
     ) -> Result<Self, TridentError> {
-        let rpc = RpcClient::new(config.stellar_rpc_url.clone());
+        let rpc = RpcClient::with_settings(
+            config.stellar_rpc_url.clone(),
+            &RpcHttpSettings {
+                connect_timeout: config.rpc_connect_timeout,
+                request_timeout: config.rpc_request_timeout,
+                pool_idle_timeout: config.rpc_pool_idle_timeout,
+                pool_max_idle_per_host: config.rpc_pool_max_idle_per_host,
+                tcp_keepalive: config.rpc_tcp_keepalive,
+            },
+        )?;
         let parser = Parser::new(config.index_diagnostic);
         let contract_filter = Self::load_filter(&db, &config.network).await?;
         let alerter = Alerter::from_config(
@@ -554,6 +563,11 @@ mod tests {
             poll_interval_ceiling: Duration::from_millis(500),
             lag_high_watermark: 100,
             poll_hysteresis_ledgers: 10,
+            rpc_connect_timeout: Duration::from_secs(5),
+            rpc_request_timeout: Duration::from_secs(30),
+            rpc_pool_idle_timeout: Duration::from_secs(90),
+            rpc_pool_max_idle_per_host: 8,
+            rpc_tcp_keepalive: Duration::from_secs(60),
             index_diagnostic: false,
             max_events_per_poll: 200,
             redis_stream_maxlen: 10_000,
