@@ -870,6 +870,125 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Token projection (issue #211)
+    // -----------------------------------------------------------------------
+
+    /// A page of standard SEP-41 transfer events, wire-encoded the way the RPC
+    /// returns them so the whole decode path runs.
+    fn token_events_page(ledger: u64, count: usize) -> serde_json::Value {
+        use stellar_xdr::curr::{AccountId, Int128Parts, PublicKey, ScAddress, Uint256};
+
+        let addr = |seed: u8| {
+            let val = ScVal::Address(ScAddress::Account(AccountId(
+                PublicKey::PublicKeyTypeEd25519(Uint256([seed; 32])),
+            )));
+            let mut buf = vec![];
+            val.write_xdr(&mut Limited::new(&mut buf, Limits::none()))
+                .unwrap();
+            STANDARD.encode(buf)
+        };
+        let amount = |v: i64| {
+            let val = ScVal::I128(Int128Parts {
+                hi: 0,
+                lo: v as u64,
+            });
+            let mut buf = vec![];
+            val.write_xdr(&mut Limited::new(&mut buf, Limits::none()))
+                .unwrap();
+            STANDARD.encode(buf)
+        };
+
+        let events: Vec<serde_json::Value> = (0..count)
+            .map(|i| {
+                serde_json::json!({
+                    "type": "contract",
+                    "ledger": ledger.to_string(),
+                    "ledgerClosedAt": "2024-01-01T00:00:00Z",
+                    "contractId": "CTOKEN_PROJECTION",
+                    "id": format!("{:016}-{}", ledger, i),
+                    "pagingToken": format!("{}-{}", ledger, i),
+                    "txHash": format!("tokenhash{}{}", ledger, i),
+                    "topic": [sym_xdr("transfer"), addr(1), addr(2)],
+                    "value": amount(1_000 + i as i64),
+                    "inSuccessfulContractCall": true
+                })
+            })
+            .collect();
+
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": { "events": events, "latestLedger": ledger }
+        })
+    }
+
+    #[tokio::test]
+    async fn token_events_are_projected_into_the_projection_table() {
+        let (db_url, redis_url) = require_services!();
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "getLedgers" }),
+            ))
+            .respond_with(rpc_ok(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "ledgers": [] }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "getEvents" }),
+            ))
+            .respond_with(rpc_ok(token_events_page(700, 3)))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "getEvents" }),
+            ))
+            .respond_with(rpc_ok(events_page(700, 0)))
+            .mount(&server)
+            .await;
+
+        let mut s = make_streamer(&db_url, &redis_url, server.uri()).await;
+        reset_db(&s.db).await;
+
+        let mut cursor = 0u64;
+        s.poll_once(&mut cursor).await.unwrap();
+
+        let rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT event_type, amount, to_address FROM token_events
+             WHERE contract_id = 'CTOKEN_PROJECTION' ORDER BY event_index",
+        )
+        .fetch_all(&s.db)
+        .await
+        .unwrap();
+
+        assert_eq!(rows.len(), 3, "every transfer must be projected");
+        assert!(rows.iter().all(|(kind, _, _)| kind == "transfer"));
+        assert_eq!(rows[0].1.as_deref(), Some("1000"));
+        assert!(rows[0].2.is_some(), "transfer must record a destination");
+
+        // Replaying the same page must not duplicate the projection.
+        let mut replay_cursor = 0u64;
+        let _ = s.poll_once(&mut replay_cursor).await;
+        let count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM token_events WHERE contract_id = 'CTOKEN_PROJECTION'",
+        )
+        .fetch_one(&s.db)
+        .await
+        .unwrap();
+        assert_eq!(count.0, 3, "replay must not duplicate projection rows");
+    }
+
+    // -----------------------------------------------------------------------
     // Server-side getEvents filtering (issue #203)
     // -----------------------------------------------------------------------
 
