@@ -460,6 +460,82 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Golden fixtures (issue #211)
+    //
+    // Each fixture is a wire-format event — base64 XDR topics and body, exactly
+    // as getEvents returns them — decoded through the production path.
+    // -----------------------------------------------------------------------
+
+    /// Decode a fixture and assert every expected field, including that fields
+    /// the event should not carry are absent.
+    fn assert_fixture(raw: &str) {
+        let fixture: serde_json::Value = serde_json::from_str(raw).expect("fixture JSON");
+
+        let topics: Vec<ScVal> = fixture["topics"]
+            .as_array()
+            .expect("topics array")
+            .iter()
+            .map(|t| super::super::decode_scval(t.as_str().unwrap()).expect("topic XDR"))
+            .collect();
+        let data = super::super::decode_scval(fixture["data"].as_str().unwrap()).expect("body XDR");
+
+        let expected = &fixture["expected"];
+        let decoded = decode_token_event(&topics, &data)
+            .unwrap_or_else(|| panic!("fixture {} must decode", fixture["name"]));
+
+        assert_eq!(
+            decoded.event_type.as_str(),
+            expected["event_type"].as_str().unwrap()
+        );
+
+        let expect_field = |actual: &Option<String>, key: &str| {
+            let want = expected.get(key).and_then(|v| v.as_str());
+            assert_eq!(
+                actual.as_deref(),
+                want,
+                "field {key} mismatch in fixture {}",
+                fixture["name"]
+            );
+        };
+
+        expect_field(&decoded.from, "from");
+        expect_field(&decoded.to, "to");
+        expect_field(&decoded.spender, "spender");
+        expect_field(&decoded.admin, "admin");
+        expect_field(&decoded.amount, "amount");
+
+        assert_eq!(
+            decoded.expiration_ledger,
+            expected.get("expiration_ledger").and_then(|v| v.as_i64())
+        );
+    }
+
+    #[test]
+    fn transfer_fixture_decodes() {
+        assert_fixture(include_str!("../../fixtures/token_events/transfer.json"));
+    }
+
+    #[test]
+    fn mint_fixture_decodes() {
+        assert_fixture(include_str!("../../fixtures/token_events/mint.json"));
+    }
+
+    #[test]
+    fn burn_fixture_decodes() {
+        assert_fixture(include_str!("../../fixtures/token_events/burn.json"));
+    }
+
+    #[test]
+    fn clawback_fixture_decodes() {
+        assert_fixture(include_str!("../../fixtures/token_events/clawback.json"));
+    }
+
+    #[test]
+    fn approve_fixture_decodes() {
+        assert_fixture(include_str!("../../fixtures/token_events/approve.json"));
+    }
+
+    // -----------------------------------------------------------------------
     // Typed projection decoding (issue #211)
     // -----------------------------------------------------------------------
 

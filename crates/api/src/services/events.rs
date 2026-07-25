@@ -45,8 +45,59 @@ fn extract_context(metadata: &tonic::metadata::MetadataMap) -> opentelemetry::Co
 }
 
 const REDIS_STREAM_KEY: &str = "trident:events";
-const STREAM_CHANNEL_BUF: usize = 128;
+
+/// Default in-flight buffer per subscriber. Bounded so one slow consumer
+/// cannot make the server accumulate events without limit; when it fills, the
+/// consumer task blocks on send and stops reading Redis.
+const DEFAULT_STREAM_CHANNEL_BUF: usize = 128;
+
+/// How long a single blocking XREAD waits before looping. Short enough that a
+/// dropped client is noticed promptly, long enough to avoid busy polling.
+const XREAD_BLOCK_MS: usize = 5_000;
+
+/// Redis stream ID meaning "only entries added after this call".
+const STREAM_ID_LIVE_TAIL: &str = "$";
+
 const DEFAULT_NETWORK: &str = "testnet";
+
+/// Per-subscriber buffer size, overridable via `STREAM_CHANNEL_BUFFER`.
+fn stream_channel_buffer() -> usize {
+    std::env::var("STREAM_CHANNEL_BUFFER")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_STREAM_CHANNEL_BUF)
+}
+
+/// Validate a client-supplied resume point.
+///
+/// Redis stream IDs are `<millis>-<seq>`. `0` (replay everything still in the
+/// stream) and `$` (live tail) are also accepted. Anything else is rejected
+/// rather than passed through, because Redis would answer a malformed ID with a
+/// connection-level error that the subscriber would see as an opaque failure.
+fn validate_start_id(start_id: &str) -> Result<String, Status> {
+    if start_id.is_empty() {
+        return Ok(STREAM_ID_LIVE_TAIL.to_string());
+    }
+    if start_id == STREAM_ID_LIVE_TAIL || start_id == "0" {
+        return Ok(start_id.to_string());
+    }
+
+    let mut parts = start_id.split('-');
+    let valid = matches!((parts.next(), parts.next(), parts.next()), (Some(ms), Some(seq), None)
+        if !ms.is_empty()
+            && !seq.is_empty()
+            && ms.bytes().all(|b| b.is_ascii_digit())
+            && seq.bytes().all(|b| b.is_ascii_digit()));
+
+    if valid {
+        Ok(start_id.to_string())
+    } else {
+        Err(Status::invalid_argument(
+            "start_id must be a Redis stream ID (<millis>-<seq>), \"0\", or \"$\"",
+        ))
+    }
+}
 
 pub struct EventsServiceImpl {
     pub db: PgPool,
