@@ -81,6 +81,196 @@ pub async fn insert_event(pool: &PgPool, event: &SorobanEvent) -> Result<(), Tri
     Ok(())
 }
 
+/// Ledger provenance recorded alongside a committed page.
+pub struct LedgerMeta<'a> {
+    pub sequence: u64,
+    pub hash: &'a str,
+    pub timestamp: &'a str,
+    pub event_count: i32,
+}
+
+/// Everything one RPC page contributes to the database, committed atomically.
+///
+/// Bundling the events with the cursor advance is what stops a crash between
+/// the two from leaving the cursor ahead of the data it claims to cover.
+pub struct PageCommit<'a> {
+    pub events: &'a [SorobanEvent],
+    /// New cursor value, when the page advanced it.
+    pub cursor: Option<u64>,
+    /// Ledger metadata row, written only when the cursor advanced.
+    pub ledger: Option<LedgerMeta<'a>>,
+    /// Maximum rows per INSERT statement, bounding statement size and memory.
+    pub batch_size: usize,
+}
+
+/// Columns of a batch of events, transposed into the parallel arrays that the
+/// `UNNEST` insert binds. Building this once avoids re-deriving per row.
+struct EventColumns {
+    ids: Vec<Uuid>,
+    contract_ids: Vec<String>,
+    ledger_sequences: Vec<i64>,
+    ledger_timestamps: Vec<DateTime<Utc>>,
+    transaction_hashes: Vec<String>,
+    event_indexes: Vec<i32>,
+    event_types: Vec<String>,
+    topics: Vec<serde_json::Value>,
+    data: Vec<serde_json::Value>,
+}
+
+fn event_type_str(event_type: &EventType) -> &'static str {
+    match event_type {
+        EventType::Contract => "contract",
+        EventType::System => "system",
+        EventType::Diagnostic => "diagnostic",
+    }
+}
+
+impl EventColumns {
+    fn build(events: &[SorobanEvent]) -> Result<Self, TridentError> {
+        let mut cols = EventColumns {
+            ids: Vec::with_capacity(events.len()),
+            contract_ids: Vec::with_capacity(events.len()),
+            ledger_sequences: Vec::with_capacity(events.len()),
+            ledger_timestamps: Vec::with_capacity(events.len()),
+            transaction_hashes: Vec::with_capacity(events.len()),
+            event_indexes: Vec::with_capacity(events.len()),
+            event_types: Vec::with_capacity(events.len()),
+            topics: Vec::with_capacity(events.len()),
+            data: Vec::with_capacity(events.len()),
+        };
+
+        for event in events {
+            let ledger_ts: DateTime<Utc> = event.ledger_timestamp.parse().map_err(|e| {
+                TridentError::storage(anyhow::Error::new(e).context("ledger timestamp parse"))
+            })?;
+            let topics = serde_json::to_value(&event.topics).map_err(|e| {
+                TridentError::storage(anyhow::Error::new(e).context("topics serialise"))
+            })?;
+
+            cols.ids.push(event_uuid(
+                &event.contract_id,
+                event.ledger_sequence,
+                event.event_index,
+            ));
+            cols.contract_ids.push(event.contract_id.clone());
+            cols.ledger_sequences.push(event.ledger_sequence as i64);
+            cols.ledger_timestamps.push(ledger_ts);
+            cols.transaction_hashes.push(event.transaction_hash.clone());
+            cols.event_indexes.push(event.event_index as i32);
+            cols.event_types
+                .push(event_type_str(&event.event_type).to_string());
+            cols.topics.push(topics);
+            cols.data.push(event.data.clone());
+        }
+
+        Ok(cols)
+    }
+}
+
+/// Insert a batch of events in a single statement (issue #199).
+///
+/// One round-trip per batch instead of one per row. Duplicate handling is
+/// unchanged: the deterministic UUIDv5 primary key plus `ON CONFLICT (id) DO
+/// NOTHING` means a replayed page inserts nothing new.
+pub async fn insert_events_batch<'e, E>(
+    executor: E,
+    events: &[SorobanEvent],
+) -> Result<(), TridentError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    if events.is_empty() {
+        return Ok(());
+    }
+
+    let cols = EventColumns::build(events)?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO soroban_events
+            (id, contract_id, ledger_sequence, ledger_timestamp, transaction_hash,
+             event_index, event_type, topics, data)
+        SELECT * FROM UNNEST(
+            $1::uuid[], $2::text[], $3::bigint[], $4::timestamptz[], $5::text[],
+            $6::int[], $7::text[], $8::jsonb[], $9::jsonb[]
+        )
+        ON CONFLICT (id) DO NOTHING
+        "#,
+    )
+    .bind(&cols.ids)
+    .bind(&cols.contract_ids)
+    .bind(&cols.ledger_sequences)
+    .bind(&cols.ledger_timestamps)
+    .bind(&cols.transaction_hashes)
+    .bind(&cols.event_indexes)
+    .bind(&cols.event_types)
+    .bind(&cols.topics)
+    .bind(&cols.data)
+    .execute(executor)
+    .await
+    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("insert_events_batch")))?;
+
+    Ok(())
+}
+
+/// Persist one RPC page — events, cursor, and ledger metadata — in a single
+/// transaction (issue #199).
+///
+/// Events are chunked to `batch_size` so a very large page cannot produce an
+/// unbounded statement, but every chunk shares the one transaction: either the
+/// whole page and its cursor advance land, or none of it does.
+pub async fn commit_page(pool: &PgPool, commit: PageCommit<'_>) -> Result<(), TridentError> {
+    let batch_size = commit.batch_size.max(1);
+
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("commit_page begin")))?;
+
+    for chunk in commit.events.chunks(batch_size) {
+        insert_events_batch(&mut *tx, chunk).await?;
+    }
+
+    if let Some(cursor) = commit.cursor {
+        sqlx::query(
+            "UPDATE system_state SET value = $1, updated_at = NOW() WHERE key = 'latest_ledger_cursor'",
+        )
+        .bind(cursor.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("commit_page set_cursor")))?;
+    }
+
+    if let Some(ledger) = commit.ledger {
+        let ts: DateTime<Utc> = ledger.timestamp.parse().map_err(|e| {
+            TridentError::storage(anyhow::Error::new(e).context("ledger timestamp parse"))
+        })?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO ledger_metadata (ledger_sequence, ledger_hash, ledger_timestamp, event_count)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (ledger_sequence) DO NOTHING
+            "#,
+        )
+        .bind(ledger.sequence as i64)
+        .bind(ledger.hash)
+        .bind(ts)
+        .bind(ledger.event_count)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            TridentError::storage(anyhow::Error::new(e).context("commit_page ledger_metadata"))
+        })?;
+    }
+
+    tx.commit()
+        .await
+        .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("commit_page commit")))?;
+
+    Ok(())
+}
+
 /// Read the latest processed ledger cursor from system_state.
 pub async fn get_cursor(pool: &PgPool) -> Result<u64, TridentError> {
     let row: (String,) =
