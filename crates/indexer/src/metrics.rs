@@ -20,6 +20,8 @@ pub const POLL_ERRORS_TOTAL: &str = "trident_indexer_poll_errors_total";
 pub const RPC_RETRIES_TOTAL: &str = "trident_indexer_rpc_retries_total";
 pub const EFFECTIVE_POLL_INTERVAL_MS: &str = "trident_indexer_effective_poll_interval_ms";
 pub const RPC_TIMEOUTS_TOTAL: &str = "trident_indexer_rpc_timeouts_total";
+pub const RPC_ACTIVE_ENDPOINT: &str = "trident_indexer_rpc_active_endpoint";
+pub const RPC_FAILOVERS_TOTAL: &str = "trident_indexer_rpc_failovers_total";
 
 /// Install the global Prometheus recorder and start serving `/metrics` on
 /// `port`. Must be called once, before the streamer starts recording.
@@ -60,6 +62,14 @@ pub fn install(port: u16) -> Result<(), TridentError> {
         RPC_TIMEOUTS_TOTAL,
         "RPC calls aborted by the connect or request timeout (issue #214)"
     );
+    describe_gauge!(
+        RPC_ACTIVE_ENDPOINT,
+        "Index of the RPC endpoint currently in use, 0 = primary (issue #213)"
+    );
+    describe_counter!(
+        RPC_FAILOVERS_TOTAL,
+        "Times the indexer failed over to another RPC endpoint (issue #213)"
+    );
 
     // Counters only render in the scrape output once touched at least once;
     // seed them at zero so /metrics is complete from the very first scrape.
@@ -69,6 +79,8 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     counter!(POLL_ERRORS_TOTAL).increment(0);
     counter!(RPC_RETRIES_TOTAL).increment(0);
     counter!(RPC_TIMEOUTS_TOTAL).increment(0);
+    counter!(RPC_FAILOVERS_TOTAL).increment(0);
+    gauge!(RPC_ACTIVE_ENDPOINT).set(0.0);
     gauge!(LEDGER_LAG).set(0.0);
     gauge!(EFFECTIVE_POLL_INTERVAL_MS).set(0.0);
 
@@ -115,4 +127,15 @@ pub fn record_rpc_retry() {
 /// Count an RPC call that hit the connect or overall request timeout (issue #214).
 pub fn record_rpc_timeout() {
     counter!(RPC_TIMEOUTS_TOTAL).increment(1);
+}
+
+/// Publish which endpoint of the configured pool is currently serving traffic
+/// (0 = primary), so a silent, sustained failover is visible (issue #213).
+pub fn set_rpc_active_endpoint(index: usize) {
+    gauge!(RPC_ACTIVE_ENDPOINT).set(index as f64);
+}
+
+/// Count a switch to a different RPC endpoint (issue #213).
+pub fn record_rpc_failover() {
+    counter!(RPC_FAILOVERS_TOTAL).increment(1);
 }
