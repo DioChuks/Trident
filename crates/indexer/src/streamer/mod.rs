@@ -62,8 +62,8 @@ impl Streamer {
         db: PgPool,
         redis: redis::aio::MultiplexedConnection,
     ) -> Result<Self, TridentError> {
-        let rpc = RpcClient::with_settings(
-            config.stellar_rpc_url.clone(),
+        let rpc = RpcClient::with_endpoints(
+            config.stellar_rpc_urls.clone(),
             &RpcHttpSettings {
                 connect_timeout: config.rpc_connect_timeout,
                 request_timeout: config.rpc_request_timeout,
@@ -71,7 +71,14 @@ impl Streamer {
                 pool_max_idle_per_host: config.rpc_pool_max_idle_per_host,
                 tcp_keepalive: config.rpc_tcp_keepalive,
             },
+            config.rpc_failover_threshold,
+            config.rpc_endpoint_cooldown,
         )?;
+        tracing::info!(
+            endpoints = config.stellar_rpc_urls.len(),
+            primary = %config.stellar_rpc_url,
+            "RPC endpoint pool configured"
+        );
         let parser = Parser::new(config.index_diagnostic);
         let contract_filter = Self::load_filter(&db, &config.network).await?;
         let alerter = Alerter::from_config(
@@ -553,7 +560,7 @@ mod tests {
             .await
             .unwrap();
         let config = Config {
-            stellar_rpc_url: rpc_url,
+            stellar_rpc_url: rpc_url.clone(),
             database_url: db_url.to_string(),
             db_pool_size: 3,
             redis_url: redis_url.to_string(),
@@ -563,6 +570,9 @@ mod tests {
             poll_interval_ceiling: Duration::from_millis(500),
             lag_high_watermark: 100,
             poll_hysteresis_ledgers: 10,
+            stellar_rpc_urls: vec![rpc_url],
+            rpc_failover_threshold: 3,
+            rpc_endpoint_cooldown: Duration::from_secs(30),
             rpc_connect_timeout: Duration::from_secs(5),
             rpc_request_timeout: Duration::from_secs(30),
             rpc_pool_idle_timeout: Duration::from_secs(90),
