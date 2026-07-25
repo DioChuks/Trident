@@ -484,18 +484,20 @@ mod tests {
         let contract_id = format!("CBATCH_{}", Uuid::new_v4());
         let events: Vec<SorobanEvent> = (0..25).map(|i| make_event(&contract_id, 900, i)).collect();
 
-        let commit = |events: &'_ [SorobanEvent]| PageCommit {
-            events,
-            cursor: Some(900),
-            ledger: Some(LedgerMeta {
-                sequence: 900,
-                hash: "hash900",
-                timestamp: "2024-01-01T00:00:00Z",
-                event_count: events.len() as i32,
-            }),
-            // Deliberately smaller than the page so chunking is exercised.
-            batch_size: 10,
-        };
+        fn commit(events: &[SorobanEvent]) -> PageCommit<'_> {
+            PageCommit {
+                events,
+                cursor: Some(900),
+                ledger: Some(LedgerMeta {
+                    sequence: 900,
+                    hash: "hash900",
+                    timestamp: "2024-01-01T00:00:00Z",
+                    event_count: events.len() as i32,
+                }),
+                // Deliberately smaller than the page so chunking is exercised.
+                batch_size: 10,
+            }
+        }
 
         commit_page(&pool, commit(&events))
             .await
