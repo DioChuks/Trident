@@ -312,7 +312,7 @@ impl Streamer {
             }
         }
 
-        tracing::info!("Streamer stopped cleanly");
+        tracing::info!(cursor, "Streamer stopped cleanly; cursor persisted");
         Ok(())
     }
 
@@ -503,10 +503,13 @@ impl Streamer {
             // Indices, not references, because `page_events` is still growing.
             let mut page_tokens: Vec<(usize, crate::parser::token_events::TokenEvent)> = Vec::new();
             for raw in &page.events {
+                let decode_start = Instant::now();
                 let parse_result = {
                     let _span = tracing::info_span!("parse_events").entered();
                     self.parser.parse_event_with_projection(raw)
                 };
+                metrics::record_decode_duration(decode_start.elapsed().as_secs_f64());
+
                 match parse_result {
                     Ok(Some(parsed)) => {
                         let event = parsed.event;
@@ -518,10 +521,17 @@ impl Streamer {
                                     contract_id = %event.contract_id,
                                     "Skipping event from unlisted contract"
                                 );
+                                // Unlisted contracts land in the "other" bucket to
+                                // bound cardinality (issue #212).
+                                metrics::record_events_by_contract("other", 1);
                                 skipped_in_page += 1;
                                 continue;
                             }
                         }
+                        // Allowlisted or index-all: record under the real contract_id.
+                        // In index-all mode cardinality is unbounded — operators should
+                        // configure an allowlist if per-contract metrics are needed.
+                        metrics::record_events_by_contract(&event.contract_id, 1);
                         // Events are accumulated and committed as one page,
                         // together with their outbox rows; the relay owns the
                         // Redis publish (issues #199, #200). Publishing inline

@@ -29,6 +29,10 @@ pub const OUTBOX_PUBLISH_FAILURES_TOTAL: &str = "trident_indexer_outbox_publish_
 /// `time() - trident_indexer_last_poll_timestamp_seconds > N` as a
 /// dead-man's-switch alert for a stalled indexer (#218).
 pub const HEARTBEAT_TIMESTAMP: &str = "trident_indexer_last_poll_timestamp_seconds";
+/// Bounded per-contract event counter. Labels: `contract` (allowlisted contract ID or `"other"`).
+/// Cardinality: |allowlist| + 1. In index-all mode (no allowlist) all events land in `"other"`.
+pub const EVENTS_BY_CONTRACT_TOTAL: &str = "trident_indexer_events_by_contract_total";
+pub const EVENT_DECODE_DURATION_SECONDS: &str = "trident_indexer_event_decode_duration_seconds";
 
 /// Install the global Prometheus recorder and start serving `/metrics` on
 /// `port`. Must be called once, before the streamer starts recording.
@@ -92,6 +96,14 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     describe_gauge!(
         HEARTBEAT_TIMESTAMP,
         "Unix timestamp (seconds) of the most recent completed poll cycle (#218)"
+    );
+    describe_counter!(
+        EVENTS_BY_CONTRACT_TOTAL,
+        "Events processed per contract (bounded: allowlisted contract IDs + 'other' bucket)"
+    );
+    describe_histogram!(
+        EVENT_DECODE_DURATION_SECONDS,
+        "Time to XDR-decode a single event, in seconds (per-event parse latency)"
     );
 
     // Counters only render in the scrape output once touched at least once;
@@ -188,4 +200,16 @@ pub fn record_outbox_published() {
 /// Count a failed relay publish attempt (issue #200).
 pub fn record_outbox_publish_failure() {
     counter!(OUTBOX_PUBLISH_FAILURES_TOTAL).increment(1);
+}
+
+/// Increment the per-contract event counter. `contract_id` must be either an
+/// allowlisted contract ID or the sentinel `"other"` — never an unbounded value.
+pub fn record_events_by_contract(contract_id: &str, count: u64) {
+    if count > 0 {
+        counter!(EVENTS_BY_CONTRACT_TOTAL, "contract" => contract_id.to_string()).increment(count);
+    }
+}
+
+pub fn record_decode_duration(seconds: f64) {
+    histogram!(EVENT_DECODE_DURATION_SECONDS).record(seconds);
 }
