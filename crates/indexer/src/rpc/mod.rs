@@ -1,6 +1,10 @@
 use serde::{Deserialize, Serialize};
 use trident_common::TridentError;
 
+pub mod filters;
+
+pub use filters::{EventFilter, FilterPlan};
+
 /// A single raw event as returned by the Stellar RPC `getEvents` method.
 /// Topics and data are base64-encoded XDR strings; the parser decodes them.
 #[derive(Debug, Deserialize)]
@@ -79,10 +83,12 @@ struct LedgerSummary {
 }
 
 #[derive(Serialize)]
-struct GetEventsParams {
+struct GetEventsParams<'a> {
     #[serde(rename = "startLedger", skip_serializing_if = "Option::is_none")]
     start_ledger: Option<u64>,
-    filters: Vec<serde_json::Value>,
+    /// Server-side narrowing (issue #203). Always serialised — an empty array is
+    /// the RPC's "no filter" form and is what index-all mode sends.
+    filters: &'a [EventFilter],
     pagination: Pagination,
 }
 
@@ -169,15 +175,19 @@ impl RpcClient {
     /// set at a time — the RPC rejects requests that supply both.
     ///
     /// `limit` controls the page size; callers should pass `config.max_events_per_poll`.
+    ///
+    /// `filters` narrows the result set server-side (issue #203). Pass an empty
+    /// slice to index every contract.
     pub async fn get_events(
         &self,
         start_ledger: Option<u64>,
         cursor: Option<String>,
         limit: u32,
+        filters: &[EventFilter],
     ) -> Result<EventsPage, TridentError> {
         let params = GetEventsParams {
             start_ledger,
-            filters: vec![],
+            filters,
             pagination: Pagination { limit, cursor },
         };
 
