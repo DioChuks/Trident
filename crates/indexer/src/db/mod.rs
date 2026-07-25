@@ -40,11 +40,58 @@ fn event_uuid(contract_id: &str, ledger_sequence: u64, event_index: u32) -> Uuid
     Uuid::new_v5(&EVENT_NS, key.as_bytes())
 }
 
-/// Insert a normalised event. Silently ignores duplicates via `ON CONFLICT (id) DO NOTHING`.
-/// The `id` is a deterministic UUIDv5 derived from `(contract_id, ledger_sequence, event_index)`,
-/// so replaying the same event always produces the same primary key.
-pub async fn insert_event(pool: &PgPool, event: &SorobanEvent) -> Result<(), TridentError> {
+pub mod outbox;
+
+/// Insert a normalised event together with its outbox row, in one transaction
+/// (issue #200).
+///
+/// Either both rows commit or neither does, so a committed event always carries
+/// a delivery record: the relay will publish it even if the indexer dies before
+/// the Redis `XADD`. Both inserts are idempotent on the deterministic event id,
+/// so replaying a ledger neither duplicates the event nor re-queues a delivery.
+pub async fn insert_event_with_outbox(
+    pool: &PgPool,
+    event: &SorobanEvent,
+) -> Result<(), TridentError> {
     let id = event_uuid(&event.contract_id, event.ledger_sequence, event.event_index);
+    let payload = serde_json::to_value(event).map_err(|e| {
+        TridentError::storage(anyhow::Error::new(e).context("outbox payload serialise"))
+    })?;
+
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("begin event tx")))?;
+
+    insert_event_query(id, event)?
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("insert_event")))?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO event_outbox (event_id, payload)
+        VALUES ($1, $2)
+        ON CONFLICT (event_id) DO NOTHING
+        "#,
+    )
+    .bind(id)
+    .bind(&payload)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("insert_outbox")))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("commit event tx")))
+}
+
+/// Build the idempotent `soroban_events` insert shared by the plain and
+/// transactional insert paths.
+fn insert_event_query(
+    id: Uuid,
+    event: &SorobanEvent,
+) -> Result<sqlx::query::Query<'_, sqlx::Postgres, sqlx::postgres::PgArguments>, TridentError> {
     let event_type = match event.event_type {
         EventType::Contract => "contract",
         EventType::System => "system",
@@ -56,7 +103,7 @@ pub async fn insert_event(pool: &PgPool, event: &SorobanEvent) -> Result<(), Tri
         TridentError::storage(anyhow::Error::new(e).context("ledger timestamp parse"))
     })?;
 
-    sqlx::query(
+    Ok(sqlx::query(
         r#"
         INSERT INTO soroban_events
             (id, contract_id, ledger_sequence, ledger_timestamp, transaction_hash,
@@ -72,11 +119,20 @@ pub async fn insert_event(pool: &PgPool, event: &SorobanEvent) -> Result<(), Tri
     .bind(&event.transaction_hash)
     .bind(event.event_index as i32)
     .bind(event_type)
-    .bind(&topics)
-    .bind(&event.data)
-    .execute(pool)
-    .await
-    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("insert_event")))?;
+    .bind(topics)
+    .bind(&event.data))
+}
+
+/// Insert a normalised event. Silently ignores duplicates via `ON CONFLICT (id) DO NOTHING`.
+/// The `id` is a deterministic UUIDv5 derived from `(contract_id, ledger_sequence, event_index)`,
+/// so replaying the same event always produces the same primary key.
+pub async fn insert_event(pool: &PgPool, event: &SorobanEvent) -> Result<(), TridentError> {
+    let id = event_uuid(&event.contract_id, event.ledger_sequence, event.event_index);
+
+    insert_event_query(id, event)?
+        .execute(pool)
+        .await
+        .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("insert_event")))?;
 
     Ok(())
 }
