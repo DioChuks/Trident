@@ -203,6 +203,8 @@ func main() {
 	mux.HandleFunc("PATCH /v1/webhooks/{id}/pause", pauseWebhookHandler(webhookDB))
 	mux.HandleFunc("PATCH /v1/webhooks/{id}/resume", resumeWebhookHandler(webhookDB))
 	mux.HandleFunc("GET /v1/webhooks/{id}/deliveries", deliveriesWebhookHandler(webhookDB))
+	mux.HandleFunc("GET /v1/webhooks/{id}/dead-letters", deadLettersWebhookHandler(webhookDB))
+	mux.HandleFunc("POST /v1/webhooks/{id}/dead-letters/{deliveryId}/replay", replayDeadLetterHandler(webhookDB))
 	mux.HandleFunc("GET /metrics", handlers.MetricsHandler())
 	mux.HandleFunc("GET /internal/status", handlers.InternalStatus())
 	mux.Handle("/ws", middleware.WSConnectionLimit(ws.Handler(hub)))
