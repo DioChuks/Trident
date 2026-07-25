@@ -19,6 +19,7 @@ pub const POLL_DURATION_SECONDS: &str = "trident_indexer_poll_duration_seconds";
 pub const POLL_ERRORS_TOTAL: &str = "trident_indexer_poll_errors_total";
 pub const RPC_RETRIES_TOTAL: &str = "trident_indexer_rpc_retries_total";
 pub const EFFECTIVE_POLL_INTERVAL_MS: &str = "trident_indexer_effective_poll_interval_ms";
+pub const RPC_TIMEOUTS_TOTAL: &str = "trident_indexer_rpc_timeouts_total";
 
 /// Install the global Prometheus recorder and start serving `/metrics` on
 /// `port`. Must be called once, before the streamer starts recording.
@@ -55,6 +56,10 @@ pub fn install(port: u16) -> Result<(), TridentError> {
         EFFECTIVE_POLL_INTERVAL_MS,
         "Current adaptive poll interval in milliseconds (issue #198)"
     );
+    describe_counter!(
+        RPC_TIMEOUTS_TOTAL,
+        "RPC calls aborted by the connect or request timeout (issue #214)"
+    );
 
     // Counters only render in the scrape output once touched at least once;
     // seed them at zero so /metrics is complete from the very first scrape.
@@ -63,6 +68,7 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     counter!(PARSE_ERRORS_TOTAL).increment(0);
     counter!(POLL_ERRORS_TOTAL).increment(0);
     counter!(RPC_RETRIES_TOTAL).increment(0);
+    counter!(RPC_TIMEOUTS_TOTAL).increment(0);
     gauge!(LEDGER_LAG).set(0.0);
     gauge!(EFFECTIVE_POLL_INTERVAL_MS).set(0.0);
 
@@ -104,4 +110,9 @@ pub fn record_poll_error() {
 
 pub fn record_rpc_retry() {
     counter!(RPC_RETRIES_TOTAL).increment(1);
+}
+
+/// Count an RPC call that hit the connect or overall request timeout (issue #214).
+pub fn record_rpc_timeout() {
+    counter!(RPC_TIMEOUTS_TOTAL).increment(1);
 }
