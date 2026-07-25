@@ -40,47 +40,6 @@ fn event_uuid(contract_id: &str, ledger_sequence: u64, event_index: u32) -> Uuid
     Uuid::new_v5(&EVENT_NS, key.as_bytes())
 }
 
-/// Insert a normalised event. Silently ignores duplicates via `ON CONFLICT (id) DO NOTHING`.
-/// The `id` is a deterministic UUIDv5 derived from `(contract_id, ledger_sequence, event_index)`,
-/// so replaying the same event always produces the same primary key.
-pub async fn insert_event(pool: &PgPool, event: &SorobanEvent) -> Result<(), TridentError> {
-    let id = event_uuid(&event.contract_id, event.ledger_sequence, event.event_index);
-    let event_type = match event.event_type {
-        EventType::Contract => "contract",
-        EventType::System => "system",
-        EventType::Diagnostic => "diagnostic",
-    };
-    let topics = serde_json::to_value(&event.topics)
-        .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("topics serialise")))?;
-    let ledger_ts: DateTime<Utc> = event.ledger_timestamp.parse().map_err(|e| {
-        TridentError::storage(anyhow::Error::new(e).context("ledger timestamp parse"))
-    })?;
-
-    sqlx::query(
-        r#"
-        INSERT INTO soroban_events
-            (id, contract_id, ledger_sequence, ledger_timestamp, transaction_hash,
-             event_index, event_type, topics, data)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        ON CONFLICT (id) DO NOTHING
-        "#,
-    )
-    .bind(id)
-    .bind(&event.contract_id)
-    .bind(event.ledger_sequence as i64)
-    .bind(ledger_ts)
-    .bind(&event.transaction_hash)
-    .bind(event.event_index as i32)
-    .bind(event_type)
-    .bind(&topics)
-    .bind(&event.data)
-    .execute(pool)
-    .await
-    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("insert_event")))?;
-
-    Ok(())
-}
-
 /// Ledger provenance recorded alongside a committed page.
 pub struct LedgerMeta<'a> {
     pub sequence: u64,
@@ -284,50 +243,6 @@ pub async fn get_cursor(pool: &PgPool) -> Result<u64, TridentError> {
         .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("cursor parse")))
 }
 
-/// Persist the latest processed ledger sequence so the streamer can resume
-/// from the correct position after a restart.
-pub async fn set_cursor(pool: &PgPool, ledger: u64) -> Result<(), TridentError> {
-    sqlx::query(
-        "UPDATE system_state SET value = $1, updated_at = NOW() WHERE key = 'latest_ledger_cursor'",
-    )
-    .bind(ledger.to_string())
-    .execute(pool)
-    .await
-    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("set_cursor")))?;
-
-    Ok(())
-}
-
-/// Record a processed ledger in ledger_metadata for gap detection.
-pub async fn insert_ledger_metadata(
-    pool: &PgPool,
-    ledger_sequence: u64,
-    ledger_hash: &str,
-    ledger_timestamp: &str,
-    event_count: i32,
-) -> Result<(), TridentError> {
-    let ts: DateTime<Utc> = ledger_timestamp.parse().map_err(|e| {
-        TridentError::storage(anyhow::Error::new(e).context("ledger timestamp parse"))
-    })?;
-
-    sqlx::query(
-        r#"
-        INSERT INTO ledger_metadata (ledger_sequence, ledger_hash, ledger_timestamp, event_count)
-        VALUES ($1, $2, $3, $4)
-        ON CONFLICT (ledger_sequence) DO NOTHING
-        "#,
-    )
-    .bind(ledger_sequence as i64)
-    .bind(ledger_hash)
-    .bind(ts)
-    .bind(event_count)
-    .execute(pool)
-    .await
-    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("insert_ledger_metadata")))?;
-
-    Ok(())
-}
-
 /// Write indexer health metrics into the `system_state` health columns after
 /// every successful poll cycle (issue #62).
 ///
@@ -483,13 +398,13 @@ mod tests {
         assert_ne!(a, b);
     }
 
-    /// Calling `insert_event` twice with the same event must not error and
-    /// the row count in `soroban_events` must remain 1.
+    /// Committing the same event twice must not error and the row count in
+    /// `soroban_events` must remain 1.
     ///
     /// Uses the shared test database (TEST_DATABASE_URL) like the other
     /// integration tests; skips when it is not configured.
     #[tokio::test]
-    async fn insert_event_is_idempotent() {
+    async fn batch_insert_is_idempotent() {
         let db_url = match std::env::var("TEST_DATABASE_URL") {
             Ok(url) => url,
             // Hard-fail under the rust-integration CI job (REQUIRE_TEST_SERVICES)
@@ -513,10 +428,11 @@ mod tests {
             .await
             .expect("cleanup failed");
 
-        insert_event(&pool, &event)
+        let events = [event.clone()];
+        insert_events_batch(&pool, &events)
             .await
             .expect("first insert failed");
-        insert_event(&pool, &event)
+        insert_events_batch(&pool, &events)
             .await
             .expect("second insert must not error");
 
