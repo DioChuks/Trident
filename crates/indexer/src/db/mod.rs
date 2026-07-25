@@ -445,4 +445,87 @@ mod tests {
 
         assert_eq!(count.0, 1, "duplicate insert should be silently ignored");
     }
+
+    /// An empty batch must be a no-op rather than an invalid statement.
+    #[tokio::test]
+    async fn empty_batch_is_a_noop() {
+        let db_url = match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) if std::env::var("REQUIRE_TEST_SERVICES").is_ok() => {
+                panic!("TEST_DATABASE_URL must be set when REQUIRE_TEST_SERVICES is set");
+            }
+            Err(_) => {
+                eprintln!("SKIP: TEST_DATABASE_URL not set");
+                return;
+            }
+        };
+        let pool = PgPool::connect(&db_url).await.unwrap();
+        insert_events_batch(&pool, &[])
+            .await
+            .expect("empty batch must succeed");
+    }
+
+    /// A page larger than `batch_size` must still land in full — chunking splits
+    /// the statement, not the transaction — and a replay must insert nothing new.
+    #[tokio::test]
+    async fn commit_page_chunks_large_pages_and_advances_cursor_once() {
+        let db_url = match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) if std::env::var("REQUIRE_TEST_SERVICES").is_ok() => {
+                panic!("TEST_DATABASE_URL must be set when REQUIRE_TEST_SERVICES is set");
+            }
+            Err(_) => {
+                eprintln!("SKIP: TEST_DATABASE_URL not set");
+                return;
+            }
+        };
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        let contract_id = format!("CBATCH_{}", Uuid::new_v4());
+        let events: Vec<SorobanEvent> = (0..25).map(|i| make_event(&contract_id, 900, i)).collect();
+
+        let commit = |events: &'_ [SorobanEvent]| PageCommit {
+            events,
+            cursor: Some(900),
+            ledger: Some(LedgerMeta {
+                sequence: 900,
+                hash: "hash900",
+                timestamp: "2024-01-01T00:00:00Z",
+                event_count: events.len() as i32,
+            }),
+            // Deliberately smaller than the page so chunking is exercised.
+            batch_size: 10,
+        };
+
+        commit_page(&pool, commit(&events))
+            .await
+            .expect("commit_page failed");
+
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM soroban_events WHERE contract_id = $1")
+                .bind(&contract_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count.0, 25, "every chunk of the page must land");
+        assert_eq!(get_cursor(&pool).await.unwrap(), 900);
+
+        commit_page(&pool, commit(&events))
+            .await
+            .expect("replay failed");
+
+        let recount: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM soroban_events WHERE contract_id = $1")
+                .bind(&contract_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(recount.0, 25, "replaying a page must insert nothing new");
+
+        sqlx::query("DELETE FROM soroban_events WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
 }
