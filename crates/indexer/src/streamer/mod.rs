@@ -219,6 +219,61 @@ impl Streamer {
         Ok(())
     }
 
+    /// Fetch and decode per-invocation fee + declared-resource metering for
+    /// one transaction hash via `getTransaction` (issue #266).
+    ///
+    /// Best-effort: any RPC or decode failure is logged and treated as "no
+    /// metrics for this transaction" rather than failing the poll cycle —
+    /// metering is a value-add on top of event indexing, not a correctness
+    /// requirement for it.
+    async fn fetch_invocation_metrics(
+        &self,
+        tx_hash: &str,
+    ) -> Option<crate::parser::invocation_metrics::InvocationMetrics> {
+        let resp = match self.rpc.get_transaction(tx_hash).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                tracing::warn!(
+                    tx_hash,
+                    error = %e,
+                    "getTransaction failed; skipping invocation metrics"
+                );
+                return None;
+            }
+        };
+
+        if resp.status == "NOT_FOUND" {
+            tracing::warn!(
+                tx_hash,
+                "getTransaction returned NOT_FOUND for a just-indexed event; skipping invocation metrics"
+            );
+            return None;
+        }
+
+        let (envelope_xdr, result_xdr) = match (resp.envelope_xdr, resp.result_xdr) {
+            (Some(envelope), Some(result)) => (envelope, result),
+            _ => {
+                tracing::warn!(
+                    tx_hash,
+                    status = %resp.status,
+                    "getTransaction response missing envelope/result XDR; skipping invocation metrics"
+                );
+                return None;
+            }
+        };
+
+        match crate::parser::invocation_metrics::decode_invocation_metrics(
+            &envelope_xdr,
+            &result_xdr,
+        ) {
+            Ok(metrics) => Some(metrics),
+            Err(e) => {
+                tracing::warn!(tx_hash, error = %e, "Failed to decode invocation metrics");
+                None
+            }
+        }
+    }
+
     /// Execute a single poll cycle. Fetches all available pages from the RPC
     /// starting at `cursor`, persists each event, and advances the cursor.
     /// Returns the total number of events processed in this cycle.
@@ -407,11 +462,53 @@ impl Streamer {
                 })
                 .collect();
 
+            // Per-invocation fee + declared-resource metering for tracked
+            // contracts (issue #266). Every event in `page_events` already
+            // passed the allowlist check above, so this never runs unbounded
+            // index-all fan-out (see docs/contract-invocation-metering.md).
+            //
+            // Two passes over `page_events`: fetching (pass 1) mutates
+            // `tx_metrics`, and building the rows (pass 2) borrows from it —
+            // keeping those separate avoids holding a long-lived immutable
+            // borrow into the map across a later mutable insert.
+            let mut tx_metrics: std::collections::HashMap<
+                &str,
+                Option<crate::parser::invocation_metrics::InvocationMetrics>,
+            > = std::collections::HashMap::new();
+            let mut invocation_metrics: Vec<db::InvocationMetricRow<'_>> = Vec::new();
+            if self.contract_filter.is_some() {
+                for event in &page_events {
+                    if !tx_metrics.contains_key(event.transaction_hash.as_str()) {
+                        let decoded = self.fetch_invocation_metrics(&event.transaction_hash).await;
+                        tx_metrics.insert(event.transaction_hash.as_str(), decoded);
+                    }
+                }
+
+                let mut seen_pairs: std::collections::HashSet<(&str, &str)> =
+                    std::collections::HashSet::new();
+                for event in &page_events {
+                    let pair = (event.contract_id.as_str(), event.transaction_hash.as_str());
+                    if !seen_pairs.insert(pair) {
+                        continue;
+                    }
+                    if let Some(Some(metrics)) = tx_metrics.get(event.transaction_hash.as_str()) {
+                        invocation_metrics.push(db::InvocationMetricRow {
+                            contract_id: &event.contract_id,
+                            transaction_hash: &event.transaction_hash,
+                            ledger_sequence: event.ledger_sequence,
+                            ledger_timestamp: &event.ledger_timestamp,
+                            metrics,
+                        });
+                    }
+                }
+            }
+
             db::commit_page(
                 &self.db,
                 db::PageCommit {
                     events: &page_events,
                     token_events: &token_projections,
+                    invocation_metrics: &invocation_metrics,
                     cursor: next_cursor,
                     ledger: next_cursor.map(|_| db::LedgerMeta {
                         sequence: ledger_sequence,
@@ -1113,6 +1210,278 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(count.0, 3, "replay must not duplicate projection rows");
+    }
+
+    // -----------------------------------------------------------------------
+    // Invocation metrics (issue #266)
+    // -----------------------------------------------------------------------
+
+    /// Build the `envelopeXdr` + `resultXdr` base64 pair for a successful
+    /// Soroban invocation declaring the given resource budget, exactly as
+    /// `getTransaction` returns them.
+    fn invocation_transaction_xdr(
+        instructions: u32,
+        disk_read_bytes: u32,
+        write_bytes: u32,
+        resource_fee: i64,
+        fee_charged: i64,
+    ) -> (String, String) {
+        use stellar_xdr::curr::{
+            LedgerFootprint, Memo, MuxedAccount, Operation, OperationBody, Preconditions,
+            SequenceNumber, SorobanResources, SorobanTransactionData, SorobanTransactionDataExt,
+            Transaction, TransactionEnvelope, TransactionExt, TransactionResult,
+            TransactionResultExt, TransactionResultResult, TransactionV1Envelope, VecM,
+        };
+
+        let tx = Transaction {
+            source_account: MuxedAccount::Ed25519(stellar_xdr::curr::Uint256([1u8; 32])),
+            fee: 1_000_000,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: VecM::try_from(vec![Operation {
+                source_account: None,
+                body: OperationBody::Inflation,
+            }])
+            .unwrap(),
+            ext: TransactionExt::V1(SorobanTransactionData {
+                ext: SorobanTransactionDataExt::V0,
+                resources: SorobanResources {
+                    footprint: LedgerFootprint {
+                        read_only: VecM::default(),
+                        read_write: VecM::default(),
+                    },
+                    instructions,
+                    disk_read_bytes,
+                    write_bytes,
+                },
+                resource_fee,
+            }),
+        };
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: VecM::default(),
+        });
+        let result = TransactionResult {
+            fee_charged,
+            result: TransactionResultResult::TxSuccess(VecM::default()),
+            ext: TransactionResultExt::V0,
+        };
+
+        let mut env_buf = vec![];
+        envelope
+            .write_xdr(&mut Limited::new(&mut env_buf, Limits::none()))
+            .unwrap();
+        let mut res_buf = vec![];
+        result
+            .write_xdr(&mut Limited::new(&mut res_buf, Limits::none()))
+            .unwrap();
+
+        (STANDARD.encode(env_buf), STANDARD.encode(res_buf))
+    }
+
+    #[tokio::test]
+    async fn invocation_metrics_persisted_for_tracked_contract() {
+        let (db_url, redis_url) = require_services!();
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "getLedgers" }),
+            ))
+            .respond_with(rpc_ok(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "ledgers": [] }
+            })))
+            .mount(&server)
+            .await;
+
+        let event = serde_json::json!({
+            "type": "contract",
+            "ledger": "800",
+            "ledgerClosedAt": "2024-01-01T00:00:00Z",
+            "contractId": "CINVOKE_TRACKED",
+            "id": "0000000000800000-0",
+            "pagingToken": "800-0",
+            "txHash": "txinvoke1",
+            "topic": [sym_xdr("swap")],
+            "value": void_xdr(),
+            "inSuccessfulContractCall": true
+        });
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "getEvents" }),
+            ))
+            .respond_with(rpc_ok(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "events": [event], "latestLedger": 800 }
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "getEvents" }),
+            ))
+            .respond_with(rpc_ok(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "events": [], "latestLedger": 800 }
+            })))
+            .mount(&server)
+            .await;
+
+        let (envelope_xdr, result_xdr) =
+            invocation_transaction_xdr(5_000_000, 2_048, 512, 12_345, 1_012_345);
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "getTransaction", "params": { "hash": "txinvoke1" } }),
+            ))
+            .respond_with(rpc_ok(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {
+                    "status": "SUCCESS",
+                    "envelopeXdr": envelope_xdr,
+                    "resultXdr": result_xdr,
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let mut s = make_streamer(&db_url, &redis_url, server.uri()).await;
+        reset_db(&s.db).await;
+        sqlx::query(
+            "DELETE FROM contract_invocation_metrics WHERE contract_id = 'CINVOKE_TRACKED'",
+        )
+        .execute(&s.db)
+        .await
+        .unwrap();
+        set_allowlist(&s.db, &["CINVOKE_TRACKED"]).await;
+        s.refresh_contract_filter().await.unwrap();
+
+        let mut cursor = 0u64;
+        s.poll_once(&mut cursor).await.unwrap();
+
+        let row: (i64, Option<i64>, Option<i64>, Option<i64>, Option<i64>, String) = sqlx::query_as(
+            "SELECT fee_charged, resource_fee, cpu_instructions, read_bytes, write_bytes, provenance
+             FROM contract_invocation_metrics WHERE contract_id = 'CINVOKE_TRACKED' AND transaction_hash = 'txinvoke1'",
+        )
+        .fetch_one(&s.db)
+        .await
+        .expect("invocation metrics row must be persisted");
+
+        assert_eq!(row.0, 1_012_345, "fee_charged");
+        assert_eq!(row.1, Some(12_345), "resource_fee");
+        assert_eq!(row.2, Some(5_000_000), "cpu_instructions");
+        assert_eq!(row.3, Some(2_048), "read_bytes");
+        assert_eq!(row.4, Some(512), "write_bytes");
+        assert_eq!(row.5, "declared_resources", "provenance");
+
+        // Replaying the same page must not duplicate the row.
+        let mut replay_cursor = 0u64;
+        let _ = s.poll_once(&mut replay_cursor).await;
+        let count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM contract_invocation_metrics WHERE contract_id = 'CINVOKE_TRACKED'",
+        )
+        .fetch_one(&s.db)
+        .await
+        .unwrap();
+        assert_eq!(count.0, 1, "replay must not duplicate the metrics row");
+
+        set_allowlist(&s.db, &[]).await;
+        sqlx::query(
+            "DELETE FROM contract_invocation_metrics WHERE contract_id = 'CINVOKE_TRACKED'",
+        )
+        .execute(&s.db)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn invocation_metrics_are_not_fetched_in_index_all_mode() {
+        let (db_url, redis_url) = require_services!();
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "getLedgers" }),
+            ))
+            .respond_with(rpc_ok(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "ledgers": [] }
+            })))
+            .mount(&server)
+            .await;
+
+        let event = serde_json::json!({
+            "type": "contract",
+            "ledger": "810",
+            "ledgerClosedAt": "2024-01-01T00:00:00Z",
+            "contractId": "CINVOKE_UNTRACKED",
+            "id": "0000000000810000-0",
+            "pagingToken": "810-0",
+            "txHash": "txinvoke2",
+            "topic": [sym_xdr("swap")],
+            "value": void_xdr(),
+            "inSuccessfulContractCall": true
+        });
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "getEvents" }),
+            ))
+            .respond_with(rpc_ok(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "events": [event], "latestLedger": 810 }
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "getEvents" }),
+            ))
+            .respond_with(rpc_ok(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "events": [], "latestLedger": 810 }
+            })))
+            .mount(&server)
+            .await;
+        // Deliberately no getTransaction mock: in index-all mode (no
+        // allowlist) the streamer must never call it. Wiremock returns a 404
+        // for any unmatched request, which would fail the poll if this were
+        // called.
+
+        let mut s = make_streamer(&db_url, &redis_url, server.uri()).await;
+        reset_db(&s.db).await;
+        set_allowlist(&s.db, &[]).await;
+        s.refresh_contract_filter().await.unwrap();
+
+        let mut cursor = 0u64;
+        s.poll_once(&mut cursor).await.unwrap();
+
+        let count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM contract_invocation_metrics WHERE contract_id = 'CINVOKE_UNTRACKED'",
+        )
+        .fetch_one(&s.db)
+        .await
+        .unwrap();
+        assert_eq!(
+            count.0, 0,
+            "index-all mode must not fetch invocation metrics"
+        );
     }
 
     // -----------------------------------------------------------------------

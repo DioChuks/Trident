@@ -21,6 +21,7 @@ use trident_common::{EventType, SorobanEvent, TridentError};
 
 use crate::rpc::RawEvent;
 
+pub mod invocation_metrics;
 pub mod token_events;
 
 use token_events::TokenEvent;
