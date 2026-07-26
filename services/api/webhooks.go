@@ -104,7 +104,7 @@ type webhookDeliveryResult struct {
 //	expected := "sha256=" + hex.EncodeToString(mac.Sum(nil))
 func signWebhookPayload(timestamp int64, body string, secret string) string {
 	mac := hmac.New(sha256.New, []byte(secret))
-	_, _ = mac.Write([]byte(fmt.Sprintf("%d.%s", timestamp, body)))
+	_, _ = fmt.Fprintf(mac, "%d.%s", timestamp, body)
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
