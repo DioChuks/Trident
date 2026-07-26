@@ -79,6 +79,12 @@ services:
       NETWORK: ${NETWORK}
       POLL_INTERVAL_MS: ${POLL_INTERVAL_MS}
       INDEX_DIAGNOSTIC: ${INDEX_DIAGNOSTIC}
+      # Rows per batched INSERT when a page is committed (statement size only —
+      # the page is always one transaction).
+      DB_BATCH_SIZE: ${DB_BATCH_SIZE:-1000}
+      # Topic patterns added to the getEvents filter. Empty means no topic
+      # narrowing, which is the default.
+      INDEX_TOPIC_FILTERS: ${INDEX_TOPIC_FILTERS:-}
       METRICS_PORT: ${METRICS_PORT}
       LOG_LEVEL: ${LOG_LEVEL}
     ports:
