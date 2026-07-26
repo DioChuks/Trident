@@ -99,8 +99,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         shutdown_trigger.cancel();
     });
 
-    let mut s = streamer::Streamer::new(cfg, db_pool, redis_conn).await?;
-    s.run(shutdown).await?;
+    // Outbox relay (issue #200): the poll loop only commits events; this task
+    // delivers them to Redis. It runs alongside the streamer and stops on the
+    // same shutdown signal.
+    let mut relay = redis_stream::relay::OutboxRelay::new(
+        db_pool.clone(),
+        redis_conn.clone(),
+        redis_stream::relay::RelayConfig {
+            interval: cfg.outbox_poll_interval,
+            batch_size: cfg.outbox_batch_size,
+            backlog_alert_threshold: cfg.outbox_backlog_alert_threshold,
+            stream_maxlen: cfg.redis_stream_maxlen,
+        },
+    );
+    let relay_shutdown = shutdown.clone();
+    let relay_handle = tokio::spawn(async move { relay.run(relay_shutdown).await });
+
+    let mut s = streamer::Streamer::new(cfg, db_pool).await?;
+    let result = s.run(shutdown).await;
+
+    // Let the relay drain its current pass before the process exits.
+    if let Err(e) = relay_handle.await {
+        tracing::warn!(error = %e, "Outbox relay task did not shut down cleanly");
+    }
+    result?;
 
     tracing::info!("Trident indexer stopped");
     Ok(())

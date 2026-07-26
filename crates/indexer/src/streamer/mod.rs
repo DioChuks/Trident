@@ -11,9 +11,10 @@
 //! - Fault tolerance and retry logic: transient RPC failures are retried with
 //!   exponential backoff; persistent failures are logged without crashing the
 //!   process or losing cursor position so the next poll cycle can recover.
-//! - Handing each raw event to the `Parser` and forwarding normalised
-//!   `SorobanEvent` values to both PostgreSQL (via `db`) and Redis Streams
-//!   (via `redis_stream`).
+//! - Handing each raw event to the `Parser` and committing normalised
+//!   `SorobanEvent` values to PostgreSQL together with an outbox row (issue
+//!   #200). Redis delivery is owned by `redis_stream::relay`, so a crash
+//!   between the commit and the publish cannot drop an event.
 
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
@@ -30,8 +31,7 @@ use crate::{
     db, metrics,
     parser::Parser,
     poll::{AdaptivePoll, AdaptivePollConfig},
-    redis_stream,
-    rpc::{filters::build_event_filters, FilterPlan, RpcClient},
+    rpc::{filters::build_event_filters, FilterPlan, RpcClient, RpcHttpSettings},
 };
 /// How often (in poll loop iterations) we re-query `indexed_contracts`.
 /// At the default 5 s poll interval this is ≈ 60 s — matches the env-var default.
@@ -40,7 +40,6 @@ const FILTER_REFRESH_EVERY_N_POLLS: u32 = 12;
 pub struct Streamer {
     config: Config,
     db: PgPool,
-    redis: redis::aio::MultiplexedConnection,
     rpc: RpcClient,
     parser: Parser,
     /// `None`  → index all contracts (empty `indexed_contracts` table).
@@ -60,12 +59,27 @@ pub struct Streamer {
 }
 
 impl Streamer {
-    pub async fn new(
-        config: Config,
-        db: PgPool,
-        redis: redis::aio::MultiplexedConnection,
-    ) -> Result<Self, TridentError> {
-        let rpc = RpcClient::new(config.stellar_rpc_url.clone());
+    /// Build the streamer. It owns no Redis connection: events are committed to
+    /// Postgres with an outbox row and delivered by `redis_stream::relay`
+    /// (issue #200).
+    pub async fn new(config: Config, db: PgPool) -> Result<Self, TridentError> {
+        let rpc = RpcClient::with_endpoints(
+            config.stellar_rpc_urls.clone(),
+            &RpcHttpSettings {
+                connect_timeout: config.rpc_connect_timeout,
+                request_timeout: config.rpc_request_timeout,
+                pool_idle_timeout: config.rpc_pool_idle_timeout,
+                pool_max_idle_per_host: config.rpc_pool_max_idle_per_host,
+                tcp_keepalive: config.rpc_tcp_keepalive,
+            },
+            config.rpc_failover_threshold,
+            config.rpc_endpoint_cooldown,
+        )?;
+        tracing::info!(
+            endpoints = config.stellar_rpc_urls.len(),
+            primary = %config.stellar_rpc_url,
+            "RPC endpoint pool configured"
+        );
         let parser = Parser::new(config.index_diagnostic);
         let contract_filter = Self::load_filter(&db, &config.network).await?;
         let filter_plan = plan_filters(contract_filter.as_ref(), &config.topic_filters);
@@ -84,7 +98,6 @@ impl Streamer {
         Ok(Self {
             config,
             db,
-            redis,
             rpc,
             parser,
             contract_filter,
@@ -289,6 +302,12 @@ impl Streamer {
                                 continue;
                             }
                         }
+                        // Events are accumulated and committed as one page,
+                        // together with their outbox rows; the relay owns the
+                        // Redis publish (issues #199, #200). Publishing inline
+                        // here would reintroduce the lost-event window: a crash
+                        // after the commit but before the XADD dropped the event
+                        // for live subscribers with no replay path.
                         if let Some(token) = parsed.token {
                             page_tokens.push((page_events.len(), token));
                         }
@@ -413,17 +432,11 @@ impl Streamer {
                 *cursor = seq;
             }
 
-            // Publish only after the commit so a subscriber can never observe an
-            // event that a rolled-back transaction never persisted.
-            for event in &page_events {
-                redis_stream::publish_event(
-                    &mut self.redis,
-                    event,
-                    self.config.redis_stream_maxlen,
-                )
-                .instrument(tracing::info_span!("redis_xadd"))
-                .await?;
-            }
+            // Delivery is not done here. The commit above wrote an outbox row
+            // per event, and `redis_stream::relay` publishes them (issue #200).
+            // Publishing inline would still lose events: a crash between the
+            // commit and the XADD leaves the event in Postgres and off the
+            // stream, with nothing to replay it.
 
             // An incomplete page means we have caught up to the chain tip.
             if page.events.len() < self.config.max_events_per_poll as usize {
@@ -521,6 +534,7 @@ fn page_request_params(cursor: u64, page_cursor: Option<&str>) -> (Option<u64>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::redis_stream::relay::{OutboxRelay, RelayConfig};
     use base64::{engine::general_purpose::STANDARD, Engine};
     use stellar_xdr::curr::{Limited, Limits, ScSymbol, ScVal, WriteXdr};
     use wiremock::matchers::{body_partial_json, method, path};
@@ -625,15 +639,20 @@ mod tests {
         ResponseTemplate::new(200).set_body_json(body)
     }
 
-    async fn make_streamer(db_url: &str, redis_url: &str, rpc_url: String) -> Streamer {
-        let db = sqlx::PgPool::connect(db_url).await.unwrap();
-        let redis = redis::Client::open(redis_url)
+    /// Standalone Redis connection for tests that assert on the stream. The
+    /// streamer itself no longer holds one — the relay owns publishing.
+    async fn redis_conn(redis_url: &str) -> redis::aio::MultiplexedConnection {
+        redis::Client::open(redis_url)
             .unwrap()
             .get_multiplexed_async_connection()
             .await
-            .unwrap();
+            .unwrap()
+    }
+
+    async fn make_streamer(db_url: &str, redis_url: &str, rpc_url: String) -> Streamer {
+        let db = sqlx::PgPool::connect(db_url).await.unwrap();
         let config = Config {
-            stellar_rpc_url: rpc_url,
+            stellar_rpc_url: rpc_url.clone(),
             database_url: db_url.to_string(),
             db_pool_size: 3,
             redis_url: redis_url.to_string(),
@@ -643,18 +662,29 @@ mod tests {
             poll_interval_ceiling: Duration::from_millis(500),
             lag_high_watermark: 100,
             poll_hysteresis_ledgers: 10,
+            stellar_rpc_urls: vec![rpc_url],
+            rpc_failover_threshold: 3,
+            rpc_endpoint_cooldown: Duration::from_secs(30),
+            rpc_connect_timeout: Duration::from_secs(5),
+            rpc_request_timeout: Duration::from_secs(30),
+            rpc_pool_idle_timeout: Duration::from_secs(90),
+            rpc_pool_max_idle_per_host: 8,
+            rpc_tcp_keepalive: Duration::from_secs(60),
             index_diagnostic: false,
             topic_filters: Vec::new(),
             max_events_per_poll: 200,
             db_batch_size: 1_000,
             redis_stream_maxlen: 10_000,
+            outbox_poll_interval: Duration::from_millis(10),
+            outbox_batch_size: 500,
+            outbox_backlog_alert_threshold: 10_000,
             metrics_port: 0,
             alert_webhook_url: None,
             alert_lag_threshold: 200,
             alert_cooldown_minutes: 30,
         };
 
-        Streamer::new(config, db, redis).await.unwrap()
+        Streamer::new(config, db).await.unwrap()
     }
 
     async fn reset_db(pool: &sqlx::PgPool) {
@@ -748,26 +778,123 @@ mod tests {
             .await;
 
         let mut s = make_streamer(&db_url, &redis_url, server.uri()).await;
+        let mut conn = redis_conn(&redis_url).await;
         reset_db(&s.db).await;
+        sqlx::query("DELETE FROM event_outbox")
+            .execute(&s.db)
+            .await
+            .unwrap();
 
         // Trim the stream so we start fresh.
         let _: () = redis::cmd("XTRIM")
             .arg("trident:events")
             .arg("MAXLEN")
             .arg(0)
-            .query_async(&mut s.redis)
+            .query_async(&mut conn)
             .await
             .unwrap_or(());
 
         let mut cursor = 0u64;
         s.poll_once(&mut cursor).await.unwrap();
 
+        // The poll only commits events plus their outbox rows; the relay is
+        // what puts them on the stream (issue #200).
+        let mut relay = OutboxRelay::new(
+            s.db.clone(),
+            conn.clone(),
+            RelayConfig {
+                interval: Duration::from_millis(10),
+                batch_size: 100,
+                backlog_alert_threshold: 1_000,
+                stream_maxlen: 10_000,
+            },
+        );
+        let published = relay.publish_pending().await.unwrap();
+        assert_eq!(published, 2, "relay should publish both committed events");
+
         let len: i64 = redis::cmd("XLEN")
             .arg("trident:events")
-            .query_async(&mut s.redis)
+            .query_async(&mut conn)
             .await
             .unwrap();
         assert_eq!(len, 2, "expected 2 events in Redis stream");
+    }
+
+    /// A publish that never happens (relay not run) must leave the events
+    /// recoverable: a later relay pass still delivers them, which is the
+    /// crash-after-commit case from issue #200.
+    #[tokio::test]
+    async fn unpublished_events_are_delivered_on_a_later_relay_pass() {
+        let (db_url, redis_url) = require_services!();
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(rpc_ok(events_page(400, 3)))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(rpc_ok(events_page(400, 0)))
+            .mount(&server)
+            .await;
+
+        let mut s = make_streamer(&db_url, &redis_url, server.uri()).await;
+        let mut conn = redis_conn(&redis_url).await;
+        reset_db(&s.db).await;
+        sqlx::query("DELETE FROM event_outbox")
+            .execute(&s.db)
+            .await
+            .unwrap();
+        let _: () = redis::cmd("XTRIM")
+            .arg("trident:events")
+            .arg("MAXLEN")
+            .arg(0)
+            .query_async(&mut conn)
+            .await
+            .unwrap_or(());
+
+        // Commit the batch, then simulate the process dying before any publish.
+        let mut cursor = 0u64;
+        s.poll_once(&mut cursor).await.unwrap();
+
+        let backlog = crate::db::outbox::backlog(&s.db).await.unwrap();
+        assert_eq!(backlog, 3, "committed events must be queued for delivery");
+
+        let len: i64 = redis::cmd("XLEN")
+            .arg("trident:events")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            len, 0,
+            "nothing should be on the stream before the relay runs"
+        );
+
+        // Restart equivalent: a fresh relay drains the backlog.
+        let mut relay = OutboxRelay::new(
+            s.db.clone(),
+            conn.clone(),
+            RelayConfig {
+                interval: Duration::from_millis(10),
+                batch_size: 100,
+                backlog_alert_threshold: 1_000,
+                stream_maxlen: 10_000,
+            },
+        );
+        assert_eq!(relay.publish_pending().await.unwrap(), 3);
+
+        let len: i64 = redis::cmd("XLEN")
+            .arg("trident:events")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(len, 3, "relay must deliver every committed event");
+        assert_eq!(crate::db::outbox::backlog(&s.db).await.unwrap(), 0);
+
+        // A second pass is a no-op: published rows are not re-delivered.
+        assert_eq!(relay.publish_pending().await.unwrap(), 0);
     }
 
     #[tokio::test]

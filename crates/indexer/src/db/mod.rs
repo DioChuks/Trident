@@ -42,6 +42,8 @@ fn event_uuid(contract_id: &str, ledger_sequence: u64, event_index: u32) -> Uuid
     Uuid::new_v5(&EVENT_NS, key.as_bytes())
 }
 
+pub mod outbox;
+
 /// Ledger provenance recorded alongside a committed page.
 pub struct LedgerMeta<'a> {
     pub sequence: u64,
@@ -275,8 +277,53 @@ where
     Ok(())
 }
 
-/// Persist one RPC page — events, cursor, and ledger metadata — in a single
-/// transaction (issue #199).
+/// Insert the outbox rows for a batch of events in a single statement (#200).
+///
+/// Mirrors [`insert_events_batch`]: same deterministic ids, same idempotency.
+/// `ON CONFLICT (event_id) DO NOTHING` means a replayed page does not re-queue
+/// a delivery for an event that already has one.
+pub async fn insert_outbox_batch<'e, E>(
+    executor: E,
+    events: &[SorobanEvent],
+) -> Result<(), TridentError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    if events.is_empty() {
+        return Ok(());
+    }
+
+    let mut ids: Vec<Uuid> = Vec::with_capacity(events.len());
+    let mut payloads: Vec<serde_json::Value> = Vec::with_capacity(events.len());
+    for event in events {
+        ids.push(event_uuid(
+            &event.contract_id,
+            event.ledger_sequence,
+            event.event_index,
+        ));
+        payloads.push(serde_json::to_value(event).map_err(|e| {
+            TridentError::storage(anyhow::Error::new(e).context("outbox payload serialise"))
+        })?);
+    }
+
+    sqlx::query(
+        r#"
+        INSERT INTO event_outbox (event_id, payload)
+        SELECT * FROM UNNEST($1::uuid[], $2::jsonb[])
+        ON CONFLICT (event_id) DO NOTHING
+        "#,
+    )
+    .bind(&ids)
+    .bind(&payloads)
+    .execute(executor)
+    .await
+    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("insert_outbox_batch")))?;
+
+    Ok(())
+}
+
+/// Persist one RPC page — events, outbox rows, cursor, and ledger metadata — in
+/// a single transaction (issues #199, #200).
 ///
 /// Events are chunked to `batch_size` so a very large page cannot produce an
 /// unbounded statement, but every chunk shares the one transaction: either the
@@ -291,6 +338,10 @@ pub async fn commit_page(pool: &PgPool, commit: PageCommit<'_>) -> Result<(), Tr
 
     for chunk in commit.events.chunks(batch_size) {
         insert_events_batch(&mut *tx, chunk).await?;
+        // Outbox rows ride the same transaction as the events they deliver
+        // (issue #200): either both land or neither does, so a committed event
+        // can never exist without a delivery record for the relay to pick up.
+        insert_outbox_batch(&mut *tx, chunk).await?;
     }
 
     // Projection rows are foreign-keyed to soroban_events, so they must follow

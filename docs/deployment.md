@@ -52,6 +52,32 @@ Open `.env` and set every value below. Do not leave defaults in production.
 | `ALLOWED_ORIGINS` | Comma-separated allowed CORS origins, or `*` to allow all |
 | `REQUEST_TIMEOUT_MS` | HTTP request timeout in milliseconds (default: `30000`) |
 
+#### Indexer RPC transport and failover
+
+| Variable | Description |
+|---|---|
+| `STELLAR_RPC_URLS` | Prioritised, comma-separated RPC endpoints; the first is the primary. Overrides `STELLAR_RPC_URL`, which stays valid as a single-value alias |
+| `RPC_CONNECT_TIMEOUT_MS` | TCP connect timeout for RPC calls (default: `5000`) |
+| `RPC_REQUEST_TIMEOUT_MS` | Overall RPC request timeout; must be >= the connect timeout (default: `30000`) |
+| `RPC_POOL_IDLE_TIMEOUT_MS` | How long an idle pooled connection is kept (default: `90000`) |
+| `RPC_POOL_MAX_IDLE_PER_HOST` | Idle keep-alive connections retained per RPC host (default: `8`) |
+| `RPC_TCP_KEEPALIVE_MS` | TCP keep-alive probe interval (default: `60000`) |
+| `RPC_FAILOVER_THRESHOLD` | Consecutive failures before the active endpoint is parked (default: `3`) |
+| `RPC_ENDPOINT_COOLDOWN_MS` | How long a parked endpoint waits before it is tried again (default: `30000`) |
+
+Without an explicit request timeout a stalled RPC connection blocks a poll
+indefinitely: the retry wrapper only reacts to returned errors, never to a call
+that never returns. Timeouts are classified retryable, so they engage backoff
+and count toward the failover threshold.
+
+#### Indexer outbox relay
+
+| Variable | Description |
+|---|---|
+| `OUTBOX_POLL_INTERVAL_MS` | How often the relay scans for unpublished events (default: `100`) |
+| `OUTBOX_BATCH_SIZE` | Maximum events published per relay pass (default: `500`) |
+| `OUTBOX_BACKLOG_ALERT_THRESHOLD` | Backlog size at which the relay logs an alert-worthy warning (default: `10000`) |
+
 Generate a secure `API_KEY_SALT`:
 
 ```bash

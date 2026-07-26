@@ -1,7 +1,33 @@
 openapi: 3.1.0
 info:
   title: Trident REST API
-  description: Real-time indexing and event querying for Soroban contract events
+  description: |
+    Real-time indexing and event querying for Soroban contract events.
+
+    ## Request validation
+
+    Every endpoint validates its parameters before doing any work and answers a
+    malformed request with `400` and the `ErrorResponse` envelope, where
+    `error.code` is `INVALID_ARGUMENT` and `error.message` names the field that
+    failed:
+
+    ```json
+    {"error": {"code": "INVALID_ARGUMENT", "message": "limit must be an integer between 1 and 200"}}
+    ```
+
+    Rules shared across endpoints:
+
+    - `contractId` — Stellar contract strkey: `C` followed by 55 uppercase
+      base32 characters.
+    - path ids — canonical UUID v4.
+    - ledger ranges — non-negative integers; the upper bound must be greater
+      than or equal to the lower bound.
+    - `limit` — an integer within the range documented for that endpoint.
+    - `cursor` — an opaque cursor from a previous response; anything else is
+      rejected rather than silently ignored.
+    - `network` — `testnet` or `mainnet`.
+    - Unknown query parameters are rejected, so a typo such as `?limitt=5`
+      fails loudly instead of silently changing the page size.
   version: 1.0.0
   contact:
     name: Trident Team
