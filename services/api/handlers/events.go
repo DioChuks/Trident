@@ -49,11 +49,9 @@ func SetEventsClient(client gen.EventsClient) {
 // API key context and enforced server-side — callers cannot override it.
 // Returns 400 on any validation failure.
 func ListEvents(w http.ResponseWriter, r *http.Request) {
-	if eventsClient == nil {
-		httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.INTERNAL, "gRPC backend unavailable")
-		return
-	}
-
+	// Input is validated before backend availability: a malformed request is
+	// invalid whether or not the gRPC backend is up, and answering 503 for it
+	// tells the client to retry something that can never succeed (#222).
 	q := r.URL.Query()
 	// An unrecognised parameter is a client bug — a typo'd `limitt` silently
 	// changing the page size hides it — so it is rejected, not ignored (#222).
@@ -81,6 +79,11 @@ func ListEvents(w http.ResponseWriter, r *http.Request) {
 	pagingToken, verr := validation.ValidateCursor("cursor", q.Get("cursor"))
 	if verr != nil {
 		httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
+		return
+	}
+
+	if eventsClient == nil {
+		httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.INTERNAL, "gRPC backend unavailable")
 		return
 	}
 
@@ -141,14 +144,14 @@ func ListEvents(w http.ResponseWriter, r *http.Request) {
 // derived from the authenticated API key context to prevent cross-network
 // data exposure. Returns 400 when the format is invalid.
 func GetEvent(w http.ResponseWriter, r *http.Request) {
-	if eventsClient == nil {
-		httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.INTERNAL, "gRPC backend unavailable")
-		return
-	}
-
 	id := r.PathValue("id")
 	if verr := validation.ValidateEventID(id); verr != nil {
 		httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
+		return
+	}
+
+	if eventsClient == nil {
+		httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.INTERNAL, "gRPC backend unavailable")
 		return
 	}
 
