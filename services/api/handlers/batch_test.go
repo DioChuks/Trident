@@ -159,3 +159,96 @@ func TestBatchGetEvents_EmptyMissingIsArray(t *testing.T) {
 		t.Errorf("missing should be empty array, got: %s", body)
 	}
 }
+
+func TestBatchGetEvents_PreservesRequestOrder(t *testing.T) {
+	handlers.SetEventsClient(&MockEventsClient{
+		GetEventFunc: func(_ context.Context, req *gen.GetEventRequest) (*gen.Event, error) {
+			return fakeEvent(req.Id), nil
+		},
+	})
+
+	w := httptest.NewRecorder()
+	handlers.BatchGetEvents(w, batchPost(map[string]any{"ids": []string{uuid3, uuid1, uuid2}}))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp handlers.BatchEventsResponse
+	_ = json.NewDecoder(w.Body).Decode(&resp)
+	want := []string{uuid3, uuid1, uuid2}
+	if len(resp.Events) != len(want) {
+		t.Fatalf("expected %d events, got %d", len(want), len(resp.Events))
+	}
+	for i, id := range want {
+		if resp.Events[i].ID != id {
+			t.Errorf("events[%d] = %s, want %s (request order must be preserved)", i, resp.Events[i].ID, id)
+		}
+	}
+}
+
+func TestBatchGetEvents_MissingPreservesRequestOrder(t *testing.T) {
+	handlers.SetEventsClient(&MockEventsClient{
+		GetEventFunc: func(_ context.Context, _ *gen.GetEventRequest) (*gen.Event, error) {
+			return nil, status.Error(codes.NotFound, "not found")
+		},
+	})
+
+	w := httptest.NewRecorder()
+	handlers.BatchGetEvents(w, batchPost(map[string]any{"ids": []string{uuid2, uuid3, uuid1}}))
+
+	var resp handlers.BatchEventsResponse
+	_ = json.NewDecoder(w.Body).Decode(&resp)
+	want := []string{uuid2, uuid3, uuid1}
+	if len(resp.Missing) != len(want) {
+		t.Fatalf("expected %d missing, got %v", len(want), resp.Missing)
+	}
+	for i, id := range want {
+		if resp.Missing[i] != id {
+			t.Errorf("missing[%d] = %s, want %s (request order must be preserved)", i, resp.Missing[i], id)
+		}
+	}
+}
+
+func TestBatchGetEvents_DuplicateIDsDeduplicated(t *testing.T) {
+	var calls int
+	handlers.SetEventsClient(&MockEventsClient{
+		GetEventFunc: func(_ context.Context, req *gen.GetEventRequest) (*gen.Event, error) {
+			calls++
+			return fakeEvent(req.Id), nil
+		},
+	})
+
+	w := httptest.NewRecorder()
+	handlers.BatchGetEvents(w, batchPost(map[string]any{"ids": []string{uuid1, uuid2, uuid1, uuid1}}))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp handlers.BatchEventsResponse
+	_ = json.NewDecoder(w.Body).Decode(&resp)
+	if len(resp.Events) != 2 {
+		t.Errorf("expected 2 deduplicated events, got %d", len(resp.Events))
+	}
+	if len(resp.Events) == 2 && (resp.Events[0].ID != uuid1 || resp.Events[1].ID != uuid2) {
+		t.Errorf("expected first-occurrence order [%s %s], got [%s %s]", uuid1, uuid2, resp.Events[0].ID, resp.Events[1].ID)
+	}
+	if calls != 2 {
+		t.Errorf("expected 2 backend calls after dedupe, got %d", calls)
+	}
+}
+
+func TestBatchGetEvents_OverLimitCountsDuplicates(t *testing.T) {
+	handlers.SetEventsClient(&MockEventsClient{})
+
+	// 101 copies of the same id: the limit applies before deduplication.
+	ids := make([]string, 101)
+	for i := range ids {
+		ids[i] = uuid1
+	}
+	w := httptest.NewRecorder()
+	handlers.BatchGetEvents(w, batchPost(map[string]any{"ids": ids}))
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d", w.Code)
+	}
+}
