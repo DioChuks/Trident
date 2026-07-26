@@ -34,6 +34,12 @@ pub struct Config {
     pub rpc_pool_max_idle_per_host: usize,
     /// TCP keep-alive probe interval for pooled RPC sockets (issue #214).
     pub rpc_tcp_keepalive: Duration,
+    /// How often the outbox relay scans for unpublished events (issue #200).
+    pub outbox_poll_interval: Duration,
+    /// Maximum events published per relay pass (issue #200).
+    pub outbox_batch_size: i64,
+    /// Backlog size at which the relay warns that delivery is falling behind.
+    pub outbox_backlog_alert_threshold: i64,
     pub index_diagnostic: bool,
     pub max_events_per_poll: u32,
     pub redis_stream_maxlen: u64,
@@ -118,6 +124,15 @@ impl Config {
         let rpc_endpoint_cooldown_ms =
             parse_bounded_u64("RPC_ENDPOINT_COOLDOWN_MS", 30_000, 1_000, 3_600_000)?;
 
+        // Outbox relay tuning (issue #200). The default 100ms interval keeps
+        // live delivery latency close to the direct-publish path while the
+        // bounded batch stops the relay starving the poll loop.
+        let outbox_poll_interval_ms =
+            parse_bounded_u64("OUTBOX_POLL_INTERVAL_MS", 100, 10, 60_000)?;
+        let outbox_batch_size = parse_bounded_u64("OUTBOX_BATCH_SIZE", 500, 1, 10_000)? as i64;
+        let outbox_backlog_alert_threshold =
+            parse_bounded_u64("OUTBOX_BACKLOG_ALERT_THRESHOLD", 10_000, 1, 10_000_000)? as i64;
+
         let index_diagnostic = std::env::var("INDEX_DIAGNOSTIC")
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
@@ -147,6 +162,9 @@ impl Config {
             rpc_pool_idle_timeout: Duration::from_millis(rpc_pool_idle_timeout_ms),
             rpc_pool_max_idle_per_host,
             rpc_tcp_keepalive: Duration::from_millis(rpc_tcp_keepalive_ms),
+            outbox_poll_interval: Duration::from_millis(outbox_poll_interval_ms),
+            outbox_batch_size,
+            outbox_backlog_alert_threshold,
             index_diagnostic,
             max_events_per_poll: max_events_per_poll as u32,
             redis_stream_maxlen: std::env::var("REDIS_STREAM_MAXLEN")
@@ -533,6 +551,34 @@ mod tests {
             let cfg = Config::from_env().unwrap();
             assert_eq!(cfg.rpc_failover_threshold, 3);
             assert_eq!(cfg.rpc_endpoint_cooldown.as_millis(), 30_000);
+        });
+    }
+
+    #[test]
+    fn outbox_relay_knobs_have_defaults() {
+        let vars = required_vars();
+        with_env(&vars, || {
+            for key in [
+                "OUTBOX_POLL_INTERVAL_MS",
+                "OUTBOX_BATCH_SIZE",
+                "OUTBOX_BACKLOG_ALERT_THRESHOLD",
+            ] {
+                env::remove_var(key);
+            }
+            let cfg = Config::from_env().unwrap();
+            assert_eq!(cfg.outbox_poll_interval.as_millis(), 100);
+            assert_eq!(cfg.outbox_batch_size, 500);
+            assert_eq!(cfg.outbox_backlog_alert_threshold, 10_000);
+        });
+    }
+
+    #[test]
+    fn outbox_batch_size_is_bounded() {
+        let mut vars = required_vars();
+        vars.push(("OUTBOX_BATCH_SIZE", "0"));
+        with_env(&vars, || {
+            let err = Config::from_env().unwrap_err();
+            assert!(err.to_string().contains("OUTBOX_BATCH_SIZE"));
         });
     }
 
