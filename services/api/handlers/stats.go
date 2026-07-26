@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	apigrpc "github.com/Depo-dev/trident/services/api/grpc"
 	"github.com/Depo-dev/trident/services/api/internal/httputil"
 	"github.com/Depo-dev/trident/services/api/validation"
 	"github.com/jackc/pgx/v5"
@@ -41,8 +42,8 @@ var (
 	metricEventsTotal       atomicGauge
 )
 
-// MetricsHandler exposes the three Prometheus gauges in text format.
-// Mount at GET /metrics (or /v1/metrics).
+// MetricsHandler exposes the three Prometheus gauges plus the gRPC client
+// counters in text format. Mount at GET /metrics (or /v1/metrics).
 func MetricsHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
@@ -55,6 +56,7 @@ func MetricsHandler() http.HandlerFunc {
 		_, _ = fmt.Fprintf(w, "# HELP trident_indexer_events_total Cumulative events indexed.\n")
 		_, _ = fmt.Fprintf(w, "# TYPE trident_indexer_events_total gauge\n")
 		_, _ = fmt.Fprintf(w, "trident_indexer_events_total %g\n", metricEventsTotal.Get())
+		apigrpc.WriteClientMetrics(w)
 	}
 }
 
