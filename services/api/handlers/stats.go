@@ -452,7 +452,19 @@ func ContractsStats(db DBPool, rdb *redis.Client) http.HandlerFunc {
 // row-level join against soroban_events: the two tables share no per-row key
 // (metering is one row per transaction, events are one row per emitted
 // event), so the join key is contract_id + the same ledger range.
+//
+// Index usage: the WHERE clause on (network, ledger_sequence) uses
+// idx_soroban_events_network_contract (migration 0004) for partition pruning
+// when a ledger range is supplied; the GROUP BY + ORDER BY event_count DESC is
+// a computed aggregate and is not index-backed — this is expected for an
+// aggregation query. The LIMIT cap prevents runaway result sets (#255).
 func queryContractStats(ctx context.Context, db DBPool, params *validation.QueryStatsParams) ([]*ContractStats, error) {
+	// Belt-and-suspenders: clamp limit even if the caller skips ValidateQueryStats.
+	limit := params.Limit
+	if limit <= 0 || limit > validation.StatsLimitMax {
+		limit = validation.StatsLimitDefault
+	}
+
 	query := `
 	SELECT
 		e.contract_id,
@@ -493,7 +505,7 @@ func queryContractStats(ctx context.Context, db DBPool, params *validation.Query
 	LIMIT $4
 	`
 
-	rows, err := db.Query(ctx, query, params.Network, params.FromLedgerPtr, params.ToLedgerPtr, params.Limit)
+	rows, err := db.Query(ctx, query, params.Network, params.FromLedgerPtr, params.ToLedgerPtr, limit)
 	if err != nil {
 		return nil, err
 	}
