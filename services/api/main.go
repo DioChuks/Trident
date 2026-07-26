@@ -147,8 +147,12 @@ func main() {
 			pool, slog.Default(), 500*time.Millisecond, 100, 10000,
 		)
 		defer auditWriter.Close()
-		// Background cleanup: delete audit log entries older than 90 days.
-		go runAuditCleanup(ctx, pool)
+	}
+
+	// Start automated retention job (issue #245). Replaces the ad-hoc audit
+	// cleanup with a configurable per-table retention policy.
+	if pool != nil {
+		startRetentionJob(ctx, pool)
 	}
 
 	adminCfg := handlers.AdminConfig{
@@ -157,6 +161,13 @@ func main() {
 	}
 	if adminURL := os.Getenv("PGBOUNCER_ADMIN_URL"); adminURL != "" {
 		adminCfg.StatsFunc = newPgbouncerStats(adminURL)
+	}
+
+	// Validate CORS allowlist at startup (issue #234).
+	allowedOrigins, err := middleware.ValidateAllowedOrigins()
+	if err != nil {
+		slog.Error("invalid CORS configuration", "err", err)
+		os.Exit(1)
 	}
 
 	// Shared tier cache so an admin tier change (PATCH /v1/api-keys/{id}) can
@@ -190,6 +201,11 @@ func main() {
 	mux.HandleFunc("GET /v1/events/stream", handlers.Stream(redisClient))
 	mux.HandleFunc("GET /v1/admin/db", handlers.AdminDB(adminCfg))
 	mux.HandleFunc("GET /v1/admin/keys/{id}/usage", handlers.AdminKeyUsage(adminCfg))
+	// Admin contract registration CRUD (issue #230)
+	contractCfg := handlers.ContractConfig{AdminKey: os.Getenv("ADMIN_API_KEY"), DB: pool}
+	mux.HandleFunc("POST /v1/admin/contracts", handlers.CreateContract(contractCfg))
+	mux.HandleFunc("GET /v1/admin/contracts", handlers.ListContracts(contractCfg))
+	mux.HandleFunc("DELETE /v1/admin/contracts/{id}", handlers.DeleteContract(contractCfg))
 	// API key management (admin-only via X-Admin-Key header)
 	mux.HandleFunc("POST /v1/api-keys", handlers.CreateAPIKey(apiKeyCfg))
 	mux.HandleFunc("GET /v1/api-keys", handlers.ListAPIKeys(apiKeyCfg))
@@ -229,7 +245,8 @@ func main() {
 		handler = middleware.AuditMiddleware(auditWriter)(handler)
 	}
 	handler = middleware.NewDBAuth(authDB)(handler)
-	handler = middleware.NewCORSFromEnv()(middleware.NewTimeoutFromEnv()(handler))
+	handler = middleware.NewCORSFromEnv(allowedOrigins)(middleware.NewTimeoutFromEnv()(handler))
+	handler = middleware.SecurityHeaders(true)(handler)
 	// RequestID + StructuredLogging are outermost so every response — including
 	// auth and rate-limit rejections — is assigned a request id, echoes it on
 	// X-Request-ID, and is captured in structured logs (issue #226). RequestID
@@ -241,6 +258,9 @@ func main() {
 	// never mounted on the public mux above (#299).
 	pprofSrv := profiling.Start()
 	defer profiling.Shutdown(pprofSrv)
+
+	// Grace period mirrors Helm terminationGracePeriodSeconds (default 30s).
+	const shutdownGrace = 30 * time.Second
 
 	server := &http.Server{
 		Addr:         fmt.Sprintf(":%s", port),
@@ -258,12 +278,20 @@ func main() {
 	}()
 
 	<-ctx.Done()
-	slog.Info("shutting down")
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	slog.Info("shutting down", "grace", shutdownGrace)
+
+	// Stop accepting new connections and begin draining in-flight requests.
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
 	defer cancel()
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		slog.Error("graceful shutdown failed", "err", err)
 	}
+
+	// After the HTTP server stops accepting requests, close active SSE/WS
+	// streams so connected clients receive a clean close instead of a TCP RST.
+	hub.ShutdownAll()
+
+	slog.Info("shutdown complete")
 }
 
 func newDBPool(ctx context.Context, dsn string, poolSize int32) (*pgxpool.Pool, error) {
@@ -294,36 +322,98 @@ func dbPoolSizeFromEnv() int32 {
 	return defaultDBPoolSize
 }
 
-func runAuditCleanup(ctx context.Context, pool *pgxpool.Pool) {
-	ticker := time.NewTicker(auditCleanupInterval)
-	defer ticker.Stop()
+// retentionConfig holds per-table retention windows (in days).
+// Configured via env vars with sensible defaults.
+type retentionConfig struct {
+	AuditLogDays       int
+	ParseErrorsDays    int
+	WebhookDeliveriesDays int
+	SorobanEventsDays  int
+}
 
-	cleanup := func() {
-		cleanupCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		defer cancel()
+func loadRetentionConfig() retentionConfig {
+	return retentionConfig{
+		AuditLogDays:          envInt("RETENTION_AUDIT_LOG_DAYS", 90),
+		ParseErrorsDays:       envInt("RETENTION_PARSE_ERRORS_DAYS", 30),
+		WebhookDeliveriesDays: envInt("RETENTION_WEBHOOK_DELIVERIES_DAYS", 30),
+		SorobanEventsDays:     envInt("RETENTION_SOROBAN_EVENTS_DAYS", 0), // 0 = disabled
+	}
+}
+
+func envInt(key string, defaultVal int) int {
+	if raw := os.Getenv(key); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n >= 0 {
+			return n
+		}
+	}
+	return defaultVal
+}
+
+// startRetentionJob runs a periodic retention cleanup loop (issue #245).
+// It replaces the ad-hoc audit cleanup with a configurable per-table policy.
+func startRetentionJob(ctx context.Context, pool *pgxpool.Pool) {
+	cfg := loadRetentionConfig()
+	interval := 6 * time.Hour
+
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		run := func() {
+			cleanupCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+			defer cancel()
+
+			tables := []struct {
+				name   string
+				days   int
+				query  string
+			}{
+				{"audit_log", cfg.AuditLogDays,
+					`DELETE FROM audit_log WHERE ts < NOW() - ($1 || ' days')::INTERVAL AND ctid IN (
+						SELECT ctid FROM audit_log WHERE ts < NOW() - ($1 || ' days')::INTERVAL LIMIT 1000
+					)`},
+				{"parse_errors", cfg.ParseErrorsDays,
+					`DELETE FROM parse_errors WHERE occurred_at < NOW() - ($1 || ' days')::INTERVAL AND ctid IN (
+						SELECT ctid FROM parse_errors WHERE occurred_at < NOW() - ($1 || ' days')::INTERVAL LIMIT 1000
+					)`},
+				{"webhook_deliveries", cfg.WebhookDeliveriesDays,
+					`DELETE FROM webhook_deliveries WHERE delivered_at < NOW() - ($1 || ' days')::INTERVAL AND ctid IN (
+						SELECT ctid FROM webhook_deliveries WHERE delivered_at < NOW() - ($1 || ' days')::INTERVAL LIMIT 1000
+					)`},
+				{"soroban_events", cfg.SorobanEventsDays,
+					`DELETE FROM soroban_events WHERE created_at < NOW() - ($1 || ' days')::INTERVAL AND ctid IN (
+						SELECT ctid FROM soroban_events WHERE created_at < NOW() - ($1 || ' days')::INTERVAL LIMIT 1000
+					)`},
+			}
+
+			for _, t := range tables {
+				if t.days <= 0 {
+					continue
+				}
+				for {
+					tag, err := pool.Exec(cleanupCtx, t.query, fmt.Sprintf("%d", t.days))
+					if err != nil {
+						slog.Warn("retention: cleanup failed", "table", t.name, "err", err)
+						break
+					}
+					if tag.RowsAffected() == 0 {
+						break
+					}
+				}
+			}
+		}
+
+		// Run once at startup, then on ticker.
+		run()
+
 		for {
-			tag, err := pool.Exec(cleanupCtx,
-				`DELETE FROM audit_log WHERE ts < NOW() - INTERVAL '90 days' AND ctid IN (
-					SELECT ctid FROM audit_log WHERE ts < NOW() - INTERVAL '90 days' LIMIT 1000
-				)`,
-			)
-			if err != nil {
-				slog.Warn("audit cleanup failed", "err", err)
+			select {
+			case <-ctx.Done():
+				run()
 				return
-			}
-			if tag.RowsAffected() == 0 {
-				return
+			case <-ticker.C:
+				run()
 			}
 		}
-	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			cleanup()
-			return
-		case <-ticker.C:
-			cleanup()
-		}
-	}
+	}()
 }
