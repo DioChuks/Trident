@@ -31,7 +31,7 @@ use crate::{
     parser::Parser,
     poll::{AdaptivePoll, AdaptivePollConfig},
     redis_stream,
-    rpc::RpcClient,
+    rpc::{filters::build_event_filters, FilterPlan, RpcClient},
 };
 /// How often (in poll loop iterations) we re-query `indexed_contracts`.
 /// At the default 5 s poll interval this is ≈ 60 s — matches the env-var default.
@@ -46,6 +46,9 @@ pub struct Streamer {
     /// `None`  → index all contracts (empty `indexed_contracts` table).
     /// `Some`  → allowlist; events from unlisted contracts are skipped.
     contract_filter: Option<HashSet<String>>,
+    /// Server-side `getEvents` filters derived from `contract_filter` (issue
+    /// #203). Rebuilt whenever the allowlist is reloaded.
+    filter_plan: FilterPlan,
     /// Counts poll cycles so we know when to refresh the filter.
     poll_count: u32,
     /// Outbound webhook alerter (issue #75). No-op when URL is not configured.
@@ -65,6 +68,7 @@ impl Streamer {
         let rpc = RpcClient::new(config.stellar_rpc_url.clone());
         let parser = Parser::new(config.index_diagnostic);
         let contract_filter = Self::load_filter(&db, &config.network).await?;
+        let filter_plan = plan_filters(contract_filter.as_ref(), &config.topic_filters);
         let alerter = Alerter::from_config(
             config.alert_webhook_url.clone(),
             config.alert_lag_threshold,
@@ -84,6 +88,7 @@ impl Streamer {
             rpc,
             parser,
             contract_filter,
+            filter_plan,
             poll_count: 0,
             alerter,
             last_chain_tip: 0,
@@ -110,6 +115,7 @@ impl Streamer {
     pub async fn refresh_contract_filter(&mut self) -> Result<(), TridentError> {
         match Self::load_filter(&self.db, &self.config.network).await {
             Ok(filter) => {
+                self.filter_plan = plan_filters(filter.as_ref(), &self.config.topic_filters);
                 self.contract_filter = filter;
                 Ok(())
             }
@@ -217,16 +223,24 @@ impl Streamer {
         let mut page_cursor: Option<String> = None;
         let mut total = 0;
 
+        // Snapshot the server-side filters for the whole cycle (issue #203) so
+        // the request shape is stable across pages and the borrow does not
+        // conflict with the mutable state updated inside the loop.
+        let filters = self.filter_plan.filters.clone();
+
         loop {
             let (sl, pc) = page_request_params(*cursor, page_cursor.as_deref());
             let mut attempt = 0u32;
             let limit = self.config.max_events_per_poll;
+            // Server-side narrowing (issue #203). Empty in index-all mode; the
+            // client-side allowlist check below stays as the safety net.
+            let filters = filters.as_slice();
             let page = Retry::start(retry_strategy.clone(), || {
                 attempt += 1;
                 if attempt > 1 {
                     metrics::record_rpc_retry();
                 }
-                async { self.rpc.get_events(sl, pc.clone(), limit).await }
+                async { self.rpc.get_events(sl, pc.clone(), limit, filters).await }
                     .instrument(tracing::info_span!("rpc_get_events"))
             })
             .await?;
@@ -248,13 +262,21 @@ impl Streamer {
 
             let mut events_in_page: i32 = 0;
             let mut skipped_in_page: u64 = 0;
+            // Accumulate the page and commit it in one transaction (issue #199)
+            // rather than paying a round-trip per row.
+            let mut page_events: Vec<trident_common::SorobanEvent> =
+                Vec::with_capacity(page.events.len());
+            // Token projections keyed by position in `page_events` (issue #211).
+            // Indices, not references, because `page_events` is still growing.
+            let mut page_tokens: Vec<(usize, crate::parser::token_events::TokenEvent)> = Vec::new();
             for raw in &page.events {
                 let parse_result = {
                     let _span = tracing::info_span!("parse_events").entered();
-                    self.parser.parse_event(raw)
+                    self.parser.parse_event_with_projection(raw)
                 };
                 match parse_result {
-                    Ok(Some(event)) => {
+                    Ok(Some(parsed)) => {
+                        let event = parsed.event;
                         // Contract allowlist filtering (issue #47).
                         // None → index all; Some(set) → only listed contracts.
                         if let Some(ref filter) = self.contract_filter {
@@ -267,19 +289,10 @@ impl Streamer {
                                 continue;
                             }
                         }
-                        db::insert_event(&self.db, &event)
-                            .instrument(tracing::info_span!(
-                                "db_insert_events",
-                                contract_id = %event.contract_id
-                            ))
-                            .await?;
-                        redis_stream::publish_event(
-                            &mut self.redis,
-                            &event,
-                            self.config.redis_stream_maxlen,
-                        )
-                        .instrument(tracing::info_span!("redis_xadd"))
-                        .await?;
+                        if let Some(token) = parsed.token {
+                            page_tokens.push((page_events.len(), token));
+                        }
+                        page_events.push(event);
                         total += 1;
                         events_in_page += 1;
                     }
@@ -333,16 +346,23 @@ impl Streamer {
             metrics::record_events_processed(events_in_page as u64);
             metrics::record_events_skipped(skipped_in_page);
 
-            // Advance the persistent cursor and record ledger metadata.
+            // Decide whether this page advances the cursor, and gather the
+            // ledger provenance that must land in the same transaction.
+            let mut next_cursor: Option<u64> = None;
+            let mut ledger_hash = String::new();
+            let mut ledger_timestamp = String::new();
+            let mut ledger_sequence = 0u64;
+
             if let Some(last) = page.events.last() {
                 let seq: u64 = last.ledger.parse().unwrap_or(*cursor);
                 if seq > *cursor {
-                    *cursor = seq;
-                    db::set_cursor(&self.db, *cursor).await?;
+                    next_cursor = Some(seq);
+                    ledger_sequence = seq;
+                    ledger_timestamp = last.ledger_closed_at.clone();
 
                     // Fetch the real ledger hash from getLedgers RPC.
                     // Non-critical: log a warning on failure, store empty string.
-                    let ledger_hash = match self.rpc.get_ledger(seq).await {
+                    ledger_hash = match self.rpc.get_ledger(seq).await {
                         Ok(Some(h)) => h,
                         Ok(None) => {
                             tracing::warn!(seq, "getLedgers returned no ledger for sequence");
@@ -353,16 +373,56 @@ impl Streamer {
                             String::new()
                         }
                     };
-
-                    db::insert_ledger_metadata(
-                        &self.db,
-                        seq,
-                        &ledger_hash,
-                        &last.ledger_closed_at,
-                        events_in_page,
-                    )
-                    .await?;
                 }
+            }
+
+            // One transaction for the whole page: events, cursor, and ledger
+            // metadata land together or not at all, so a crash can never leave
+            // the cursor ahead of the events it claims to cover (issue #199).
+            // Resolve the projection indices now that `page_events` is final.
+            let token_projections: Vec<db::TokenProjection<'_>> = page_tokens
+                .iter()
+                .map(|(index, token)| db::TokenProjection {
+                    event: &page_events[*index],
+                    token,
+                })
+                .collect();
+
+            db::commit_page(
+                &self.db,
+                db::PageCommit {
+                    events: &page_events,
+                    token_events: &token_projections,
+                    cursor: next_cursor,
+                    ledger: next_cursor.map(|_| db::LedgerMeta {
+                        sequence: ledger_sequence,
+                        hash: &ledger_hash,
+                        timestamp: &ledger_timestamp,
+                        event_count: events_in_page,
+                    }),
+                    batch_size: self.config.db_batch_size,
+                },
+            )
+            .instrument(tracing::info_span!(
+                "db_commit_page",
+                events = page_events.len()
+            ))
+            .await?;
+
+            if let Some(seq) = next_cursor {
+                *cursor = seq;
+            }
+
+            // Publish only after the commit so a subscriber can never observe an
+            // event that a rolled-back transaction never persisted.
+            for event in &page_events {
+                redis_stream::publish_event(
+                    &mut self.redis,
+                    event,
+                    self.config.redis_stream_maxlen,
+                )
+                .instrument(tracing::info_span!("redis_xadd"))
+                .await?;
             }
 
             // An incomplete page means we have caught up to the chain tip.
@@ -410,6 +470,35 @@ impl Streamer {
 
         Ok(total)
     }
+}
+
+/// Build the server-side `getEvents` filter plan for the current allowlist and
+/// log how the request will be narrowed (issue #203).
+///
+/// A `degraded` plan means the allowlist is too large to express within the
+/// RPC's filter caps, so we index everything and rely on the client-side
+/// allowlist check in `poll_once` — correct, just less efficient.
+fn plan_filters(allowlist: Option<&HashSet<String>>, topic_filters: &[Vec<String>]) -> FilterPlan {
+    let plan = build_event_filters(allowlist, topic_filters);
+
+    if plan.degraded {
+        tracing::warn!(
+            contracts = allowlist.map(|s| s.len()).unwrap_or(0),
+            max = crate::rpc::filters::MAX_FILTERABLE_CONTRACTS,
+            "Allowlist exceeds the RPC filter caps; falling back to index-all with client-side filtering"
+        );
+    } else if plan.filters.is_empty() {
+        tracing::info!("No contract allowlist; requesting all events (index-all mode)");
+    } else {
+        tracing::info!(
+            filters = plan.filters.len(),
+            contracts = allowlist.map(|s| s.len()).unwrap_or(0),
+            topic_patterns = topic_filters.len(),
+            "Server-side getEvents filtering active"
+        );
+    }
+
+    plan
 }
 
 /// Decide the `(startLedger, cursor)` params for a single RPC page request.
@@ -555,7 +644,9 @@ mod tests {
             lag_high_watermark: 100,
             poll_hysteresis_ledgers: 10,
             index_diagnostic: false,
+            topic_filters: Vec::new(),
             max_events_per_poll: 200,
+            db_batch_size: 1_000,
             redis_stream_maxlen: 10_000,
             metrics_port: 0,
             alert_webhook_url: None,
@@ -776,6 +867,245 @@ mod tests {
             Some(0.0),
             "lag should be zero once the cursor catches up to the chain tip"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Token projection (issue #211)
+    // -----------------------------------------------------------------------
+
+    /// A page of standard SEP-41 transfer events, wire-encoded the way the RPC
+    /// returns them so the whole decode path runs.
+    fn token_events_page(ledger: u64, count: usize) -> serde_json::Value {
+        use stellar_xdr::curr::{AccountId, Int128Parts, PublicKey, ScAddress, Uint256};
+
+        let addr = |seed: u8| {
+            let val = ScVal::Address(ScAddress::Account(AccountId(
+                PublicKey::PublicKeyTypeEd25519(Uint256([seed; 32])),
+            )));
+            let mut buf = vec![];
+            val.write_xdr(&mut Limited::new(&mut buf, Limits::none()))
+                .unwrap();
+            STANDARD.encode(buf)
+        };
+        let amount = |v: i64| {
+            let val = ScVal::I128(Int128Parts {
+                hi: 0,
+                lo: v as u64,
+            });
+            let mut buf = vec![];
+            val.write_xdr(&mut Limited::new(&mut buf, Limits::none()))
+                .unwrap();
+            STANDARD.encode(buf)
+        };
+
+        let events: Vec<serde_json::Value> = (0..count)
+            .map(|i| {
+                serde_json::json!({
+                    "type": "contract",
+                    "ledger": ledger.to_string(),
+                    "ledgerClosedAt": "2024-01-01T00:00:00Z",
+                    "contractId": "CTOKEN_PROJECTION",
+                    "id": format!("{:016}-{}", ledger, i),
+                    "pagingToken": format!("{}-{}", ledger, i),
+                    "txHash": format!("tokenhash{}{}", ledger, i),
+                    "topic": [sym_xdr("transfer"), addr(1), addr(2)],
+                    "value": amount(1_000 + i as i64),
+                    "inSuccessfulContractCall": true
+                })
+            })
+            .collect();
+
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": { "events": events, "latestLedger": ledger }
+        })
+    }
+
+    #[tokio::test]
+    async fn token_events_are_projected_into_the_projection_table() {
+        let (db_url, redis_url) = require_services!();
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "getLedgers" }),
+            ))
+            .respond_with(rpc_ok(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "ledgers": [] }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "getEvents" }),
+            ))
+            .respond_with(rpc_ok(token_events_page(700, 3)))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "getEvents" }),
+            ))
+            .respond_with(rpc_ok(events_page(700, 0)))
+            .mount(&server)
+            .await;
+
+        let mut s = make_streamer(&db_url, &redis_url, server.uri()).await;
+        reset_db(&s.db).await;
+
+        let mut cursor = 0u64;
+        s.poll_once(&mut cursor).await.unwrap();
+
+        let rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT event_type, amount, to_address FROM token_events
+             WHERE contract_id = 'CTOKEN_PROJECTION' ORDER BY event_index",
+        )
+        .fetch_all(&s.db)
+        .await
+        .unwrap();
+
+        assert_eq!(rows.len(), 3, "every transfer must be projected");
+        assert!(rows.iter().all(|(kind, _, _)| kind == "transfer"));
+        assert_eq!(rows[0].1.as_deref(), Some("1000"));
+        assert!(rows[0].2.is_some(), "transfer must record a destination");
+
+        // Replaying the same page must not duplicate the projection.
+        let mut replay_cursor = 0u64;
+        let _ = s.poll_once(&mut replay_cursor).await;
+        let count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM token_events WHERE contract_id = 'CTOKEN_PROJECTION'",
+        )
+        .fetch_one(&s.db)
+        .await
+        .unwrap();
+        assert_eq!(count.0, 3, "replay must not duplicate projection rows");
+    }
+
+    // -----------------------------------------------------------------------
+    // Server-side getEvents filtering (issue #203)
+    // -----------------------------------------------------------------------
+
+    /// Register the allowlist rows the streamer reads on refresh, scoped to the
+    /// network the test config uses.
+    async fn set_allowlist(pool: &sqlx::PgPool, contract_ids: &[&str]) {
+        sqlx::query("DELETE FROM indexed_contracts WHERE network = 'testnet' OR network IS NULL")
+            .execute(pool)
+            .await
+            .unwrap();
+        for id in contract_ids {
+            sqlx::query(
+                "INSERT INTO indexed_contracts (contract_id, network) VALUES ($1, 'testnet')
+                 ON CONFLICT (contract_id, network) DO NOTHING",
+            )
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn get_events_request_carries_allowlist_contract_filter() {
+        let (db_url, redis_url) = require_services!();
+        let server = MockServer::start().await;
+
+        // The mock only matches when the outbound body contains the expected
+        // filter block. If the filter were missing, nothing would match and the
+        // poll would fail — this assertion cannot silently pass.
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(serde_json::json!({
+                "method": "getEvents",
+                "params": {
+                    "filters": [{
+                        "type": "contract",
+                        "contractIds": ["CFILTER_A", "CFILTER_B"]
+                    }]
+                }
+            })))
+            .respond_with(rpc_ok(events_page(600, 0)))
+            .expect(1..)
+            .mount(&server)
+            .await;
+
+        let mut s = make_streamer(&db_url, &redis_url, server.uri()).await;
+        reset_db(&s.db).await;
+        set_allowlist(&s.db, &["CFILTER_A", "CFILTER_B"]).await;
+        s.refresh_contract_filter().await.unwrap();
+
+        let mut cursor = 0u64;
+        s.poll_once(&mut cursor).await.unwrap();
+
+        set_allowlist(&s.db, &[]).await;
+    }
+
+    #[tokio::test]
+    async fn get_events_request_sends_empty_filters_in_index_all_mode() {
+        let (db_url, redis_url) = require_services!();
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(serde_json::json!({
+                "method": "getEvents",
+                "params": { "filters": [] }
+            })))
+            .respond_with(rpc_ok(events_page(601, 0)))
+            .expect(1..)
+            .mount(&server)
+            .await;
+
+        let mut s = make_streamer(&db_url, &redis_url, server.uri()).await;
+        reset_db(&s.db).await;
+        set_allowlist(&s.db, &[]).await;
+        s.refresh_contract_filter().await.unwrap();
+
+        let mut cursor = 0u64;
+        s.poll_once(&mut cursor).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_allowlist_degrades_to_unfiltered_request() {
+        let (db_url, redis_url) = require_services!();
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(serde_json::json!({
+                "method": "getEvents",
+                "params": { "filters": [] }
+            })))
+            .respond_with(rpc_ok(events_page(602, 0)))
+            .expect(1..)
+            .mount(&server)
+            .await;
+
+        let ids: Vec<String> = (0..crate::rpc::filters::MAX_FILTERABLE_CONTRACTS + 1)
+            .map(|i| format!("CBIG_{i:03}"))
+            .collect();
+        let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+
+        let mut s = make_streamer(&db_url, &redis_url, server.uri()).await;
+        reset_db(&s.db).await;
+        set_allowlist(&s.db, &id_refs).await;
+        s.refresh_contract_filter().await.unwrap();
+
+        assert!(
+            s.filter_plan.degraded,
+            "an allowlist past the RPC caps must degrade to index-all"
+        );
+
+        let mut cursor = 0u64;
+        s.poll_once(&mut cursor).await.unwrap();
+
+        set_allowlist(&s.db, &[]).await;
     }
 
     #[tokio::test]

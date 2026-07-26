@@ -18,7 +18,12 @@ pub struct Config {
     /// Hysteresis deadband (ledgers) suppressing interval churn on lag jitter.
     pub poll_hysteresis_ledgers: u64,
     pub index_diagnostic: bool,
+    /// Topic patterns pushed into the `getEvents` RPC filter alongside the
+    /// contract allowlist (issue #203). Empty means "no topic narrowing".
+    pub topic_filters: Vec<Vec<String>>,
     pub max_events_per_poll: u32,
+    /// Maximum rows per batched INSERT when committing a page (issue #199).
+    pub db_batch_size: usize,
     pub redis_stream_maxlen: u64,
     pub metrics_port: u16,
     pub alert_webhook_url: Option<String>,
@@ -49,6 +54,10 @@ impl Config {
 
         let poll_interval_ms = parse_bounded_u64("POLL_INTERVAL_MS", 1000, 100, 60_000)?;
         let max_events_per_poll = parse_bounded_u64("MAX_EVENTS_PER_POLL", 200, 1, 10_000)?;
+        // Rows per batched INSERT (issue #199). Large enough that a default
+        // 200-event page commits in one statement, bounded so a huge page
+        // cannot build an unbounded statement.
+        let db_batch_size = parse_bounded_u64("DB_BATCH_SIZE", 1_000, 1, 10_000)?;
 
         // Adaptive poll interval bounds (issue #198). Defaults: poll every 250ms
         // while far behind, back off to 5s once caught up, cross over at 100
@@ -69,6 +78,17 @@ impl Config {
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
+        // Optional server-side topic narrowing (issue #203), e.g.
+        // INDEX_TOPIC_FILTERS="transfer/*/*,mint/*/*". Only applied when a
+        // contract allowlist is configured; an invalid spec is a hard error
+        // rather than a silent fallback to unfiltered indexing.
+        let topic_filters = match std::env::var("INDEX_TOPIC_FILTERS") {
+            Ok(spec) => crate::rpc::filters::parse_topic_filters(&spec).map_err(|e| {
+                TridentError::config(anyhow::anyhow!("[indexer] INDEX_TOPIC_FILTERS: {e}"))
+            })?,
+            Err(_) => Vec::new(),
+        };
+
         let alert_webhook_url = std::env::var("ALERT_WEBHOOK_URL")
             .ok()
             .filter(|s| !s.is_empty());
@@ -87,7 +107,9 @@ impl Config {
             lag_high_watermark,
             poll_hysteresis_ledgers,
             index_diagnostic,
+            topic_filters,
             max_events_per_poll: max_events_per_poll as u32,
+            db_batch_size: db_batch_size as usize,
             redis_stream_maxlen: std::env::var("REDIS_STREAM_MAXLEN")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -361,6 +383,67 @@ mod tests {
             env::remove_var("POLL_INTERVAL_MS");
             let cfg = Config::from_env().unwrap();
             assert_eq!(cfg.max_events_per_poll, 10000);
+        });
+    }
+
+    #[test]
+    fn db_batch_size_defaults_to_1000() {
+        let vars = required_vars();
+        with_env(&vars, || {
+            env::remove_var("DB_BATCH_SIZE");
+            let cfg = Config::from_env().unwrap();
+            assert_eq!(cfg.db_batch_size, 1_000);
+        });
+    }
+
+    #[test]
+    fn db_batch_size_custom_value() {
+        let mut vars = required_vars();
+        vars.push(("DB_BATCH_SIZE", "250"));
+        with_env(&vars, || {
+            let cfg = Config::from_env().unwrap();
+            assert_eq!(cfg.db_batch_size, 250);
+        });
+    }
+
+    #[test]
+    fn db_batch_size_zero_is_rejected() {
+        let mut vars = required_vars();
+        vars.push(("DB_BATCH_SIZE", "0"));
+        with_env(&vars, || {
+            let err = Config::from_env().unwrap_err();
+            assert!(err.to_string().contains("DB_BATCH_SIZE"));
+        });
+    }
+
+    #[test]
+    fn topic_filters_default_to_empty() {
+        let vars = required_vars();
+        with_env(&vars, || {
+            env::remove_var("INDEX_TOPIC_FILTERS");
+            let cfg = Config::from_env().unwrap();
+            assert!(cfg.topic_filters.is_empty());
+        });
+    }
+
+    #[test]
+    fn topic_filters_parsed_from_spec() {
+        let mut vars = required_vars();
+        vars.push(("INDEX_TOPIC_FILTERS", "transfer/*/*"));
+        with_env(&vars, || {
+            let cfg = Config::from_env().unwrap();
+            assert_eq!(cfg.topic_filters.len(), 1);
+            assert_eq!(cfg.topic_filters[0].len(), 3);
+        });
+    }
+
+    #[test]
+    fn invalid_topic_filter_spec_is_rejected() {
+        let mut vars = required_vars();
+        vars.push(("INDEX_TOPIC_FILTERS", "a/b/c/d/e"));
+        with_env(&vars, || {
+            let err = Config::from_env().unwrap_err();
+            assert!(err.to_string().contains("INDEX_TOPIC_FILTERS"));
         });
     }
 
