@@ -9,6 +9,9 @@ import (
 	"net"
 	"net/http"
 	"time"
+
+	"github.com/Depo-dev/trident/services/api/internal/httputil"
+	"github.com/Depo-dev/trident/services/api/validation"
 )
 
 const (
@@ -38,9 +41,17 @@ const (
 // read deadline so dead connections are detected and goroutines do not leak.
 func Handler(hub *Hub) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		contractID := r.URL.Query().Get("contractId")
-		if contractID == "" {
-			http.Error(w, "missing contractId query parameter", http.StatusBadRequest)
+		q := r.URL.Query()
+		// Pre-handshake failures use the same INVALID_ARGUMENT envelope as the
+		// REST endpoints rather than a plain-text body (issue #222).
+		if verr := validation.RejectUnknownParams(q, "contractId", "topic0"); verr != nil {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
+			return
+		}
+
+		contractID := q.Get("contractId")
+		if verr := validation.ValidateRequiredContractID("contractId", contractID); verr != nil {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
 			return
 		}
 
