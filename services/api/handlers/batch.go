@@ -32,11 +32,6 @@ type BatchEventsResponse struct {
 // fetches up to batchEventsMaxIDs events in parallel via gRPC GetEvent, and
 // returns found events plus a missing array for any IDs that were not indexed.
 func BatchGetEvents(w http.ResponseWriter, r *http.Request) {
-	if eventsClient == nil {
-		httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.INTERNAL, "gRPC backend unavailable")
-		return
-	}
-
 	var req batchRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, "request body must be valid JSON")
@@ -59,6 +54,13 @@ func BatchGetEvents(w http.ResponseWriter, r *http.Request) {
 	if len(invalid) > 0 {
 		httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT,
 			fmt.Sprintf("one or more IDs are not valid UUID v4: %s", strings.Join(invalid, ", ")))
+		return
+	}
+
+	// Backend availability is checked after validation: a malformed body is a
+	// 400 whether or not the backend is up (issue #222).
+	if eventsClient == nil {
+		httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.INTERNAL, "gRPC backend unavailable")
 		return
 	}
 
