@@ -786,6 +786,9 @@ mod tests {
             alert_webhook_url: None,
             alert_lag_threshold: 200,
             alert_cooldown_minutes: 30,
+            health_port: 0,
+            statement_timeout_ms: 30_000,
+            idle_in_transaction_timeout_ms: 60_000,
         };
 
         Streamer::new(config, db).await.unwrap()
