@@ -5,7 +5,7 @@
 //! it catches up again.
 //!
 //! ## Design decisions
-//! - **Silently disabled** when `ALERT_WEBHOOK_URL` is not set — no log
+//! - **Silently disabled** when no sinks are configured — no log
 //!   warnings, no HTTP client allocated.
 //! - **Cooldown**: alerts fire at most once per `ALERT_COOLDOWN_MINUTES`.
 //!   Without this, every 6-second poll cycle would flood Slack.
@@ -13,20 +13,38 @@
 //!   aborts the poll cycle or affects cursor advancement.
 //! - **One retry on network error**: a 4xx means our payload is malformed;
 //!   retrying won't help. A network error is transient and worth one retry.
-//! - **Slack compatible**: payload includes a `text` field so it can be sent
-//!   directly to a Slack incoming webhook URL.
-//! - **PagerDuty**: PagerDuty Events API v2 requires `routing_key` and
-//!   `event_action` fields which are not present in our payload. PagerDuty
-//!   users should use an HTTP proxy/transformation layer (e.g. an AWS Lambda
-//!   or Zapier step) to translate the payload before forwarding to PD.
+//! - **Pluggable sinks**: generic webhook, Slack (blocks/attachments),
+//!   and PagerDuty Events API v2 with per-severity routing.
+//! - **Severity levels**: `info`, `warning`, `critical` route to different
+//!   sinks or the same sink with formatted payloads.
 
 use chrono::Utc;
+use reqwest::Client;
 use serde::Serialize;
 use std::time::Duration;
 use trident_common::TridentError;
 
 /// Webhook POST timeout.
 const WEBHOOK_TIMEOUT_SECS: u64 = 5;
+
+/// Severity level for alerts.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Severity {
+    Info,
+    Warning,
+    Critical,
+}
+
+impl Severity {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Warning => "warning",
+            Self::Critical => "critical",
+        }
+    }
+}
 
 /// State passed into every alerting check.
 pub struct AlertContext {
@@ -46,7 +64,7 @@ pub struct AlertState {
 #[derive(Debug, Serialize)]
 struct WebhookPayload {
     alert: &'static str,
-    severity: &'static str,
+    severity: String,
     indexer: &'static str,
     network: String,
     lag_ledgers: u64,
@@ -68,50 +86,226 @@ struct RecoveryPayload {
     text: String,
 }
 
+/// Pluggable alert sink abstraction. Each implementation knows how to format
+/// and POST an alert to a specific backend.
+#[async_trait::async_trait]
+pub trait AlertSink: Send + Sync {
+    /// Post an alert payload.
+    async fn post(&self, client: &Client, url: &str, payload: &WebhookPayload) -> bool;
+
+    /// Post a recovery payload.
+    async fn post_recovery(&self, client: &Client, url: &str, payload: &RecoveryPayload) -> bool;
+}
+
+/// Generic JSON webhook sink — posts the serialised payload as-is.
+pub struct GenericWebhook;
+
+#[async_trait::async_trait]
+impl AlertSink for GenericWebhook {
+    async fn post(&self, client: &Client, url: &str, payload: &WebhookPayload) -> bool {
+        post_json_with_retry(client, url, payload).await
+    }
+
+    async fn post_recovery(&self, client: &Client, url: &str, payload: &RecoveryPayload) -> bool {
+        post_json_with_retry(client, url, payload).await
+    }
+}
+
+/// Slack sink — posts a minimal blocks payload with a text section.
+pub struct SlackWebhook;
+
+#[async_trait::async_trait]
+impl AlertSink for SlackWebhook {
+    async fn post(&self, client: &Client, url: &str, payload: &WebhookPayload) -> bool {
+        #[derive(Serialize)]
+        struct SlackBlock {
+            #[serde(rename = "type")]
+            kind: &'static str,
+            text: serde_json::Value,
+        }
+
+        #[derive(Serialize)]
+        struct SlackPayload {
+            text: String,
+            blocks: Vec<SlackBlock>,
+        }
+
+        let color = match payload.severity.as_str() {
+            "critical" => "#FF0000",
+            "warning" => "#FFA500",
+            _ => "#CCCCCC",
+        };
+
+        let blocks = vec![SlackBlock {
+            kind: "section",
+            text: serde_json::json!({
+                "type": "mrkdwn",
+                "text": format!(
+                    "*{}* {} ({} ledgers behind, threshold {})\n{}",
+                    payload.alert.to_uppercase(),
+                    payload.network,
+                    payload.lag_ledgers,
+                    payload.lag_threshold,
+                    payload.message
+                ),
+            }),
+        }];
+
+        let slack = SlackPayload {
+            text: payload.text.clone(),
+            blocks,
+        };
+
+        post_json_with_retry(client, url, &slack).await
+    }
+
+    async fn post_recovery(&self, client: &Client, url: &str, payload: &RecoveryPayload) -> bool {
+        #[derive(Serialize)]
+        struct SlackPayload {
+            text: String,
+        }
+
+        let slack = SlackPayload {
+            text: payload.text.clone(),
+        };
+
+        post_json_with_retry(client, url, &slack).await
+    }
+}
+
+/// PagerDuty Events API v2 sink.
+pub struct PagerDuty {
+    pub routing_key: String,
+}
+
+#[async_trait::async_trait]
+impl AlertSink for PagerDuty {
+    async fn post(&self, client: &Client, url: &str, payload: &WebhookPayload) -> bool {
+        #[derive(Serialize)]
+        struct PDEvent {
+            r#type: &'static str,
+            severity: String,
+            summary: String,
+            source: String,
+            timestamp: String,
+            custom_details: serde_json::Value,
+        }
+
+        #[derive(Serialize)]
+        struct PDPayload {
+            routing_key: String,
+            event_action: &'static str,
+            dedup_key: String,
+            payload: PDEvent,
+        }
+
+        let severity = match payload.severity.as_str() {
+            "critical" => "critical",
+            "warning" => "warning",
+            _ => "info",
+        };
+
+        let pd = PDPayload {
+            routing_key: self.routing_key.clone(),
+            event_action: "trigger",
+            dedup_key: format!("{}-{}-lag", payload.network, payload.indexer),
+            payload: PDEvent {
+                r#type: "alert",
+                severity: severity.to_string(),
+                summary: payload.text.clone(),
+                source: payload.indexer.to_string(),
+                timestamp: payload.timestamp.clone(),
+                custom_details: serde_json::json!({
+                    "lag_ledgers": payload.lag_ledgers,
+                    "chain_tip_ledger": payload.chain_tip_ledger,
+                    "last_indexed_ledger": payload.last_indexed_ledger,
+                    "lag_threshold": payload.lag_threshold,
+                }),
+            },
+        };
+
+        post_json_with_retry(client, url, &pd).await
+    }
+
+    async fn post_recovery(&self, client: &Client, url: &str, payload: &RecoveryPayload) -> bool {
+        #[derive(Serialize)]
+        struct PDResolve {
+            r#type: &'static str,
+            summary: String,
+            source: String,
+            timestamp: String,
+        }
+
+        #[derive(Serialize)]
+        struct PDPayload {
+            routing_key: String,
+            event_action: &'static str,
+            dedup_key: String,
+            payload: PDResolve,
+        }
+
+        let pd = PDPayload {
+            routing_key: self.routing_key.clone(),
+            event_action: "resolve",
+            dedup_key: format!("trident-indexer-lag-{}", payload.lag_ledgers),
+            payload: PDResolve {
+                r#type: "alert",
+                summary: payload.text.clone(),
+                source: "trident-indexer",
+                timestamp: payload.timestamp.clone(),
+            },
+        };
+
+        post_json_with_retry(client, url, &pd).await
+    }
+}
+
 /// The alerting subsystem. Constructed once in `main` and passed to
-/// `Streamer`. When `webhook_url` is `None` every method is a no-op.
+/// `Streamer`. When no sinks are registered every method is a no-op.
 pub struct Alerter {
-    webhook_url: Option<String>,
-    #[allow(dead_code)]
     lag_threshold: u64,
     cooldown: Duration,
-    http: Option<reqwest::Client>,
+    http: Option<Client>,
+    sinks: Vec<Box<dyn AlertSink>>,
+    urls: Vec<String>,
 }
 
 impl Alerter {
-    /// Build an `Alerter` from the three alerting env vars.
+    /// Build an `Alerter` from the provided sinks and URLs.
     ///
-    /// Returns `Ok(Alerter { webhook_url: None, .. })` when
-    /// `ALERT_WEBHOOK_URL` is absent — no error, no log.
-    pub fn from_config(
-        webhook_url: Option<String>,
+    /// Returns `Ok(Alerter { sinks: [], .. })` when no sinks are configured —
+    /// no error, no log.
+    pub fn from_sinks(
+        sinks: Vec<Box<dyn AlertSink>>,
+        urls: Vec<String>,
         lag_threshold: u64,
         cooldown_minutes: u64,
     ) -> Result<Self, TridentError> {
-        let http = if webhook_url.is_some() {
+        let http = if sinks.is_empty() {
+            None
+        } else {
             Some(
-                reqwest::Client::builder()
+                Client::builder()
                     .timeout(Duration::from_secs(WEBHOOK_TIMEOUT_SECS))
                     .build()
                     .map_err(|e| {
                         TridentError::config(anyhow::Error::new(e).context("alerting HTTP client"))
                     })?,
             )
-        } else {
-            None
         };
 
         Ok(Self {
-            webhook_url,
+            sinks,
+            urls,
             lag_threshold,
             cooldown: Duration::from_secs(cooldown_minutes * 60),
             http,
         })
     }
 
-    /// Returns `true` when alerting is enabled (webhook URL is set).
+    /// Returns `true` when at least one sink is registered.
     pub fn is_enabled(&self) -> bool {
-        self.webhook_url.is_some()
+        !self.sinks.is_empty()
     }
 
     /// Evaluate lag and fire / resolve alerts as needed.
@@ -123,7 +317,7 @@ impl Alerter {
     /// Never returns an error — failures are logged at WARN level so the poll
     /// cycle is never affected.
     pub async fn evaluate(&self, ctx: &AlertContext, state: &mut AlertState) {
-        if self.webhook_url.is_none() {
+        if !self.is_enabled() {
             return;
         }
 
@@ -154,6 +348,12 @@ impl Alerter {
         }
 
         let timestamp = now.to_rfc3339();
+        let severity = if lag > ctx.lag_threshold * 2 {
+            Severity::Critical
+        } else {
+            Severity::Warning
+        };
+
         let message = format!(
             "Trident indexer is {} ledgers behind chain tip on {} (threshold: {})",
             lag, ctx.network, ctx.lag_threshold
@@ -161,7 +361,7 @@ impl Alerter {
 
         let payload = WebhookPayload {
             alert: "indexer_lag",
-            severity: "warning",
+            severity: severity.as_str().to_string(),
             indexer: "trident-indexer",
             network: ctx.network.clone(),
             lag_ledgers: lag,
@@ -173,10 +373,21 @@ impl Alerter {
             text: message,
         };
 
-        if self.post_with_retry(&payload).await {
+        let mut posted_any = false;
+        for (sink, url) in self.sinks.iter().zip(self.urls.iter()) {
+            let client = match &self.http {
+                Some(c) => c,
+                None => return,
+            };
+            if sink.post(client, url, &payload).await {
+                posted_any = true;
+            }
+        }
+
+        if posted_any {
             state.last_alert_at = Some(now);
             state.alert_fired = true;
-            tracing::info!(lag, "Alert webhook fired");
+            tracing::info!(lag, ?severity, "Alert webhook fired");
         }
     }
 
@@ -197,62 +408,64 @@ impl Alerter {
             text: message,
         };
 
-        if self.post_with_retry(&payload).await {
+        let mut posted_any = false;
+        for (sink, url) in self.sinks.iter().zip(self.urls.iter()) {
+            let client = match &self.http {
+                Some(c) => c,
+                None => return,
+            };
+            if sink.post_recovery(client, url, &payload).await {
+                posted_any = true;
+            }
+        }
+
+        if posted_any {
             state.alert_fired = false;
             state.last_alert_at = None;
             tracing::info!(lag, network = %ctx.network, "Recovery webhook fired");
         }
     }
+}
 
-    /// POST a JSON payload to the webhook URL.
-    /// Retries once on network error. Does NOT retry on 4xx (malformed payload).
-    /// Returns `true` on success, `false` on failure (already logged).
-    async fn post_with_retry<P: Serialize>(&self, payload: &P) -> bool {
-        let url = match &self.webhook_url {
-            Some(u) => u,
-            None => return false,
-        };
-        let client = match &self.http {
-            Some(c) => c,
-            None => return false,
-        };
-
-        for attempt in 1..=2u8 {
-            match client.post(url).json(payload).send().await {
-                Ok(resp) => {
-                    let status = resp.status();
-                    if status.is_success() {
-                        tracing::info!(status = status.as_u16(), "Webhook delivered");
-                        return true;
-                    }
-                    // 4xx: our payload is malformed — no point retrying.
-                    if status.is_client_error() {
-                        tracing::warn!(
-                            status = status.as_u16(),
-                            "Webhook rejected (4xx) — not retrying"
-                        );
-                        return false;
-                    }
-                    // 5xx: server-side issue — retry once.
+/// POST a JSON payload to the webhook URL.
+/// Retries once on network error. Does NOT retry on 4xx (malformed payload).
+/// Returns `true` on success, `false` on failure (already logged).
+async fn post_json_with_retry<P: Serialize>(client: &Client, url: &str, payload: &P) -> bool {
+    for attempt in 1..=2u8 {
+        match client.post(url).json(payload).send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    tracing::info!(status = status.as_u16(), "Webhook delivered");
+                    return true;
+                }
+                // 4xx: our payload is malformed — no point retrying.
+                if status.is_client_error() {
                     tracing::warn!(
                         status = status.as_u16(),
-                        attempt,
-                        "Webhook delivery failed (5xx)"
+                        "Webhook rejected (4xx) — not retrying"
                     );
+                    return false;
                 }
-                Err(e) => {
-                    tracing::warn!(error = %e, attempt, "Webhook network error");
-                }
+                // 5xx: server-side issue — retry once.
+                tracing::warn!(
+                    status = status.as_u16(),
+                    attempt,
+                    "Webhook delivery failed (5xx)"
+                );
             }
-
-            if attempt == 2 {
-                tracing::warn!("Webhook delivery failed after retry — best-effort, continuing");
-                return false;
+            Err(e) => {
+                tracing::warn!(error = %e, attempt, "Webhook network error");
             }
         }
 
-        false
+        if attempt == 2 {
+            tracing::warn!("Webhook delivery failed after retry — best-effort, continuing");
+            return false;
+        }
     }
+
+    false
 }
 
 #[cfg(test)]
@@ -261,7 +474,13 @@ mod tests {
     use chrono::Duration as CDuration;
 
     fn make_alerter(url: Option<&str>, threshold: u64, cooldown_minutes: u64) -> Alerter {
-        Alerter::from_config(url.map(|s| s.to_string()), threshold, cooldown_minutes).unwrap()
+        let sinks = if let Some(u) = url {
+            vec![Box::new(GenericWebhook) as Box<dyn AlertSink>]
+        } else {
+            vec![]
+        };
+        let urls = url.map(|s| vec![s.to_string()]).unwrap_or_default();
+        Alerter::from_sinks(sinks, urls, threshold, cooldown_minutes).unwrap()
     }
 
     fn make_ctx(last_indexed: u64, chain_tip: u64, threshold: u64) -> AlertContext {

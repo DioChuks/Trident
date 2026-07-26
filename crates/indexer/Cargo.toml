@@ -62,6 +62,9 @@ tokio-retry = "0.3"
 # CancellationToken for graceful shutdown
 tokio-util = "0.7"
 
+# Async trait support for pluggable alert sinks
+async-trait = "0.1"
+
 # Prometheus /metrics endpoint
 metrics = "0.24"
 metrics-exporter-prometheus = "0.18"

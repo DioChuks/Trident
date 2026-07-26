@@ -131,14 +131,20 @@ pub fn scval_to_string(val: &ScVal) -> String {
             let val = ((parts.hi as i128) << 64) | (parts.lo as i128);
             val.to_string()
         }
-        ScVal::U256(parts) => format!(
-            "u256({:x}{:x}{:x}{:x})",
-            parts.hi_hi, parts.hi_lo, parts.lo_hi, parts.lo_lo
-        ),
-        ScVal::I256(parts) => format!(
-            "i256({:x}{:x}{:x}{:x})",
-            parts.hi_hi, parts.hi_lo, parts.lo_hi, parts.lo_lo
-        ),
+        ScVal::U256(parts) => {
+            let val = ((parts.hi_hi as u128) << 96)
+                | ((parts.hi_lo as u128) << 64)
+                | ((parts.lo_hi as u128) << 32)
+                | (parts.lo_lo as u128);
+            val.to_string()
+        }
+        ScVal::I256(parts) => {
+            let val = ((parts.hi_hi as i128) << 96)
+                | ((parts.hi_lo as i128) << 64)
+                | ((parts.lo_hi as i128) << 32)
+                | (parts.lo_lo as i128);
+            val.to_string()
+        }
         ScVal::Bytes(b) => hex::encode(b.as_slice()),
         ScVal::Address(addr) => scaddress_to_string(addr),
         // For complex types in topic position, fall back to debug representation
@@ -174,6 +180,20 @@ pub fn scval_to_json(val: &ScVal) -> Json {
                 Json::String(v.to_string())
             }
         }
+        ScVal::U256(parts) => {
+            let val = ((parts.hi_hi as u128) << 96)
+                | ((parts.hi_lo as u128) << 64)
+                | ((parts.lo_hi as u128) << 32)
+                | (parts.lo_lo as u128);
+            Json::String(val.to_string())
+        }
+        ScVal::I256(parts) => {
+            let val = ((parts.hi_hi as i128) << 96)
+                | ((parts.hi_lo as i128) << 64)
+                | ((parts.lo_hi as i128) << 32)
+                | (parts.lo_lo as i128);
+            Json::String(val.to_string())
+        }
         ScVal::Bytes(b) => Json::String(hex::encode(b.as_slice())),
         ScVal::Address(addr) => Json::String(scaddress_to_string(addr)),
         ScVal::Vec(Some(items)) => Json::Array(items.iter().map(scval_to_json).collect()),
@@ -208,10 +228,10 @@ pub(crate) fn scaddress_to_string(addr: &ScAddress) -> String {
 mod tests {
     use super::*;
     use base64::{engine::general_purpose::STANDARD, Engine};
-    use stellar_xdr::curr::{
-        AccountId, ContractId, Hash, Int128Parts, Limited, Limits, PublicKey, ScAddress, ScMap,
-        ScMapEntry, ScSymbol, ScVal, Uint256, VecM, WriteXdr,
-    };
+        use stellar_xdr::curr::{
+            AccountId, ContractId, Hash, Int128Parts, Int256Parts, Limited, Limits, PublicKey,
+            ScAddress, ScMap, ScMapEntry, ScSymbol, ScVal, Uint256, VecM, WriteXdr,
+        };
 
     use crate::rpc::RawEvent;
 
@@ -356,6 +376,70 @@ mod tests {
             parser.parse_event(&raw).unwrap().is_none(),
             "events from failed contract calls must be filtered out"
         );
+    }
+
+    #[test]
+    fn large_i128_decoded_as_json_string() {
+        let v = ScVal::I128(Int128Parts {
+            hi: (170141183460469763414537442822368085504i128 >> 64) as i64,
+            lo: 1,
+        });
+
+        let raw = make_event("contract", None, vec![], v, true);
+        let event = Parser::new(false).parse_event(&raw).unwrap().unwrap();
+
+        assert!(
+            event.data.is_string(),
+            "large i128 must be a JSON string, got: {event}"
+        );
+        assert_eq!(
+            event.data.as_str().unwrap(),
+            "170141183460469763414537442822368085505",
+            "exact decimal string must survive round-trip XDR -> JSON"
+        );
+    }
+
+    #[test]
+    fn u256_decoded_as_decimal_string() {
+        let v = ScVal::U256(stellar_xdr::curr::UInt256Parts {
+            hi_hi: 0,
+            hi_lo: 0,
+            lo_hi: 0,
+            lo_lo: 1,
+        });
+
+        let raw = make_event("contract", None, vec![], v, true);
+        let event = Parser::new(false).parse_event(&raw).unwrap().unwrap();
+
+        assert_eq!(event.data, serde_json::json!("1"), "u256(1) must encode as \"1\"");
+    }
+
+    #[test]
+    fn i256_decoded_as_decimal_string() {
+        let v = ScVal::I256(stellar_xdr::curr::Int256Parts {
+            hi_hi: 0,
+            hi_lo: 0,
+            lo_hi: 0,
+            lo_lo: -1i32,
+        });
+
+        let raw = make_event("contract", None, vec![], v, true);
+        let event = Parser::new(false).parse_event(&raw).unwrap().unwrap();
+
+        assert_eq!(event.data, serde_json::json!("-1"), "i256(-1) must encode as \"-1\"");
+    }
+
+    #[test]
+    fn small_i128_remains_json_number() {
+        let v = ScVal::I128(Int128Parts { hi: 0, lo: 123 });
+        let raw = make_event("contract", None, vec![], v, true);
+        let event = Parser::new(false).parse_event(&raw).unwrap().unwrap();
+
+        assert!(
+            event.data.is_number(),
+            "small i128 that fits in i64 should remain a JSON number: {event}",
+        );
+        assert_eq!(event.data, serde_json::json!(123));
     }
 
     #[test]

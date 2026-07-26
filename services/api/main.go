@@ -242,6 +242,9 @@ func main() {
 	pprofSrv := profiling.Start()
 	defer profiling.Shutdown(pprofSrv)
 
+	// Grace period mirrors Helm terminationGracePeriodSeconds (default 30s).
+	const shutdownGrace = 30 * time.Second
+
 	server := &http.Server{
 		Addr:         fmt.Sprintf(":%s", port),
 		Handler:      handler,
@@ -258,12 +261,20 @@ func main() {
 	}()
 
 	<-ctx.Done()
-	slog.Info("shutting down")
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	slog.Info("shutting down", "grace", shutdownGrace)
+
+	// Stop accepting new connections and begin draining in-flight requests.
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
 	defer cancel()
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		slog.Error("graceful shutdown failed", "err", err)
 	}
+
+	// After the HTTP server stops accepting requests, close active SSE/WS
+	// streams so connected clients receive a clean close instead of a TCP RST.
+	hub.ShutdownAll()
+
+	slog.Info("shutdown complete")
 }
 
 func newDBPool(ctx context.Context, dsn string, poolSize int32) (*pgxpool.Pool, error) {
