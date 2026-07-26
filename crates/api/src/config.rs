@@ -42,7 +42,18 @@ mod tests {
     use super::*;
     use std::env;
 
+    /// Process environment is global state shared by every test thread, so all
+    /// env-mutating tests serialise on this lock. Without it one test clearing
+    /// `DATABASE_URL` fails another mid-`from_env`.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        // A panicking test must not poison the lock for the rest of the suite.
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn with_env<F: FnOnce()>(pairs: &[(&str, &str)], f: F) {
+        let _guard = env_guard();
         for (k, v) in pairs {
             env::set_var(k, v);
         }
@@ -54,6 +65,7 @@ mod tests {
 
     #[test]
     fn missing_both_required_vars_lists_both() {
+        let _guard = env_guard();
         env::remove_var("DATABASE_URL");
         env::remove_var("GRPC_ADDR");
 
@@ -65,6 +77,7 @@ mod tests {
 
     #[test]
     fn missing_database_url_only() {
+        let _guard = env_guard();
         env::remove_var("DATABASE_URL");
         env::set_var("GRPC_ADDR", "0.0.0.0:50051");
 
@@ -78,6 +91,7 @@ mod tests {
 
     #[test]
     fn missing_grpc_addr_only() {
+        let _guard = env_guard();
         env::set_var("DATABASE_URL", "postgres://localhost/test");
         env::remove_var("GRPC_ADDR");
 
