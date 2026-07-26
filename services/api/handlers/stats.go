@@ -307,6 +307,12 @@ func ContractsStats(db DBPool, rdb *redis.Client) http.HandlerFunc {
 		}
 
 		q := r.URL.Query()
+		if verr := validation.RejectUnknownParams(
+			q, "from_ledger", "to_ledger", "network", "limit",
+		); verr != nil {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
+			return
+		}
 
 		// Validate and parse query parameters
 		params, verr := validation.ValidateQueryStats(

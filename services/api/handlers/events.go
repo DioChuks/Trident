@@ -55,6 +55,15 @@ func ListEvents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	q := r.URL.Query()
+	// An unrecognised parameter is a client bug — a typo'd `limitt` silently
+	// changing the page size hides it — so it is rejected, not ignored (#222).
+	if verr := validation.RejectUnknownParams(
+		q, "limit", "ledgerFrom", "ledgerTo", "contractId", "cursor", "event_type", "topic0", "topic1",
+	); verr != nil {
+		httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
+		return
+	}
+
 	params, verr := validation.ValidateQueryEvents(
 		q.Get("limit"),
 		q.Get("ledgerFrom"),
@@ -68,15 +77,11 @@ func ListEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Decode opaque cursor → internal paging token (issue #44).
-	var pagingToken string
-	if raw := q.Get("cursor"); raw != "" {
-		decoded, err := cursor.Decode(raw)
-		if err != nil {
-			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, "invalid cursor")
-			return
-		}
-		pagingToken = decoded
+	// Decode opaque cursor → internal paging token (issues #44, #222).
+	pagingToken, verr := validation.ValidateCursor("cursor", q.Get("cursor"))
+	if verr != nil {
+		httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
+		return
 	}
 
 	// Network is enforced server-side from the authenticated API key context.
