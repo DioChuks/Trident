@@ -29,6 +29,13 @@ indexer:
   env:
     # GRPC_ADDR of the Rust gRPC service (in-cluster DNS)
     GRPC_ADDR: "trident-grpc-api:5000"
+    # Rows per batched INSERT when a page is committed. The page is always one
+    # transaction; this caps statement size, not transaction scope.
+    DB_BATCH_SIZE: "1000"
+    # Topic patterns pushed into the getEvents RPC filter alongside the contract
+    # allowlist. Unset means no topic narrowing. Segment count must match the
+    # events you want, e.g. a SEP-41 transfer carries three topics:
+    #   INDEX_TOPIC_FILTERS: "transfer/*/*,mint/*/*"
   # Prometheus metrics server (METRICS_PORT, default 9090) doubles as the
   # liveness/readiness signal for this otherwise portless worker.
   metricsPort: 9090
@@ -62,6 +69,13 @@ grpcApi:
   replicaCount: 1
   service:
     port: 5000
+  env:
+    # Address the gRPC server binds to. Must match service.port.
+    GRPC_ADDR: "0.0.0.0:5000"
+    # In-flight event buffer per StreamEvents subscriber. A full buffer blocks
+    # that subscriber's Redis consumer — deliberate backpressure, so a slow
+    # client throttles itself instead of growing an unbounded server-side queue.
+    STREAM_CHANNEL_BUFFER: "128"
   livenessProbe:
     tcpSocket:
       port: 5000

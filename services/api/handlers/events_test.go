@@ -41,9 +41,9 @@ func TestListEvents_NoParams_Returns200(t *testing.T) {
 	mock := &MockEventsClient{
 		ListEventsFunc: func(ctx context.Context, req *gen.ListEventsRequest) (*gen.ListEventsResponse, error) {
 			return &gen.ListEventsResponse{
-				Events:    []*gen.Event{},
+				Events:     []*gen.Event{},
 				NextCursor: "",
-				HasMore:   false,
+				HasMore:    false,
 			}, nil
 		},
 	}

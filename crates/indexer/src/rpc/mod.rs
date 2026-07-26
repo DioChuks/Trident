@@ -6,6 +6,10 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use trident_common::TridentError;
 
+pub mod filters;
+
+pub use filters::{EventFilter, FilterPlan};
+
 use crate::metrics;
 use endpoints::EndpointPool;
 
@@ -87,10 +91,12 @@ struct LedgerSummary {
 }
 
 #[derive(Serialize)]
-struct GetEventsParams {
+struct GetEventsParams<'a> {
     #[serde(rename = "startLedger", skip_serializing_if = "Option::is_none")]
     start_ledger: Option<u64>,
-    filters: Vec<serde_json::Value>,
+    /// Server-side narrowing (issue #203). Always serialised — an empty array is
+    /// the RPC's "no filter" form and is what index-all mode sends.
+    filters: &'a [EventFilter],
     pagination: Pagination,
 }
 
@@ -342,15 +348,19 @@ impl RpcClient {
     /// set at a time — the RPC rejects requests that supply both.
     ///
     /// `limit` controls the page size; callers should pass `config.max_events_per_poll`.
+    ///
+    /// `filters` narrows the result set server-side (issue #203). Pass an empty
+    /// slice to index every contract.
     pub async fn get_events(
         &self,
         start_ledger: Option<u64>,
         cursor: Option<String>,
         limit: u32,
+        filters: &[EventFilter],
     ) -> Result<EventsPage, TridentError> {
         let params = GetEventsParams {
             start_ledger,
-            filters: vec![],
+            filters,
             pagination: Pagination { limit, cursor },
         };
 
@@ -397,7 +407,7 @@ mod tests {
 
         let started = Instant::now();
         let err = client
-            .get_events(Some(1), None, 10)
+            .get_events(Some(1), None, 10, &[])
             .await
             .expect_err("slow endpoint must not succeed");
         let elapsed = started.elapsed();
@@ -474,20 +484,20 @@ mod tests {
         .unwrap();
 
         // Two failures on the primary trip the failover threshold.
-        assert!(client.get_events(Some(1), None, 10).await.is_err());
-        assert!(client.get_events(Some(1), None, 10).await.is_err());
+        assert!(client.get_events(Some(1), None, 10, &[]).await.is_err());
+        assert!(client.get_events(Some(1), None, 10, &[]).await.is_err());
         assert_eq!(client.active_endpoint_index(), 1);
 
         // The secondary now serves traffic successfully.
         let page = client
-            .get_events(Some(1), None, 10)
+            .get_events(Some(1), None, 10, &[])
             .await
             .expect("secondary must serve the request");
         assert_eq!(page.latest_ledger, 100);
 
         // Once the primary's cooldown elapses it is selected again.
         tokio::time::sleep(Duration::from_millis(250)).await;
-        assert!(client.get_events(Some(1), None, 10).await.is_err());
+        assert!(client.get_events(Some(1), None, 10, &[]).await.is_err());
         assert_eq!(
             client.active_endpoint_index(),
             0,
@@ -506,7 +516,7 @@ mod tests {
             .await;
 
         let client = RpcClient::with_settings(server.uri(), &fast_timeout_settings()).unwrap();
-        let err = client.get_events(Some(1), None, 10).await.unwrap_err();
+        let err = client.get_events(Some(1), None, 10, &[]).await.unwrap_err();
 
         assert!(err.to_string().contains("429"), "got: {err}");
         assert_eq!(err.severity(), Severity::Retryable);
@@ -530,7 +540,7 @@ mod tests {
         .unwrap();
 
         for _ in 0..3 {
-            client.get_events(Some(1), None, 10).await.unwrap();
+            client.get_events(Some(1), None, 10, &[]).await.unwrap();
         }
         assert_eq!(client.active_endpoint_index(), 0);
         assert_eq!(secondary.received_requests().await.unwrap().len(), 0);
