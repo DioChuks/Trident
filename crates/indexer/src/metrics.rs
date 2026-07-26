@@ -22,6 +22,9 @@ pub const EFFECTIVE_POLL_INTERVAL_MS: &str = "trident_indexer_effective_poll_int
 pub const RPC_TIMEOUTS_TOTAL: &str = "trident_indexer_rpc_timeouts_total";
 pub const RPC_ACTIVE_ENDPOINT: &str = "trident_indexer_rpc_active_endpoint";
 pub const RPC_FAILOVERS_TOTAL: &str = "trident_indexer_rpc_failovers_total";
+pub const OUTBOX_BACKLOG: &str = "trident_indexer_outbox_backlog";
+pub const OUTBOX_PUBLISHED_TOTAL: &str = "trident_indexer_outbox_published_total";
+pub const OUTBOX_PUBLISH_FAILURES_TOTAL: &str = "trident_indexer_outbox_publish_failures_total";
 
 /// Install the global Prometheus recorder and start serving `/metrics` on
 /// `port`. Must be called once, before the streamer starts recording.
@@ -70,6 +73,18 @@ pub fn install(port: u16) -> Result<(), TridentError> {
         RPC_FAILOVERS_TOTAL,
         "Times the indexer failed over to another RPC endpoint (issue #213)"
     );
+    describe_gauge!(
+        OUTBOX_BACKLOG,
+        "Committed events not yet published to the Redis stream (issue #200)"
+    );
+    describe_counter!(
+        OUTBOX_PUBLISHED_TOTAL,
+        "Events published to the Redis stream by the outbox relay (issue #200)"
+    );
+    describe_counter!(
+        OUTBOX_PUBLISH_FAILURES_TOTAL,
+        "Outbox publish attempts that failed (issue #200)"
+    );
 
     // Counters only render in the scrape output once touched at least once;
     // seed them at zero so /metrics is complete from the very first scrape.
@@ -80,7 +95,10 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     counter!(RPC_RETRIES_TOTAL).increment(0);
     counter!(RPC_TIMEOUTS_TOTAL).increment(0);
     counter!(RPC_FAILOVERS_TOTAL).increment(0);
+    counter!(OUTBOX_PUBLISHED_TOTAL).increment(0);
+    counter!(OUTBOX_PUBLISH_FAILURES_TOTAL).increment(0);
     gauge!(RPC_ACTIVE_ENDPOINT).set(0.0);
+    gauge!(OUTBOX_BACKLOG).set(0.0);
     gauge!(LEDGER_LAG).set(0.0);
     gauge!(EFFECTIVE_POLL_INTERVAL_MS).set(0.0);
 
@@ -138,4 +156,20 @@ pub fn set_rpc_active_endpoint(index: usize) {
 /// Count a switch to a different RPC endpoint (issue #213).
 pub fn record_rpc_failover() {
     counter!(RPC_FAILOVERS_TOTAL).increment(1);
+}
+
+/// Publish the number of committed-but-unpublished events. A backlog that keeps
+/// climbing means live subscribers are missing data (issue #200).
+pub fn set_outbox_backlog(backlog: i64) {
+    gauge!(OUTBOX_BACKLOG).set(backlog as f64);
+}
+
+/// Count an event delivered to the Redis stream by the relay (issue #200).
+pub fn record_outbox_published() {
+    counter!(OUTBOX_PUBLISHED_TOTAL).increment(1);
+}
+
+/// Count a failed relay publish attempt (issue #200).
+pub fn record_outbox_publish_failure() {
+    counter!(OUTBOX_PUBLISH_FAILURES_TOTAL).increment(1);
 }
