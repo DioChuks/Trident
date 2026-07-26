@@ -83,6 +83,7 @@ impl EndpointPool {
     }
 
     /// Number of configured endpoints.
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.endpoints.len()
     }

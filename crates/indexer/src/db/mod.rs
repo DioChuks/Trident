@@ -123,9 +123,12 @@ fn insert_event_query(
     .bind(&event.data))
 }
 
-/// Insert a normalised event. Silently ignores duplicates via `ON CONFLICT (id) DO NOTHING`.
-/// The `id` is a deterministic UUIDv5 derived from `(contract_id, ledger_sequence, event_index)`,
-/// so replaying the same event always produces the same primary key.
+/// Insert a normalised event on its own, without an outbox row.
+///
+/// Retained for tests that assert insert idempotency in isolation; the indexer
+/// always uses [`insert_event_with_outbox`] so every stored event has a
+/// delivery record.
+#[cfg(test)]
 pub async fn insert_event(pool: &PgPool, event: &SorobanEvent) -> Result<(), TridentError> {
     let id = event_uuid(&event.contract_id, event.ledger_sequence, event.event_index);
 

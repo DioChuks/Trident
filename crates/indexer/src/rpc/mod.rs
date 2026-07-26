@@ -181,16 +181,9 @@ pub struct RpcClient {
 }
 
 impl RpcClient {
-    /// Build a single-endpoint client with the default transport settings.
-    /// Prefer [`RpcClient::with_settings`] in production so the configured
-    /// timeouts apply.
-    pub fn new(url: String) -> Self {
-        Self::with_settings(url, &RpcHttpSettings::default())
-            .expect("default RPC HTTP settings must build a client")
-    }
-
     /// Build a single-endpoint client whose transport honours the configured
     /// timeouts and connection-pool settings (issue #214).
+    #[cfg(test)]
     pub fn with_settings(url: String, settings: &RpcHttpSettings) -> Result<Self, TridentError> {
         Self::with_endpoints(vec![url], settings, 3, Duration::from_secs(30))
     }
@@ -213,6 +206,7 @@ impl RpcClient {
     }
 
     /// Index of the endpoint currently serving traffic (0 = primary).
+    #[cfg(test)]
     pub fn active_endpoint_index(&self) -> usize {
         self.pool
             .lock()
