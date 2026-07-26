@@ -95,7 +95,16 @@ export interface paths {
         put?: never;
         /**
          * Get multiple events by ID
-         * @description Retrieve multiple events in a single request (up to 100)
+         * @description Retrieve multiple events in a single request (up to 100 ids).
+         *
+         *     Batch contract:
+         *     - `events` and `missing` both preserve the request order of `ids`.
+         *     - Duplicate ids are deduplicated on first occurrence; each unique id
+         *       appears at most once in the response, in `events` or in `missing`.
+         *     - A request with more than 100 ids (duplicates included) is rejected
+         *       with `400 INVALID_ARGUMENT`; so is any id that is not a UUID v4.
+         *     - Ids that are valid but not indexed do not fail the request; they
+         *       are listed in `missing` and the found events are still returned.
          */
         post: operations["batchGetEvents"];
         delete?: never;
@@ -575,7 +584,7 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": {
-                    /** @description List of event UUIDs */
+                    /** @description List of event UUIDs. Duplicates are deduplicated on first occurrence; the 100-id limit counts duplicates. */
                     ids: string[];
                 };
             };
@@ -588,7 +597,10 @@ export interface operations {
                 };
                 content: {
                     "application/json": {
+                        /** @description Found events, in request order (deduplicated). */
                         events: components["schemas"]["SorobanEvent"][];
+                        /** @description Ids that are valid UUIDs but not indexed, in request order. Empty array when every id was found. */
+                        missing: string[];
                     };
                 };
             };

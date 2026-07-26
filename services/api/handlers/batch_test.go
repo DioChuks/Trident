@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/Depo-dev/trident/services/api/gen"
@@ -210,10 +211,10 @@ func TestBatchGetEvents_MissingPreservesRequestOrder(t *testing.T) {
 }
 
 func TestBatchGetEvents_DuplicateIDsDeduplicated(t *testing.T) {
-	var calls int
+	var calls atomic.Int64
 	handlers.SetEventsClient(&MockEventsClient{
 		GetEventFunc: func(_ context.Context, req *gen.GetEventRequest) (*gen.Event, error) {
-			calls++
+			calls.Add(1)
 			return fakeEvent(req.Id), nil
 		},
 	})
@@ -232,8 +233,8 @@ func TestBatchGetEvents_DuplicateIDsDeduplicated(t *testing.T) {
 	if len(resp.Events) == 2 && (resp.Events[0].ID != uuid1 || resp.Events[1].ID != uuid2) {
 		t.Errorf("expected first-occurrence order [%s %s], got [%s %s]", uuid1, uuid2, resp.Events[0].ID, resp.Events[1].ID)
 	}
-	if calls != 2 {
-		t.Errorf("expected 2 backend calls after dedupe, got %d", calls)
+	if n := calls.Load(); n != 2 {
+		t.Errorf("expected 2 backend calls after dedupe, got %d", n)
 	}
 }
 
