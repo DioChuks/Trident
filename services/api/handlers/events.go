@@ -168,7 +168,13 @@ func GetEvent(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		statusCode, code := httputil.GRPCToHTTP(err)
 		slog.ErrorContext(r.Context(), "grpc GetEvent failed", "err", err)
-		httputil.WriteErrorCtx(r.Context(), w, statusCode, code, "event not found")
+		// "event not found" only fits a 404; a timeout or backend outage
+		// must not masquerade as a missing event (issue #227).
+		msg := "event not found"
+		if statusCode != http.StatusNotFound {
+			msg = "failed to fetch event"
+		}
+		httputil.WriteErrorCtx(r.Context(), w, statusCode, code, msg)
 		return
 	}
 
