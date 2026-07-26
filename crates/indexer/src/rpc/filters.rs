@@ -280,15 +280,32 @@ mod tests {
 
     #[test]
     fn symbol_segments_are_xdr_base64_encoded() {
+        // A symbol encodes as: discriminant (SCV_SYMBOL = 15), byte length, then
+        // the body zero-padded to a 4-byte boundary. "transfer" is 8 bytes, so
+        // it lands exactly on the boundary and carries no padding.
         let patterns = parse_topic_filters("transfer").unwrap();
         assert_eq!(patterns.len(), 1);
         let encoded = &patterns[0][0];
         assert_ne!(encoded, "transfer", "segment must be XDR-encoded");
+
         let bytes = STANDARD.decode(encoded).expect("valid base64");
-        assert!(
-            bytes.ends_with(b"transfer\0\0\0\0"),
-            "XDR-padded symbol body"
-        );
+        assert_eq!(&bytes[0..4], &[0, 0, 0, 15], "SCV_SYMBOL discriminant");
+        assert_eq!(&bytes[4..8], &[0, 0, 0, 8], "symbol length");
+        assert_eq!(&bytes[8..], b"transfer", "symbol body");
+    }
+
+    #[test]
+    fn symbol_segments_are_padded_to_a_four_byte_boundary() {
+        // "mint" is 4 bytes (no padding); "approve" is 7 and must be padded to 8.
+        let patterns = parse_topic_filters("mint,approve").unwrap();
+
+        let mint = STANDARD.decode(&patterns[0][0]).expect("valid base64");
+        assert_eq!(&mint[4..8], &[0, 0, 0, 4], "symbol length");
+        assert_eq!(&mint[8..], b"mint", "4-byte body needs no padding");
+
+        let approve = STANDARD.decode(&patterns[1][0]).expect("valid base64");
+        assert_eq!(&approve[4..8], &[0, 0, 0, 7], "length is the unpadded size");
+        assert_eq!(&approve[8..], b"approve\0", "7-byte body padded to 8");
     }
 
     #[test]
