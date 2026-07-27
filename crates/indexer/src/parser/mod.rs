@@ -35,6 +35,7 @@ pub struct ParsedEvent {
     /// matches the token interface layout.
     pub token: Option<TokenEvent>,
     /// `Some` only for NFT mint/transfer events (issue #275).
+    #[allow(dead_code)]
     pub nft: Option<NftEvent>,
 }
 

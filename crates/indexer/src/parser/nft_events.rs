@@ -148,7 +148,8 @@ fn string_data(val: &ScVal, field: &str) -> Result<String, String> {
 mod tests {
     use super::*;
     use stellar_xdr::curr::{
-        AccountId, ContractId, Hash, PublicKey, ScAddress, ScString, ScSymbol, ScVal, Uint256,
+        AccountId, ContractId, Hash, PublicKey, ScAddress, ScString, ScSymbol, ScVal, StringM,
+        Uint256,
     };
 
     fn sym(s: &str) -> ScVal {
@@ -166,7 +167,11 @@ mod tests {
     }
 
     fn sc_string(s: &str) -> ScVal {
-        ScVal::String(ScString::try_from(s.to_string()).unwrap())
+        // ScString wraps StringM<{u32::MAX}>; there is no From<String> impl,
+        // so convert through the underlying byte buffer.
+        ScVal::String(ScString(
+            StringM::try_from(s.as_bytes().to_vec()).unwrap(),
+        ))
     }
 
     #[test]
