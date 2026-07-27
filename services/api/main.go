@@ -218,7 +218,7 @@ func main() {
 	mux.HandleFunc("PATCH /v1/webhooks/{id}/pause", pauseWebhookHandler(webhookDB))
 	mux.HandleFunc("PATCH /v1/webhooks/{id}/resume", resumeWebhookHandler(webhookDB))
 	mux.HandleFunc("GET /v1/webhooks/{id}/deliveries", deliveriesWebhookHandler(webhookDB))
-	mux.HandleFunc("GET /metrics", handlers.MetricsHandler())
+	mux.HandleFunc("GET /metrics", handlers.MetricsHandler(pool, redisClient))
 	mux.HandleFunc("GET /internal/status", handlers.InternalStatus())
 	mux.Handle("/ws", middleware.WSConnectionLimit(ws.Handler(hub)))
 	keyValidator := middleware.Validator(middleware.ParseKeyHashes(os.Getenv("API_KEY_HASHES")))
@@ -239,7 +239,10 @@ func main() {
 	}
 	authDB.Redis = redisClient
 
-	handler := middleware.Chain(mux, middleware.StructuredLogging, middleware.RequestID)
+	// Wrap mux directly (before any middleware rewrites the request via
+	// WithContext) so PrometheusHTTP observes the same *http.Request that
+	// ServeMux annotates with the matched route pattern (r.Pattern).
+	handler := middleware.Chain(middleware.PrometheusHTTP(mux), middleware.StructuredLogging, middleware.RequestID)
 	handler = middleware.TieredRateLimit(rlCfg)(handler)
 	if auditWriter != nil {
 		handler = middleware.AuditMiddleware(auditWriter)(handler)

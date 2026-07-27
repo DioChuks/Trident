@@ -1,5 +1,9 @@
+use std::time::Instant;
+
 use serde::{Deserialize, Serialize};
 use trident_common::TridentError;
+
+use crate::metrics;
 
 /// A single raw event as returned by the Stellar RPC `getEvents` method.
 /// Topics and data are base64-encoded XDR strings; the parser decodes them.
@@ -120,6 +124,13 @@ impl RpcClient {
     /// Fetch the ledger hash for a given sequence number via `getLedgers`.
     /// Returns `None` if the RPC does not know about that ledger yet.
     pub async fn get_ledger(&self, sequence: u64) -> Result<Option<String>, TridentError> {
+        let start = Instant::now();
+        let result = self.get_ledger_inner(sequence).await;
+        metrics::record_rpc_call("getLedgers", start.elapsed().as_secs_f64(), result.is_err());
+        result
+    }
+
+    async fn get_ledger_inner(&self, sequence: u64) -> Result<Option<String>, TridentError> {
         let params = GetLedgersParams {
             start_ledger: sequence,
             pagination: LedgerPagination { limit: 1 },
@@ -168,6 +179,18 @@ impl RpcClient {
     ///
     /// `limit` controls the page size; callers should pass `config.max_events_per_poll`.
     pub async fn get_events(
+        &self,
+        start_ledger: Option<u64>,
+        cursor: Option<String>,
+        limit: u32,
+    ) -> Result<EventsPage, TridentError> {
+        let start = Instant::now();
+        let result = self.get_events_inner(start_ledger, cursor, limit).await;
+        metrics::record_rpc_call("getEvents", start.elapsed().as_secs_f64(), result.is_err());
+        result
+    }
+
+    async fn get_events_inner(
         &self,
         start_ledger: Option<u64>,
         cursor: Option<String>,

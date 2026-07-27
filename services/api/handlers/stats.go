@@ -14,8 +14,10 @@ import (
 	"time"
 
 	"github.com/Depo-dev/trident/services/api/internal/httputil"
+	"github.com/Depo-dev/trident/services/api/middleware"
 	"github.com/Depo-dev/trident/services/api/validation"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -41,21 +43,52 @@ var (
 	metricEventsTotal       atomicGauge
 )
 
-// MetricsHandler exposes the three Prometheus gauges in text format.
-// Mount at GET /metrics (or /v1/metrics).
-func MetricsHandler() http.HandlerFunc {
+// MetricsHandler exposes the Go API's Prometheus metrics in text format:
+// indexer-status gauges (populated as a side effect of GET /v1/stats/indexer;
+// note the trident_api_indexer_* prefix, which avoids colliding with the
+// indexer's own same-named counters/gauges of a different type), HTTP
+// request count/latency (all routes, via middleware.PrometheusHTTP), gRPC
+// client call count/latency, DB connection pool utilisation, and the
+// trident:events Redis Stream length. Mount at GET /metrics.
+func MetricsHandler(pool *pgxpool.Pool, rdb *redis.Client) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-		_, _ = fmt.Fprintf(w,"# HELP trident_indexer_lag_ledgers Number of ledgers the indexer is behind the chain tip.\n")
-		_, _ = fmt.Fprintf(w,"# TYPE trident_indexer_lag_ledgers gauge\n")
-		_, _ = fmt.Fprintf(w,"trident_indexer_lag_ledgers %g\n", metricLagLedgers.Get())
-		_, _ = fmt.Fprintf(w,"# HELP trident_indexer_last_poll_timestamp_seconds Unix timestamp of the last successful indexer poll.\n")
-		_, _ = fmt.Fprintf(w,"# TYPE trident_indexer_last_poll_timestamp_seconds gauge\n")
-		_, _ = fmt.Fprintf(w,"trident_indexer_last_poll_timestamp_seconds %g\n", metricLastPollTimestamp.Get())
-		_, _ = fmt.Fprintf(w,"# HELP trident_indexer_events_total Cumulative events indexed.\n")
-		_, _ = fmt.Fprintf(w,"# TYPE trident_indexer_events_total gauge\n")
-		_, _ = fmt.Fprintf(w,"trident_indexer_events_total %g\n", metricEventsTotal.Get())
+
+		_, _ = fmt.Fprint(w, "# HELP trident_api_indexer_lag_ledgers Number of ledgers the indexer is behind the chain tip, as last observed via GET /v1/stats/indexer.\n")
+		_, _ = fmt.Fprint(w, "# TYPE trident_api_indexer_lag_ledgers gauge\n")
+		_, _ = fmt.Fprintf(w, "trident_api_indexer_lag_ledgers %g\n", metricLagLedgers.Get())
+		_, _ = fmt.Fprint(w, "# HELP trident_api_indexer_last_poll_timestamp_seconds Unix timestamp of the last successful indexer poll, as last observed via GET /v1/stats/indexer.\n")
+		_, _ = fmt.Fprint(w, "# TYPE trident_api_indexer_last_poll_timestamp_seconds gauge\n")
+		_, _ = fmt.Fprintf(w, "trident_api_indexer_last_poll_timestamp_seconds %g\n", metricLastPollTimestamp.Get())
+		_, _ = fmt.Fprint(w, "# HELP trident_api_indexer_events_indexed Cumulative events indexed, as last observed via GET /v1/stats/indexer.\n")
+		_, _ = fmt.Fprint(w, "# TYPE trident_api_indexer_events_indexed gauge\n")
+		_, _ = fmt.Fprintf(w, "trident_api_indexer_events_indexed %g\n", metricEventsTotal.Get())
+
+		middleware.WriteHTTPMetrics(w)
+		middleware.WriteGRPCClientMetrics(w)
+
+		if pool != nil {
+			stat := pool.Stat()
+			writeGauge(w, "trident_api_db_pool_acquired_connections", "Connections currently checked out of the API's Postgres pool.", float64(stat.AcquiredConns()))
+			writeGauge(w, "trident_api_db_pool_idle_connections", "Idle (available) connections in the API's Postgres pool.", float64(stat.IdleConns()))
+			writeGauge(w, "trident_api_db_pool_total_connections", "Total connections (idle + acquired) currently open in the API's Postgres pool.", float64(stat.TotalConns()))
+			writeGauge(w, "trident_api_db_pool_max_connections", "Configured maximum size of the API's Postgres pool.", float64(stat.MaxConns()))
+		}
+
+		if rdb != nil {
+			ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+			defer cancel()
+			if length, err := rdb.XLen(ctx, eventStreamKey).Result(); err == nil {
+				writeGauge(w, "trident_api_redis_stream_length", "Length of the trident:events Redis Stream (indexer -> API consumer backlog).", float64(length))
+			}
+		}
 	}
+}
+
+func writeGauge(w http.ResponseWriter, name, help string, value float64) {
+	_, _ = fmt.Fprintf(w, "# HELP %s %s\n", name, help)
+	_, _ = fmt.Fprintf(w, "# TYPE %s gauge\n", name)
+	_, _ = fmt.Fprintf(w, "%s %g\n", name, value)
 }
 
 // ---------------------------------------------------------------------------
