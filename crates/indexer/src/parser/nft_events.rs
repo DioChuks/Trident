@@ -148,7 +148,7 @@ fn string_data(val: &ScVal, field: &str) -> Result<String, String> {
 mod tests {
     use super::*;
     use stellar_xdr::curr::{
-        AccountId, Hash, ContractId, PublicKey, ScAddress, ScString, ScSymbol, ScVal, Uint256,
+        AccountId, ContractId, Hash, PublicKey, ScAddress, ScString, ScSymbol, ScVal, Uint256,
     };
 
     fn sym(s: &str) -> ScVal {
@@ -171,7 +171,12 @@ mod tests {
 
     #[test]
     fn mint_happy_path() {
-        let topics = vec![sym("mint"), contract_addr(1), account_addr(2), ScVal::U64(42)];
+        let topics = vec![
+            sym("mint"),
+            contract_addr(1),
+            account_addr(2),
+            ScVal::U64(42),
+        ];
         let data = sc_string("ipfs://Qm123");
         let ev = decode_nft_event(&topics, &data).expect("decode");
         assert_eq!(ev.event_type, NftEventType::Mint);
@@ -184,7 +189,12 @@ mod tests {
 
     #[test]
     fn transfer_happy_path() {
-        let topics = vec![sym("transfer"), account_addr(1), account_addr(2), ScVal::U64(7)];
+        let topics = vec![
+            sym("transfer"),
+            account_addr(1),
+            account_addr(2),
+            ScVal::U64(7),
+        ];
         let ev = decode_nft_event(&topics, &ScVal::Void).expect("decode");
         assert_eq!(ev.event_type, NftEventType::Transfer);
         assert!(ev.from.is_some());
@@ -196,7 +206,12 @@ mod tests {
 
     #[test]
     fn u32_token_id_accepted() {
-        let topics = vec![sym("transfer"), account_addr(1), account_addr(2), ScVal::U32(99)];
+        let topics = vec![
+            sym("transfer"),
+            account_addr(1),
+            account_addr(2),
+            ScVal::U32(99),
+        ];
         let ev = decode_nft_event(&topics, &ScVal::Void).expect("decode");
         assert_eq!(ev.token_id, 99);
     }
@@ -215,7 +230,12 @@ mod tests {
 
     #[test]
     fn json_output_contains_all_fields() {
-        let topics = vec![sym("mint"), contract_addr(1), account_addr(2), ScVal::U64(1)];
+        let topics = vec![
+            sym("mint"),
+            contract_addr(1),
+            account_addr(2),
+            ScVal::U64(1),
+        ];
         let out = try_decode_nft_event(&topics, &sc_string("ipfs://abc")).expect("decode");
         assert_eq!(out["event"], "mint");
         assert_eq!(out["token_id"], 1u64);

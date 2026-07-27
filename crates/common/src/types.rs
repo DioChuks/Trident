@@ -33,8 +33,7 @@ impl ContractLiveness {
         live_until_ledger: Option<u32>,
         last_checked_ledger: u32,
     ) -> Self {
-        let ledgers_until_archive =
-            live_until_ledger.map(|l| l as i64 - current_ledger as i64);
+        let ledgers_until_archive = live_until_ledger.map(|l| l as i64 - current_ledger as i64);
         let status = match ledgers_until_archive {
             Some(n) if n > 0 => LivenessStatus::Live,
             _ => LivenessStatus::Archived,
