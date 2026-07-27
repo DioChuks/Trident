@@ -113,6 +113,11 @@ func main() {
 		healthDB = pool
 	}
 
+	var schemaRegistryDB handlers.SchemaRegistryDB
+	if pool != nil {
+		schemaRegistryDB = pool
+	}
+
 	redisURL := os.Getenv("REDIS_URL")
 	if redisURL == "" {
 		redisURL = "redis://localhost:6379"
@@ -196,6 +201,7 @@ func main() {
 	mux.HandleFunc("PATCH /v1/api-keys/{id}", handlers.UpdateAPIKey(apiKeyCfg))
 	mux.HandleFunc("DELETE /v1/api-keys/{id}", handlers.DeleteAPIKey(apiKeyCfg))
 	mux.HandleFunc("GET /v1/stats/indexer", handlers.IndexerStats(healthDB))
+	mux.HandleFunc("GET /v1/contracts/{id}/events/schema", handlers.ContractEventSchemas(schemaRegistryDB))
 	mux.HandleFunc("GET /v1/stats/contracts", handlers.ContractsStats(pool, redisClient))
 	mux.HandleFunc("GET /v1/webhooks", listWebhooksHandler(webhookDB))
 	mux.HandleFunc("POST /v1/webhooks", createWebhookHandler(webhookDB))
