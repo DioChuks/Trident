@@ -40,9 +40,31 @@ var (
 	metricLagLedgers        atomicGauge
 	metricLastPollTimestamp atomicGauge
 	metricEventsTotal       atomicGauge
+
+	// Webhook delivery counters (#241).
+	metricWebhookSuccess    atomic.Int64
+	metricWebhookFailed     atomic.Int64
+	metricWebhookDeadLetter atomic.Int64
+	metricWebhookDurationMs atomic.Int64
+	metricWebhookTotal      atomic.Int64
 )
 
-// MetricsHandler exposes the three Prometheus gauges plus the gRPC client
+// RecordWebhookDelivery updates the webhook delivery counters. Call after
+// every attempted delivery.
+func RecordWebhookDelivery(success bool, deadLetter bool, durationMs int64) {
+	metricWebhookDurationMs.Add(durationMs)
+	metricWebhookTotal.Add(1)
+	switch {
+	case deadLetter:
+		metricWebhookDeadLetter.Add(1)
+	case success:
+		metricWebhookSuccess.Add(1)
+	default:
+		metricWebhookFailed.Add(1)
+	}
+}
+
+// MetricsHandler exposes indexer gauges, webhook counters, and gRPC client
 // counters in text format. Mount at GET /metrics (or /v1/metrics).
 func MetricsHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -57,6 +79,25 @@ func MetricsHandler() http.HandlerFunc {
 		_, _ = fmt.Fprintf(w, "# TYPE trident_indexer_events_total gauge\n")
 		_, _ = fmt.Fprintf(w, "trident_indexer_events_total %g\n", metricEventsTotal.Get())
 		apigrpc.WriteClientMetrics(w)
+
+		// Webhook delivery metrics (#241).
+		_, _ = fmt.Fprintf(w, "# HELP trident_webhook_deliveries_success_total Successful webhook deliveries since startup.\n")
+		_, _ = fmt.Fprintf(w, "# TYPE trident_webhook_deliveries_success_total counter\n")
+		_, _ = fmt.Fprintf(w, "trident_webhook_deliveries_success_total %d\n", metricWebhookSuccess.Load())
+		_, _ = fmt.Fprintf(w, "# HELP trident_webhook_deliveries_failed_total Failed (retryable) webhook deliveries since startup.\n")
+		_, _ = fmt.Fprintf(w, "# TYPE trident_webhook_deliveries_failed_total counter\n")
+		_, _ = fmt.Fprintf(w, "trident_webhook_deliveries_failed_total %d\n", metricWebhookFailed.Load())
+		_, _ = fmt.Fprintf(w, "# HELP trident_webhook_deliveries_dead_lettered_total Webhook deliveries exhausted all retries.\n")
+		_, _ = fmt.Fprintf(w, "# TYPE trident_webhook_deliveries_dead_lettered_total counter\n")
+		_, _ = fmt.Fprintf(w, "trident_webhook_deliveries_dead_lettered_total %d\n", metricWebhookDeadLetter.Load())
+		total := metricWebhookTotal.Load()
+		var meanMs float64
+		if total > 0 {
+			meanMs = float64(metricWebhookDurationMs.Load()) / float64(total)
+		}
+		_, _ = fmt.Fprintf(w, "# HELP trident_webhook_delivery_mean_duration_ms Mean delivery round-trip latency in milliseconds.\n")
+		_, _ = fmt.Fprintf(w, "# TYPE trident_webhook_delivery_mean_duration_ms gauge\n")
+		_, _ = fmt.Fprintf(w, "trident_webhook_delivery_mean_duration_ms %g\n", meanMs)
 	}
 }
 

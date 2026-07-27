@@ -18,6 +18,7 @@ use crate::parser::token_events::TokenEvent;
 /// transaction mode the next transaction may be routed to a different server
 /// connection where that statement does not exist, which makes the query fail.
 /// See docs/deployment.md (issue #87).
+#[allow(dead_code)]
 pub async fn connect_pool(database_url: &str, pool_size: u32) -> Result<PgPool, TridentError> {
     let connect_options = PgConnectOptions::from_str(database_url)
         .map_err(|e| TridentError::config(anyhow::Error::new(e).context("invalid DATABASE_URL")))?
