@@ -22,9 +22,13 @@ type Client struct {
 }
 
 // NewClient creates a new Trident Go Client.
+//
+// Config precedence: an explicit config.APIKey/config.BaseURL always wins;
+// when either is left empty it falls back to the TRIDENT_API_KEY /
+// TRIDENT_BASE_URL environment variables respectively.
 func NewClient(config TridentClientConfig) *Client {
 	return &Client{
-		config: config,
+		config: config.resolve(),
 		client: &http.Client{
 			Timeout: 15 * time.Second,
 		},
@@ -33,6 +37,10 @@ func NewClient(config TridentClientConfig) *Client {
 
 // QueryEvents fetches a page of historical events matching the filter.
 func (c *Client) QueryEvents(ctx context.Context, params QueryEventsParams) (*PaginatedEvents, error) {
+	if err := c.config.requireAPIKey(); err != nil {
+		return nil, err
+	}
+
 	reqURL, err := url.Parse(c.config.BaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid BaseURL: %w", err)
@@ -95,6 +103,10 @@ func (c *Client) QueryEvents(ctx context.Context, params QueryEventsParams) (*Pa
 
 // GetEventByID fetches a single event by its UUID ID.
 func (c *Client) GetEventByID(ctx context.Context, id string) (*SorobanEvent, error) {
+	if err := c.config.requireAPIKey(); err != nil {
+		return nil, err
+	}
+
 	reqURL, err := url.Parse(c.config.BaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid BaseURL: %w", err)
@@ -157,6 +169,9 @@ func (s *Subscription) Unsubscribe() {
 func (c *Client) SubscribeToContract(ctx context.Context, params SubscribeToContractParams) (*Subscription, error) {
 	if params.ContractID == "" {
 		return nil, fmt.Errorf("contractID is required")
+	}
+	if err := c.config.requireAPIKey(); err != nil {
+		return nil, err
 	}
 
 	parsedBase, err := url.Parse(c.config.BaseURL)

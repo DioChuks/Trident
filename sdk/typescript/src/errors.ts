@@ -6,6 +6,7 @@ export type TridentErrorCode =
   | "RATE_LIMITED"
   | "INVALID_ARGUMENT"
   | "TIMEOUT"
+  | "CONFIG"
   | "INTERNAL";
 
 export class TridentError extends Error {
