@@ -169,9 +169,7 @@ mod tests {
     fn sc_string(s: &str) -> ScVal {
         // ScString wraps StringM<{u32::MAX}>; there is no From<String> impl,
         // so convert through the underlying byte buffer.
-        ScVal::String(ScString(
-            StringM::try_from(s.as_bytes().to_vec()).unwrap(),
-        ))
+        ScVal::String(ScString(StringM::try_from(s.as_bytes().to_vec()).unwrap()))
     }
 
     #[test]
