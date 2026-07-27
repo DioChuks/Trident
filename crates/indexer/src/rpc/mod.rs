@@ -114,6 +114,25 @@ struct GetEventsResult {
     latest_ledger: u64,
 }
 
+#[derive(Serialize)]
+struct GetTransactionParams<'a> {
+    hash: &'a str,
+}
+
+/// Result of the Soroban RPC `getTransaction` call (issue #266).
+///
+/// `envelope_xdr` / `result_xdr` are only present when `status` is not
+/// `"NOT_FOUND"`. Decoding them is owned by
+/// `crate::parser::invocation_metrics`, not this transport layer.
+#[derive(Debug, Deserialize)]
+pub struct GetTransactionResult {
+    pub status: String,
+    #[serde(rename = "envelopeXdr")]
+    pub envelope_xdr: Option<String>,
+    #[serde(rename = "resultXdr")]
+    pub result_xdr: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // RPC client
 // ---------------------------------------------------------------------------
@@ -370,6 +389,16 @@ impl RpcClient {
             events: result.events,
             latest_ledger: result.latest_ledger,
         })
+    }
+
+    /// Fetch a single transaction's envelope + result XDR via `getTransaction`
+    /// (issue #266). Used to derive per-invocation fee and declared resource
+    /// metering for tracked contracts — see
+    /// `crate::parser::invocation_metrics`.
+    pub async fn get_transaction(&self, hash: &str) -> Result<GetTransactionResult, TridentError> {
+        let params = GetTransactionParams { hash };
+        self.call("getTransaction", 3, params, "getTransaction")
+            .await
     }
 }
 

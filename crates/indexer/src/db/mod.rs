@@ -62,11 +62,26 @@ pub struct TokenProjection<'a> {
     pub token: &'a TokenEvent,
 }
 
+/// One (contract, transaction) invocation metrics row, ready to persist into
+/// `contract_invocation_metrics` (issue #266).
+pub struct InvocationMetricRow<'a> {
+    pub contract_id: &'a str,
+    pub transaction_hash: &'a str,
+    pub ledger_sequence: u64,
+    /// ISO 8601 UTC timestamp of the ledger close.
+    pub ledger_timestamp: &'a str,
+    pub metrics: &'a crate::parser::invocation_metrics::InvocationMetrics,
+}
+
 pub struct PageCommit<'a> {
     pub events: &'a [SorobanEvent],
     /// Normalised token-event rows for this page. Every referenced event must
     /// also appear in `events` — the projection is foreign-keyed to it.
     pub token_events: &'a [TokenProjection<'a>],
+    /// Per-invocation fee + declared-resource metering for tracked contracts
+    /// in this page (issue #266). Empty in index-all mode — metering is
+    /// bounded to the allowlist.
+    pub invocation_metrics: &'a [InvocationMetricRow<'a>],
     /// New cursor value, when the page advanced it.
     pub cursor: Option<u64>,
     /// Ledger metadata row, written only when the cursor advanced.
@@ -277,6 +292,82 @@ where
     Ok(())
 }
 
+/// Insert a batch of per-invocation fee/resource metering rows into
+/// `contract_invocation_metrics` (issue #266).
+///
+/// Keyed by `(contract_id, transaction_hash)`; a replayed page inserts
+/// nothing new via `ON CONFLICT DO NOTHING`, matching the idempotency of the
+/// other page-scoped inserts.
+pub async fn insert_invocation_metrics_batch<'e, E>(
+    executor: E,
+    rows: &[InvocationMetricRow<'_>],
+) -> Result<(), TridentError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let mut contract_ids = Vec::with_capacity(rows.len());
+    let mut transaction_hashes = Vec::with_capacity(rows.len());
+    let mut ledger_sequences = Vec::with_capacity(rows.len());
+    let mut ledger_timestamps = Vec::with_capacity(rows.len());
+    let mut fee_charged = Vec::with_capacity(rows.len());
+    let mut resource_fee = Vec::with_capacity(rows.len());
+    let mut cpu_instructions = Vec::with_capacity(rows.len());
+    let mut read_bytes = Vec::with_capacity(rows.len());
+    let mut write_bytes = Vec::with_capacity(rows.len());
+    let mut provenance = Vec::with_capacity(rows.len());
+
+    for row in rows {
+        let ledger_ts: DateTime<Utc> = row.ledger_timestamp.parse().map_err(|e| {
+            TridentError::storage(anyhow::Error::new(e).context("ledger timestamp parse"))
+        })?;
+
+        contract_ids.push(row.contract_id.to_string());
+        transaction_hashes.push(row.transaction_hash.to_string());
+        ledger_sequences.push(row.ledger_sequence as i64);
+        ledger_timestamps.push(ledger_ts);
+        fee_charged.push(row.metrics.fee_charged);
+        resource_fee.push(row.metrics.resource_fee);
+        cpu_instructions.push(row.metrics.cpu_instructions);
+        read_bytes.push(row.metrics.read_bytes);
+        write_bytes.push(row.metrics.write_bytes);
+        provenance.push(row.metrics.provenance.to_string());
+    }
+
+    sqlx::query(
+        r#"
+        INSERT INTO contract_invocation_metrics
+            (contract_id, transaction_hash, ledger_sequence, ledger_timestamp,
+             fee_charged, resource_fee, cpu_instructions, read_bytes, write_bytes, provenance)
+        SELECT * FROM UNNEST(
+            $1::text[], $2::text[], $3::bigint[], $4::timestamptz[],
+            $5::bigint[], $6::bigint[], $7::bigint[], $8::bigint[], $9::bigint[], $10::text[]
+        )
+        ON CONFLICT (contract_id, transaction_hash) DO NOTHING
+        "#,
+    )
+    .bind(&contract_ids)
+    .bind(&transaction_hashes)
+    .bind(&ledger_sequences)
+    .bind(&ledger_timestamps)
+    .bind(&fee_charged)
+    .bind(&resource_fee)
+    .bind(&cpu_instructions)
+    .bind(&read_bytes)
+    .bind(&write_bytes)
+    .bind(&provenance)
+    .execute(executor)
+    .await
+    .map_err(|e| {
+        TridentError::storage(anyhow::Error::new(e).context("insert_invocation_metrics_batch"))
+    })?;
+
+    Ok(())
+}
+
 /// Insert the outbox rows for a batch of events in a single statement (#200).
 ///
 /// Mirrors [`insert_events_batch`]: same deterministic ids, same idempotency.
@@ -348,6 +439,12 @@ pub async fn commit_page(pool: &PgPool, commit: PageCommit<'_>) -> Result<(), Tr
     // the event insert inside the same transaction.
     for chunk in commit.token_events.chunks(batch_size) {
         insert_token_events_batch(&mut *tx, chunk).await?;
+    }
+
+    // Invocation metrics ride the same transaction as the page they were
+    // derived from (issue #266), same idempotency contract as the rest.
+    for chunk in commit.invocation_metrics.chunks(batch_size) {
+        insert_invocation_metrics_batch(&mut *tx, chunk).await?;
     }
 
     if let Some(cursor) = commit.cursor {
@@ -648,6 +745,7 @@ mod tests {
             PageCommit {
                 events,
                 token_events: &[],
+                invocation_metrics: &[],
                 cursor: Some(900),
                 ledger: Some(LedgerMeta {
                     sequence: 900,
