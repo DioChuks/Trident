@@ -26,7 +26,8 @@
 --   4. Atomically rename: legacy → soroban_events_legacy, shadow → soroban_events.
 --   5. Recreate all indexes on the partitioned parent.
 --   6. Drop old FK on webhook_deliveries; add index on event_id.
---   7. Drop soroban_events_legacy.
+--   7. Drop old FK on token_events (same trade-off as webhook_deliveries).
+--   8. Drop soroban_events_legacy.
 --
 -- Reversible: to roll back before step 7, rename tables back and drop the
 --   partitioned table. The legacy table survives until explicitly dropped.
@@ -141,7 +142,16 @@ ALTER TABLE webhook_deliveries
 CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_event_id
     ON webhook_deliveries (event_id);
 
--- 7. Drop legacy table --------------------------------------------------------
+-- 7. Update token_events --------------------------------------------------------
+-- Same trade-off as webhook_deliveries above: a single-column UNIQUE (id)
+-- cannot be enforced globally on a partitioned table, so this FK is also
+-- converted to a logical reference. event_id remains token_events' own
+-- PRIMARY KEY, so no additional index is needed for lookups — only the FK
+-- constraint (which still blocks dropping soroban_events_legacy below) goes.
+ALTER TABLE token_events
+    DROP CONSTRAINT IF EXISTS token_events_event_id_fkey;
+
+-- 8. Drop legacy table --------------------------------------------------------
 DROP TABLE soroban_events_legacy;
 
 COMMIT;

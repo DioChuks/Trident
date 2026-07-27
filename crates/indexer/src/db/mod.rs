@@ -436,8 +436,12 @@ pub async fn commit_page(pool: &PgPool, commit: PageCommit<'_>) -> Result<(), Tr
         insert_outbox_batch(&mut *tx, chunk).await?;
     }
 
-    // Projection rows are foreign-keyed to soroban_events, so they must follow
-    // the event insert inside the same transaction.
+    // token_events.event_id logically references soroban_events(id) (the DB-level
+    // FK was dropped in migration 0013 — soroban_events is partitioned, so a
+    // single-column UNIQUE (id) can't be enforced globally). Referential
+    // integrity is instead upheld here: projection rows must follow the event
+    // insert inside the same transaction, so a token_events row can never exist
+    // without its corresponding soroban_events row already committed.
     for chunk in commit.token_events.chunks(batch_size) {
         insert_token_events_batch(&mut *tx, chunk).await?;
     }
