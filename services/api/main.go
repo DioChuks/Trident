@@ -231,6 +231,7 @@ func main() {
 		handler = middleware.AuditMiddleware(auditWriter)(handler)
 	}
 	handler = middleware.NewDBAuth(authDB)(handler)
+	handler = middleware.NewCompression()(handler)
 	handler = middleware.NewCORSFromEnv()(middleware.NewTimeoutFromEnv()(handler))
 	// RequestID + StructuredLogging are outermost so every response — including
 	// auth and rate-limit rejections — is assigned a request id, echoes it on
