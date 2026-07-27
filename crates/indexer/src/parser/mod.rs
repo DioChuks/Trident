@@ -21,7 +21,19 @@ use trident_common::{EventType, SorobanEvent, TridentError};
 
 use crate::rpc::RawEvent;
 
+pub mod invocation_metrics;
 pub mod token_events;
+
+use token_events::TokenEvent;
+
+/// A normalised event together with its optional typed token projection
+/// (issue #211).
+pub struct ParsedEvent {
+    pub event: SorobanEvent,
+    /// `Some` only for standard SEP-41 / SAC value-movement events whose payload
+    /// matches the token interface layout.
+    pub token: Option<TokenEvent>,
+}
 
 pub struct Parser {
     pub index_diagnostic: bool,
@@ -32,11 +44,16 @@ impl Parser {
         Self { index_diagnostic }
     }
 
-    /// Decode a raw RPC event into a normalised `SorobanEvent`.
+    /// Decode a raw RPC event into a normalised `SorobanEvent` plus, when the
+    /// payload matches the standard token interface, a typed token projection
+    /// (issue #211).
     ///
-    /// Returns `None` if the event type is `diagnostic` and `index_diagnostic`
-    /// is false — the caller should silently skip `None` returns.
-    pub fn parse_event(&self, raw: &RawEvent) -> Result<Option<SorobanEvent>, TridentError> {
+    /// The topic and body `ScVal`s are decoded once and reused for both outputs,
+    /// so the projection costs no extra XDR work.
+    pub fn parse_event_with_projection(
+        &self,
+        raw: &RawEvent,
+    ) -> Result<Option<ParsedEvent>, TridentError> {
         let event_type = parse_event_type(&raw.event_type)?;
 
         if event_type == EventType::Diagnostic && !self.index_diagnostic {
@@ -50,17 +67,21 @@ impl Parser {
 
         let contract_id = raw.contract_id.clone().unwrap_or_default();
 
-        let topics: Vec<String> = raw
+        let topic_vals: Vec<ScVal> = raw
             .topic
             .iter()
-            .map(|xdr| decode_scval(xdr).map(|v| scval_to_string(&v)))
+            .map(|xdr| decode_scval(xdr))
             .collect::<Result<_, _>>()?;
+        let topics: Vec<String> = topic_vals.iter().map(scval_to_string).collect();
 
-        let data = if raw.value.is_empty() {
-            Json::Null
+        let (data, data_val) = if raw.value.is_empty() {
+            (Json::Null, ScVal::Void)
         } else {
-            decode_scval(&raw.value).map(|v| scval_to_json(&v))?
+            let val = decode_scval(&raw.value)?;
+            (scval_to_json(&val), val)
         };
+
+        let token = token_events::decode_token_event(&topic_vals, &data_val);
 
         let ledger_sequence: u64 = raw
             .ledger
@@ -75,15 +96,18 @@ impl Parser {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
 
-        Ok(Some(SorobanEvent {
-            contract_id,
-            topics,
-            data,
-            ledger_sequence,
-            ledger_timestamp: raw.ledger_closed_at.clone(),
-            transaction_hash: raw.tx_hash.clone(),
-            event_index,
-            event_type,
+        Ok(Some(ParsedEvent {
+            event: SorobanEvent {
+                contract_id,
+                topics,
+                data,
+                ledger_sequence,
+                ledger_timestamp: raw.ledger_closed_at.clone(),
+                transaction_hash: raw.tx_hash.clone(),
+                event_index,
+                event_type,
+            },
+            token,
         }))
     }
 }
@@ -271,7 +295,11 @@ mod tests {
         );
 
         let parser = Parser::new(false);
-        let event = parser.parse_event(&raw).unwrap().unwrap();
+        let event = parser
+            .parse_event_with_projection(&raw)
+            .unwrap()
+            .unwrap()
+            .event;
 
         assert_eq!(event.contract_id, contract_id);
         assert_eq!(event.topics[0], "transfer");
@@ -296,10 +324,60 @@ mod tests {
         );
 
         let parser = Parser::new(false);
-        let event = parser.parse_event(&raw).unwrap().unwrap();
+        let event = parser
+            .parse_event_with_projection(&raw)
+            .unwrap()
+            .unwrap()
+            .event;
 
         assert_eq!(event.topics[0], "mint");
         assert_eq!(event.data, serde_json::json!(5_000u64));
+    }
+
+    #[test]
+    fn transfer_event_yields_a_token_projection() {
+        let from = ScVal::Address(ScAddress::Account(AccountId(
+            PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32])),
+        )));
+        let to = ScVal::Address(ScAddress::Account(AccountId(
+            PublicKey::PublicKeyTypeEd25519(Uint256([2u8; 32])),
+        )));
+        let amount = ScVal::I128(Int128Parts { hi: 0, lo: 7_500 });
+
+        let raw = make_event(
+            "contract",
+            Some("CTOKEN"),
+            vec![sym("transfer"), from, to],
+            amount,
+            true,
+        );
+
+        let parsed = Parser::new(false)
+            .parse_event_with_projection(&raw)
+            .unwrap()
+            .unwrap();
+        let token = parsed.token.expect("transfer must produce a projection");
+        assert_eq!(token.amount.as_deref(), Some("7500"));
+        assert_eq!(parsed.event.contract_id, "CTOKEN");
+    }
+
+    #[test]
+    fn non_token_event_yields_no_projection() {
+        let raw = make_event(
+            "contract",
+            Some("CAPP"),
+            vec![sym("swap")],
+            ScVal::Void,
+            true,
+        );
+        let parsed = Parser::new(false)
+            .parse_event_with_projection(&raw)
+            .unwrap()
+            .unwrap();
+        assert!(
+            parsed.token.is_none(),
+            "a non-token event must not be projected"
+        );
     }
 
     #[test]
@@ -318,7 +396,11 @@ mod tests {
         let raw = make_event("contract", None, vec![sym("custom")], map_val, true);
 
         let parser = Parser::new(false);
-        let event = parser.parse_event(&raw).unwrap().unwrap();
+        let event = parser
+            .parse_event_with_projection(&raw)
+            .unwrap()
+            .unwrap()
+            .event;
 
         let obj = event
             .data
@@ -333,7 +415,7 @@ mod tests {
         let raw = make_event("diagnostic", None, vec![sym("debug")], ScVal::Void, true);
         let parser = Parser::new(false);
         assert!(
-            parser.parse_event(&raw).unwrap().is_none(),
+            parser.parse_event_with_projection(&raw).unwrap().is_none(),
             "diagnostic events must be skipped when index_diagnostic=false"
         );
     }
@@ -343,7 +425,7 @@ mod tests {
         let raw = make_event("diagnostic", None, vec![sym("debug")], ScVal::Void, true);
         let parser = Parser::new(true);
         assert!(
-            parser.parse_event(&raw).unwrap().is_some(),
+            parser.parse_event_with_projection(&raw).unwrap().is_some(),
             "diagnostic events must be indexed when index_diagnostic=true"
         );
     }
@@ -353,7 +435,7 @@ mod tests {
         let raw = make_event("contract", None, vec![sym("transfer")], ScVal::Void, false);
         let parser = Parser::new(false);
         assert!(
-            parser.parse_event(&raw).unwrap().is_none(),
+            parser.parse_event_with_projection(&raw).unwrap().is_none(),
             "events from failed contract calls must be filtered out"
         );
     }
@@ -371,7 +453,11 @@ mod tests {
         );
 
         let parser = Parser::new(false);
-        let event = parser.parse_event(&raw).unwrap().unwrap();
+        let event = parser
+            .parse_event_with_projection(&raw)
+            .unwrap()
+            .unwrap()
+            .event;
 
         assert!(
             event.topics[1].starts_with('C'),

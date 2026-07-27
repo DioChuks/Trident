@@ -18,6 +18,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Depo-dev/trident/services/api/internal/httputil"
+	"github.com/Depo-dev/trident/services/api/validation"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/redis/go-redis/v9"
 )
@@ -45,10 +47,10 @@ type webhookEvent struct {
 }
 
 type webhookPayload struct {
-	ID          string        `json:"id"`
-	WebhookID   string        `json:"webhook_id"`
-	Event       webhookEvent  `json:"event"`
-	DeliveredAt string        `json:"delivered_at"`
+	ID          string       `json:"id"`
+	WebhookID   string       `json:"webhook_id"`
+	Event       webhookEvent `json:"event"`
+	DeliveredAt string       `json:"delivered_at"`
 }
 
 type webhookDelivery struct {
@@ -80,10 +82,10 @@ func resolveAPIKeyID(ctx context.Context, db *sql.DB, r *http.Request) (string, 
 }
 
 type webhookDeliveryResult struct {
-	Success     bool
-	StatusCode  int
+	Success      bool
+	StatusCode   int
 	ResponseBody string
-	Err         error
+	Err          error
 }
 
 func signWebhookBody(body string, secret string) string {
@@ -337,9 +339,9 @@ func performWebhookDelivery(ctx context.Context, sub webhookSubscription, event 
 
 func buildWebhookPayload(subscriptionID string, event webhookEvent) ([]byte, error) {
 	payload := webhookPayload{
-		ID:        fmt.Sprintf("wh_%d", time.Now().UnixNano()),
-		WebhookID: subscriptionID,
-		Event:     event,
+		ID:          fmt.Sprintf("wh_%d", time.Now().UnixNano()),
+		WebhookID:   subscriptionID,
+		Event:       event,
 		DeliveredAt: time.Now().UTC().Format(time.RFC3339),
 	}
 	return json.Marshal(payload)
@@ -461,12 +463,12 @@ func createWebhookHandler(db *sql.DB) http.HandlerFunc {
 func deleteWebhookHandler(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("id")
-		if id == "" {
-			http.Error(w, "missing webhook id", http.StatusBadRequest)
+		if verr := validation.ValidateUUID("id", id); verr != nil {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
 			return
 		}
 		if db == nil {
-			http.Error(w, "database unavailable", http.StatusServiceUnavailable)
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "database unavailable")
 			return
 		}
 		result, err := db.ExecContext(r.Context(), `DELETE FROM webhook_subscriptions WHERE id = $1`, id)
@@ -486,12 +488,12 @@ func deleteWebhookHandler(db *sql.DB) http.HandlerFunc {
 func pauseWebhookHandler(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("id")
-		if id == "" {
-			http.Error(w, "missing webhook id", http.StatusBadRequest)
+		if verr := validation.ValidateUUID("id", id); verr != nil {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
 			return
 		}
 		if db == nil {
-			http.Error(w, "database unavailable", http.StatusServiceUnavailable)
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "database unavailable")
 			return
 		}
 		if _, err := db.ExecContext(r.Context(), `UPDATE webhook_subscriptions SET paused_at = NOW() WHERE id = $1`, id); err != nil {
@@ -505,12 +507,12 @@ func pauseWebhookHandler(db *sql.DB) http.HandlerFunc {
 func resumeWebhookHandler(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("id")
-		if id == "" {
-			http.Error(w, "missing webhook id", http.StatusBadRequest)
+		if verr := validation.ValidateUUID("id", id); verr != nil {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
 			return
 		}
 		if db == nil {
-			http.Error(w, "database unavailable", http.StatusServiceUnavailable)
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "database unavailable")
 			return
 		}
 		if _, err := db.ExecContext(r.Context(), `UPDATE webhook_subscriptions SET paused_at = NULL WHERE id = $1`, id); err != nil {
@@ -524,12 +526,12 @@ func resumeWebhookHandler(db *sql.DB) http.HandlerFunc {
 func deliveriesWebhookHandler(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("id")
-		if id == "" {
-			http.Error(w, "missing webhook id", http.StatusBadRequest)
+		if verr := validation.ValidateUUID("id", id); verr != nil {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
 			return
 		}
 		if db == nil {
-			http.Error(w, "database unavailable", http.StatusServiceUnavailable)
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "database unavailable")
 			return
 		}
 		rows, err := db.QueryContext(r.Context(), `

@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	apigrpc "github.com/Depo-dev/trident/services/api/grpc"
 	"github.com/Depo-dev/trident/services/api/internal/httputil"
 	"github.com/Depo-dev/trident/services/api/validation"
 	"github.com/jackc/pgx/v5"
@@ -41,8 +42,8 @@ var (
 	metricEventsTotal       atomicGauge
 )
 
-// MetricsHandler exposes the three Prometheus gauges in text format.
-// Mount at GET /metrics (or /v1/metrics).
+// MetricsHandler exposes the three Prometheus gauges plus the gRPC client
+// counters in text format. Mount at GET /metrics (or /v1/metrics).
 func MetricsHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
@@ -55,6 +56,7 @@ func MetricsHandler() http.HandlerFunc {
 		_, _ = fmt.Fprintf(w, "# HELP trident_indexer_events_total Cumulative events indexed.\n")
 		_, _ = fmt.Fprintf(w, "# TYPE trident_indexer_events_total gauge\n")
 		_, _ = fmt.Fprintf(w, "trident_indexer_events_total %g\n", metricEventsTotal.Get())
+		apigrpc.WriteClientMetrics(w)
 	}
 }
 
@@ -276,6 +278,17 @@ type ContractStats struct {
 	EventCount     int64  `json:"event_count"`
 	LastSeenLedger int64  `json:"last_seen_ledger"`
 	LastSeenAt     string `json:"last_seen_at"`
+
+	// Per-invocation fee + declared-resource metering (issue #266), sourced
+	// from contract_invocation_metrics. Null when the contract has no metered
+	// invocations in range — either it isn't on the tracked-contract
+	// allowlist, or it has not yet been invoked since metering was added.
+	InvocationCount    *int64   `json:"invocation_count"`
+	TotalFeeCharged    *int64   `json:"total_fee_charged"`
+	AvgFeeCharged      *float64 `json:"avg_fee_charged"`
+	AvgCpuInstructions *float64 `json:"avg_cpu_instructions"`
+	AvgReadBytes       *float64 `json:"avg_read_bytes"`
+	AvgWriteBytes      *float64 `json:"avg_write_bytes"`
 }
 
 // ContractsStatsResponse is the JSON response for GET /v1/stats/contracts
@@ -307,6 +320,12 @@ func ContractsStats(db DBPool, rdb *redis.Client) http.HandlerFunc {
 		}
 
 		q := r.URL.Query()
+		if verr := validation.RejectUnknownParams(
+			q, "from_ledger", "to_ledger", "network", "limit",
+		); verr != nil {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
+			return
+		}
 
 		// Validate and parse query parameters
 		params, verr := validation.ValidateQueryStats(
@@ -386,19 +405,49 @@ func ContractsStats(db DBPool, rdb *redis.Client) http.HandlerFunc {
 
 // queryContractStats executes the aggregation query against the database.
 // Requires compound index (contract_id, ledger_sequence DESC) from #61.
+//
+// Invocation fee/resource metering (issue #266) is joined in from
+// contract_invocation_metrics via a pre-aggregated subquery rather than a
+// row-level join against soroban_events: the two tables share no per-row key
+// (metering is one row per transaction, events are one row per emitted
+// event), so the join key is contract_id + the same ledger range.
 func queryContractStats(ctx context.Context, db DBPool, params *validation.QueryStatsParams) ([]*ContractStats, error) {
 	query := `
 	SELECT
-		contract_id,
+		e.contract_id,
 		COUNT(*) AS event_count,
-		MAX(ledger_sequence) AS last_seen_ledger,
-		MAX(ledger_timestamp) AS last_seen_at
-	FROM soroban_events
+		MAX(e.ledger_sequence) AS last_seen_ledger,
+		MAX(e.ledger_timestamp) AS last_seen_at,
+		m.invocation_count,
+		m.total_fee_charged,
+		m.avg_fee_charged,
+		m.avg_cpu_instructions,
+		m.avg_read_bytes,
+		m.avg_write_bytes
+	FROM soroban_events e
+	LEFT JOIN (
+		SELECT
+			contract_id,
+			COUNT(*) AS invocation_count,
+			SUM(fee_charged) AS total_fee_charged,
+			AVG(fee_charged) AS avg_fee_charged,
+			AVG(cpu_instructions) AS avg_cpu_instructions,
+			AVG(read_bytes) AS avg_read_bytes,
+			AVG(write_bytes) AS avg_write_bytes
+		FROM contract_invocation_metrics
+		WHERE
+			network = $1
+			AND ($2::BIGINT IS NULL OR ledger_sequence >= $2)
+			AND ($3::BIGINT IS NULL OR ledger_sequence <= $3)
+		GROUP BY contract_id
+	) m ON m.contract_id = e.contract_id
 	WHERE
-		network = $1
-		AND ($2::BIGINT IS NULL OR ledger_sequence >= $2)
-		AND ($3::BIGINT IS NULL OR ledger_sequence <= $3)
-	GROUP BY contract_id
+		e.network = $1
+		AND ($2::BIGINT IS NULL OR e.ledger_sequence >= $2)
+		AND ($3::BIGINT IS NULL OR e.ledger_sequence <= $3)
+	GROUP BY
+		e.contract_id, m.invocation_count, m.total_fee_charged,
+		m.avg_fee_charged, m.avg_cpu_instructions, m.avg_read_bytes, m.avg_write_bytes
 	ORDER BY event_count DESC
 	LIMIT $4
 	`
@@ -419,6 +468,12 @@ func queryContractStats(ctx context.Context, db DBPool, params *validation.Query
 			&cs.EventCount,
 			&cs.LastSeenLedger,
 			&lastSeenAt,
+			&cs.InvocationCount,
+			&cs.TotalFeeCharged,
+			&cs.AvgFeeCharged,
+			&cs.AvgCpuInstructions,
+			&cs.AvgReadBytes,
+			&cs.AvgWriteBytes,
 		)
 		if err != nil {
 			return nil, err

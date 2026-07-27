@@ -35,6 +35,10 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.global.existingSecret }}
                   key: REDIS_URL
+            {{- range $k, $v := .Values.grpcApi.env }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
           livenessProbe:
             {{- toYaml .Values.grpcApi.livenessProbe | nindent 12 }}
           readinessProbe:

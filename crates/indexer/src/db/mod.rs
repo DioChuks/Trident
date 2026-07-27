@@ -8,6 +8,8 @@ use sqlx::PgPool;
 use trident_common::{EventType, SorobanEvent, TridentError};
 use uuid::Uuid;
 
+use crate::parser::token_events::TokenEvent;
+
 /// Build a bounded Postgres connection pool sized for this service.
 ///
 /// `statement_cache_capacity(0)` disables sqlx's named-prepared-statement cache.
@@ -40,43 +42,447 @@ fn event_uuid(contract_id: &str, ledger_sequence: u64, event_index: u32) -> Uuid
     Uuid::new_v5(&EVENT_NS, key.as_bytes())
 }
 
-/// Insert a normalised event. Silently ignores duplicates via `ON CONFLICT (id) DO NOTHING`.
-/// The `id` is a deterministic UUIDv5 derived from `(contract_id, ledger_sequence, event_index)`,
-/// so replaying the same event always produces the same primary key.
-pub async fn insert_event(pool: &PgPool, event: &SorobanEvent) -> Result<(), TridentError> {
-    let id = event_uuid(&event.contract_id, event.ledger_sequence, event.event_index);
-    let event_type = match event.event_type {
+pub mod outbox;
+
+/// Ledger provenance recorded alongside a committed page.
+pub struct LedgerMeta<'a> {
+    pub sequence: u64,
+    pub hash: &'a str,
+    pub timestamp: &'a str,
+    pub event_count: i32,
+}
+
+/// Everything one RPC page contributes to the database, committed atomically.
+///
+/// Bundling the events with the cursor advance is what stops a crash between
+/// the two from leaving the cursor ahead of the data it claims to cover.
+/// A decoded token event paired with the indexed event it projects (issue #211).
+pub struct TokenProjection<'a> {
+    pub event: &'a SorobanEvent,
+    pub token: &'a TokenEvent,
+}
+
+/// One (contract, transaction) invocation metrics row, ready to persist into
+/// `contract_invocation_metrics` (issue #266).
+pub struct InvocationMetricRow<'a> {
+    pub contract_id: &'a str,
+    pub transaction_hash: &'a str,
+    pub ledger_sequence: u64,
+    /// ISO 8601 UTC timestamp of the ledger close.
+    pub ledger_timestamp: &'a str,
+    pub metrics: &'a crate::parser::invocation_metrics::InvocationMetrics,
+}
+
+pub struct PageCommit<'a> {
+    pub events: &'a [SorobanEvent],
+    /// Normalised token-event rows for this page. Every referenced event must
+    /// also appear in `events` — the projection is foreign-keyed to it.
+    pub token_events: &'a [TokenProjection<'a>],
+    /// Per-invocation fee + declared-resource metering for tracked contracts
+    /// in this page (issue #266). Empty in index-all mode — metering is
+    /// bounded to the allowlist.
+    pub invocation_metrics: &'a [InvocationMetricRow<'a>],
+    /// New cursor value, when the page advanced it.
+    pub cursor: Option<u64>,
+    /// Ledger metadata row, written only when the cursor advanced.
+    pub ledger: Option<LedgerMeta<'a>>,
+    /// Maximum rows per INSERT statement, bounding statement size and memory.
+    pub batch_size: usize,
+}
+
+/// Columns of a batch of events, transposed into the parallel arrays that the
+/// `UNNEST` insert binds. Building this once avoids re-deriving per row.
+struct EventColumns {
+    ids: Vec<Uuid>,
+    contract_ids: Vec<String>,
+    ledger_sequences: Vec<i64>,
+    ledger_timestamps: Vec<DateTime<Utc>>,
+    transaction_hashes: Vec<String>,
+    event_indexes: Vec<i32>,
+    event_types: Vec<String>,
+    topics: Vec<serde_json::Value>,
+    data: Vec<serde_json::Value>,
+}
+
+fn event_type_str(event_type: &EventType) -> &'static str {
+    match event_type {
         EventType::Contract => "contract",
         EventType::System => "system",
         EventType::Diagnostic => "diagnostic",
-    };
-    let topics = serde_json::to_value(&event.topics)
-        .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("topics serialise")))?;
-    let ledger_ts: DateTime<Utc> = event.ledger_timestamp.parse().map_err(|e| {
-        TridentError::storage(anyhow::Error::new(e).context("ledger timestamp parse"))
-    })?;
+    }
+}
+
+impl EventColumns {
+    fn build(events: &[SorobanEvent]) -> Result<Self, TridentError> {
+        let mut cols = EventColumns {
+            ids: Vec::with_capacity(events.len()),
+            contract_ids: Vec::with_capacity(events.len()),
+            ledger_sequences: Vec::with_capacity(events.len()),
+            ledger_timestamps: Vec::with_capacity(events.len()),
+            transaction_hashes: Vec::with_capacity(events.len()),
+            event_indexes: Vec::with_capacity(events.len()),
+            event_types: Vec::with_capacity(events.len()),
+            topics: Vec::with_capacity(events.len()),
+            data: Vec::with_capacity(events.len()),
+        };
+
+        for event in events {
+            let ledger_ts: DateTime<Utc> = event.ledger_timestamp.parse().map_err(|e| {
+                TridentError::storage(anyhow::Error::new(e).context("ledger timestamp parse"))
+            })?;
+            let topics = serde_json::to_value(&event.topics).map_err(|e| {
+                TridentError::storage(anyhow::Error::new(e).context("topics serialise"))
+            })?;
+
+            cols.ids.push(event_uuid(
+                &event.contract_id,
+                event.ledger_sequence,
+                event.event_index,
+            ));
+            cols.contract_ids.push(event.contract_id.clone());
+            cols.ledger_sequences.push(event.ledger_sequence as i64);
+            cols.ledger_timestamps.push(ledger_ts);
+            cols.transaction_hashes.push(event.transaction_hash.clone());
+            cols.event_indexes.push(event.event_index as i32);
+            cols.event_types
+                .push(event_type_str(&event.event_type).to_string());
+            cols.topics.push(topics);
+            cols.data.push(event.data.clone());
+        }
+
+        Ok(cols)
+    }
+}
+
+/// Insert a batch of events in a single statement (issue #199).
+///
+/// One round-trip per batch instead of one per row. Duplicate handling is
+/// unchanged: the deterministic UUIDv5 primary key plus `ON CONFLICT (id) DO
+/// NOTHING` means a replayed page inserts nothing new.
+pub async fn insert_events_batch<'e, E>(
+    executor: E,
+    events: &[SorobanEvent],
+) -> Result<(), TridentError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    if events.is_empty() {
+        return Ok(());
+    }
+
+    let cols = EventColumns::build(events)?;
 
     sqlx::query(
         r#"
         INSERT INTO soroban_events
             (id, contract_id, ledger_sequence, ledger_timestamp, transaction_hash,
              event_index, event_type, topics, data)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        SELECT * FROM UNNEST(
+            $1::uuid[], $2::text[], $3::bigint[], $4::timestamptz[], $5::text[],
+            $6::int[], $7::text[], $8::jsonb[], $9::jsonb[]
+        )
         ON CONFLICT (id) DO NOTHING
         "#,
     )
-    .bind(id)
-    .bind(&event.contract_id)
-    .bind(event.ledger_sequence as i64)
-    .bind(ledger_ts)
-    .bind(&event.transaction_hash)
-    .bind(event.event_index as i32)
-    .bind(event_type)
-    .bind(&topics)
-    .bind(&event.data)
-    .execute(pool)
+    .bind(&cols.ids)
+    .bind(&cols.contract_ids)
+    .bind(&cols.ledger_sequences)
+    .bind(&cols.ledger_timestamps)
+    .bind(&cols.transaction_hashes)
+    .bind(&cols.event_indexes)
+    .bind(&cols.event_types)
+    .bind(&cols.topics)
+    .bind(&cols.data)
+    .execute(executor)
     .await
-    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("insert_event")))?;
+    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("insert_events_batch")))?;
+
+    Ok(())
+}
+
+/// Insert a batch of decoded token events into the `token_events` projection
+/// (issue #211).
+///
+/// Keyed by the originating event's UUID, so replaying a page re-projects the
+/// same rows and `ON CONFLICT DO NOTHING` absorbs them.
+pub async fn insert_token_events_batch<'e, E>(
+    executor: E,
+    projections: &[TokenProjection<'_>],
+) -> Result<(), TridentError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    if projections.is_empty() {
+        return Ok(());
+    }
+
+    let mut event_ids = Vec::with_capacity(projections.len());
+    let mut contract_ids = Vec::with_capacity(projections.len());
+    let mut event_types = Vec::with_capacity(projections.len());
+    let mut from_addresses = Vec::with_capacity(projections.len());
+    let mut to_addresses = Vec::with_capacity(projections.len());
+    let mut spender_addresses = Vec::with_capacity(projections.len());
+    let mut admin_addresses = Vec::with_capacity(projections.len());
+    let mut amounts = Vec::with_capacity(projections.len());
+    let mut expiration_ledgers = Vec::with_capacity(projections.len());
+    let mut ledger_sequences = Vec::with_capacity(projections.len());
+    let mut ledger_timestamps = Vec::with_capacity(projections.len());
+    let mut transaction_hashes = Vec::with_capacity(projections.len());
+    let mut event_indexes = Vec::with_capacity(projections.len());
+
+    for projection in projections {
+        let event = projection.event;
+        let token = projection.token;
+        let ledger_ts: DateTime<Utc> = event.ledger_timestamp.parse().map_err(|e| {
+            TridentError::storage(anyhow::Error::new(e).context("ledger timestamp parse"))
+        })?;
+
+        event_ids.push(event_uuid(
+            &event.contract_id,
+            event.ledger_sequence,
+            event.event_index,
+        ));
+        contract_ids.push(event.contract_id.clone());
+        event_types.push(token.event_type.as_str().to_string());
+        from_addresses.push(token.from.clone());
+        to_addresses.push(token.to.clone());
+        spender_addresses.push(token.spender.clone());
+        admin_addresses.push(token.admin.clone());
+        amounts.push(token.amount.clone());
+        expiration_ledgers.push(token.expiration_ledger);
+        ledger_sequences.push(event.ledger_sequence as i64);
+        ledger_timestamps.push(ledger_ts);
+        transaction_hashes.push(event.transaction_hash.clone());
+        event_indexes.push(event.event_index as i32);
+    }
+
+    sqlx::query(
+        r#"
+        INSERT INTO token_events
+            (event_id, contract_id, event_type, from_address, to_address,
+             spender_address, admin_address, amount, expiration_ledger,
+             ledger_sequence, ledger_timestamp, transaction_hash, event_index)
+        SELECT * FROM UNNEST(
+            $1::uuid[], $2::text[], $3::text[], $4::text[], $5::text[],
+            $6::text[], $7::text[], $8::text[], $9::bigint[],
+            $10::bigint[], $11::timestamptz[], $12::text[], $13::int[]
+        )
+        ON CONFLICT (event_id) DO NOTHING
+        "#,
+    )
+    .bind(&event_ids)
+    .bind(&contract_ids)
+    .bind(&event_types)
+    .bind(&from_addresses)
+    .bind(&to_addresses)
+    .bind(&spender_addresses)
+    .bind(&admin_addresses)
+    .bind(&amounts)
+    .bind(&expiration_ledgers)
+    .bind(&ledger_sequences)
+    .bind(&ledger_timestamps)
+    .bind(&transaction_hashes)
+    .bind(&event_indexes)
+    .execute(executor)
+    .await
+    .map_err(|e| {
+        TridentError::storage(anyhow::Error::new(e).context("insert_token_events_batch"))
+    })?;
+
+    Ok(())
+}
+
+/// Insert a batch of per-invocation fee/resource metering rows into
+/// `contract_invocation_metrics` (issue #266).
+///
+/// Keyed by `(contract_id, transaction_hash)`; a replayed page inserts
+/// nothing new via `ON CONFLICT DO NOTHING`, matching the idempotency of the
+/// other page-scoped inserts.
+pub async fn insert_invocation_metrics_batch<'e, E>(
+    executor: E,
+    rows: &[InvocationMetricRow<'_>],
+) -> Result<(), TridentError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let mut contract_ids = Vec::with_capacity(rows.len());
+    let mut transaction_hashes = Vec::with_capacity(rows.len());
+    let mut ledger_sequences = Vec::with_capacity(rows.len());
+    let mut ledger_timestamps = Vec::with_capacity(rows.len());
+    let mut fee_charged = Vec::with_capacity(rows.len());
+    let mut resource_fee = Vec::with_capacity(rows.len());
+    let mut cpu_instructions = Vec::with_capacity(rows.len());
+    let mut read_bytes = Vec::with_capacity(rows.len());
+    let mut write_bytes = Vec::with_capacity(rows.len());
+    let mut provenance = Vec::with_capacity(rows.len());
+
+    for row in rows {
+        let ledger_ts: DateTime<Utc> = row.ledger_timestamp.parse().map_err(|e| {
+            TridentError::storage(anyhow::Error::new(e).context("ledger timestamp parse"))
+        })?;
+
+        contract_ids.push(row.contract_id.to_string());
+        transaction_hashes.push(row.transaction_hash.to_string());
+        ledger_sequences.push(row.ledger_sequence as i64);
+        ledger_timestamps.push(ledger_ts);
+        fee_charged.push(row.metrics.fee_charged);
+        resource_fee.push(row.metrics.resource_fee);
+        cpu_instructions.push(row.metrics.cpu_instructions);
+        read_bytes.push(row.metrics.read_bytes);
+        write_bytes.push(row.metrics.write_bytes);
+        provenance.push(row.metrics.provenance.to_string());
+    }
+
+    sqlx::query(
+        r#"
+        INSERT INTO contract_invocation_metrics
+            (contract_id, transaction_hash, ledger_sequence, ledger_timestamp,
+             fee_charged, resource_fee, cpu_instructions, read_bytes, write_bytes, provenance)
+        SELECT * FROM UNNEST(
+            $1::text[], $2::text[], $3::bigint[], $4::timestamptz[],
+            $5::bigint[], $6::bigint[], $7::bigint[], $8::bigint[], $9::bigint[], $10::text[]
+        )
+        ON CONFLICT (contract_id, transaction_hash) DO NOTHING
+        "#,
+    )
+    .bind(&contract_ids)
+    .bind(&transaction_hashes)
+    .bind(&ledger_sequences)
+    .bind(&ledger_timestamps)
+    .bind(&fee_charged)
+    .bind(&resource_fee)
+    .bind(&cpu_instructions)
+    .bind(&read_bytes)
+    .bind(&write_bytes)
+    .bind(&provenance)
+    .execute(executor)
+    .await
+    .map_err(|e| {
+        TridentError::storage(anyhow::Error::new(e).context("insert_invocation_metrics_batch"))
+    })?;
+
+    Ok(())
+}
+
+/// Insert the outbox rows for a batch of events in a single statement (#200).
+///
+/// Mirrors [`insert_events_batch`]: same deterministic ids, same idempotency.
+/// `ON CONFLICT (event_id) DO NOTHING` means a replayed page does not re-queue
+/// a delivery for an event that already has one.
+pub async fn insert_outbox_batch<'e, E>(
+    executor: E,
+    events: &[SorobanEvent],
+) -> Result<(), TridentError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    if events.is_empty() {
+        return Ok(());
+    }
+
+    let mut ids: Vec<Uuid> = Vec::with_capacity(events.len());
+    let mut payloads: Vec<serde_json::Value> = Vec::with_capacity(events.len());
+    for event in events {
+        ids.push(event_uuid(
+            &event.contract_id,
+            event.ledger_sequence,
+            event.event_index,
+        ));
+        payloads.push(serde_json::to_value(event).map_err(|e| {
+            TridentError::storage(anyhow::Error::new(e).context("outbox payload serialise"))
+        })?);
+    }
+
+    sqlx::query(
+        r#"
+        INSERT INTO event_outbox (event_id, payload)
+        SELECT * FROM UNNEST($1::uuid[], $2::jsonb[])
+        ON CONFLICT (event_id) DO NOTHING
+        "#,
+    )
+    .bind(&ids)
+    .bind(&payloads)
+    .execute(executor)
+    .await
+    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("insert_outbox_batch")))?;
+
+    Ok(())
+}
+
+/// Persist one RPC page — events, outbox rows, cursor, and ledger metadata — in
+/// a single transaction (issues #199, #200).
+///
+/// Events are chunked to `batch_size` so a very large page cannot produce an
+/// unbounded statement, but every chunk shares the one transaction: either the
+/// whole page and its cursor advance land, or none of it does.
+pub async fn commit_page(pool: &PgPool, commit: PageCommit<'_>) -> Result<(), TridentError> {
+    let batch_size = commit.batch_size.max(1);
+
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("commit_page begin")))?;
+
+    for chunk in commit.events.chunks(batch_size) {
+        insert_events_batch(&mut *tx, chunk).await?;
+        // Outbox rows ride the same transaction as the events they deliver
+        // (issue #200): either both land or neither does, so a committed event
+        // can never exist without a delivery record for the relay to pick up.
+        insert_outbox_batch(&mut *tx, chunk).await?;
+    }
+
+    // Projection rows are foreign-keyed to soroban_events, so they must follow
+    // the event insert inside the same transaction.
+    for chunk in commit.token_events.chunks(batch_size) {
+        insert_token_events_batch(&mut *tx, chunk).await?;
+    }
+
+    // Invocation metrics ride the same transaction as the page they were
+    // derived from (issue #266), same idempotency contract as the rest.
+    for chunk in commit.invocation_metrics.chunks(batch_size) {
+        insert_invocation_metrics_batch(&mut *tx, chunk).await?;
+    }
+
+    if let Some(cursor) = commit.cursor {
+        sqlx::query(
+            "UPDATE system_state SET value = $1, updated_at = NOW() WHERE key = 'latest_ledger_cursor'",
+        )
+        .bind(cursor.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("commit_page set_cursor")))?;
+    }
+
+    if let Some(ledger) = commit.ledger {
+        let ts: DateTime<Utc> = ledger.timestamp.parse().map_err(|e| {
+            TridentError::storage(anyhow::Error::new(e).context("ledger timestamp parse"))
+        })?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO ledger_metadata (ledger_sequence, ledger_hash, ledger_timestamp, event_count)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (ledger_sequence) DO NOTHING
+            "#,
+        )
+        .bind(ledger.sequence as i64)
+        .bind(ledger.hash)
+        .bind(ts)
+        .bind(ledger.event_count)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            TridentError::storage(anyhow::Error::new(e).context("commit_page ledger_metadata"))
+        })?;
+    }
+
+    tx.commit()
+        .await
+        .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("commit_page commit")))?;
 
     Ok(())
 }
@@ -92,50 +498,6 @@ pub async fn get_cursor(pool: &PgPool) -> Result<u64, TridentError> {
     row.0
         .parse::<u64>()
         .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("cursor parse")))
-}
-
-/// Persist the latest processed ledger sequence so the streamer can resume
-/// from the correct position after a restart.
-pub async fn set_cursor(pool: &PgPool, ledger: u64) -> Result<(), TridentError> {
-    sqlx::query(
-        "UPDATE system_state SET value = $1, updated_at = NOW() WHERE key = 'latest_ledger_cursor'",
-    )
-    .bind(ledger.to_string())
-    .execute(pool)
-    .await
-    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("set_cursor")))?;
-
-    Ok(())
-}
-
-/// Record a processed ledger in ledger_metadata for gap detection.
-pub async fn insert_ledger_metadata(
-    pool: &PgPool,
-    ledger_sequence: u64,
-    ledger_hash: &str,
-    ledger_timestamp: &str,
-    event_count: i32,
-) -> Result<(), TridentError> {
-    let ts: DateTime<Utc> = ledger_timestamp.parse().map_err(|e| {
-        TridentError::storage(anyhow::Error::new(e).context("ledger timestamp parse"))
-    })?;
-
-    sqlx::query(
-        r#"
-        INSERT INTO ledger_metadata (ledger_sequence, ledger_hash, ledger_timestamp, event_count)
-        VALUES ($1, $2, $3, $4)
-        ON CONFLICT (ledger_sequence) DO NOTHING
-        "#,
-    )
-    .bind(ledger_sequence as i64)
-    .bind(ledger_hash)
-    .bind(ts)
-    .bind(event_count)
-    .execute(pool)
-    .await
-    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("insert_ledger_metadata")))?;
-
-    Ok(())
 }
 
 /// Write indexer health metrics into the `system_state` health columns after
@@ -293,13 +655,13 @@ mod tests {
         assert_ne!(a, b);
     }
 
-    /// Calling `insert_event` twice with the same event must not error and
-    /// the row count in `soroban_events` must remain 1.
+    /// Committing the same event twice must not error and the row count in
+    /// `soroban_events` must remain 1.
     ///
     /// Uses the shared test database (TEST_DATABASE_URL) like the other
     /// integration tests; skips when it is not configured.
     #[tokio::test]
-    async fn insert_event_is_idempotent() {
+    async fn batch_insert_is_idempotent() {
         let db_url = match std::env::var("TEST_DATABASE_URL") {
             Ok(url) => url,
             // Hard-fail under the rust-integration CI job (REQUIRE_TEST_SERVICES)
@@ -323,10 +685,11 @@ mod tests {
             .await
             .expect("cleanup failed");
 
-        insert_event(&pool, &event)
+        let events = [event.clone()];
+        insert_events_batch(&pool, &events)
             .await
             .expect("first insert failed");
-        insert_event(&pool, &event)
+        insert_events_batch(&pool, &events)
             .await
             .expect("second insert must not error");
 
@@ -338,5 +701,92 @@ mod tests {
                 .expect("count query failed");
 
         assert_eq!(count.0, 1, "duplicate insert should be silently ignored");
+    }
+
+    /// An empty batch must be a no-op rather than an invalid statement.
+    #[tokio::test]
+    async fn empty_batch_is_a_noop() {
+        let db_url = match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) if std::env::var("REQUIRE_TEST_SERVICES").is_ok() => {
+                panic!("TEST_DATABASE_URL must be set when REQUIRE_TEST_SERVICES is set");
+            }
+            Err(_) => {
+                eprintln!("SKIP: TEST_DATABASE_URL not set");
+                return;
+            }
+        };
+        let pool = PgPool::connect(&db_url).await.unwrap();
+        insert_events_batch(&pool, &[])
+            .await
+            .expect("empty batch must succeed");
+    }
+
+    /// A page larger than `batch_size` must still land in full — chunking splits
+    /// the statement, not the transaction — and a replay must insert nothing new.
+    #[tokio::test]
+    async fn commit_page_chunks_large_pages_and_advances_cursor_once() {
+        let db_url = match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) if std::env::var("REQUIRE_TEST_SERVICES").is_ok() => {
+                panic!("TEST_DATABASE_URL must be set when REQUIRE_TEST_SERVICES is set");
+            }
+            Err(_) => {
+                eprintln!("SKIP: TEST_DATABASE_URL not set");
+                return;
+            }
+        };
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        let contract_id = format!("CBATCH_{}", Uuid::new_v4());
+        let events: Vec<SorobanEvent> = (0..25).map(|i| make_event(&contract_id, 900, i)).collect();
+
+        fn commit(events: &[SorobanEvent]) -> PageCommit<'_> {
+            PageCommit {
+                events,
+                token_events: &[],
+                invocation_metrics: &[],
+                cursor: Some(900),
+                ledger: Some(LedgerMeta {
+                    sequence: 900,
+                    hash: "hash900",
+                    timestamp: "2024-01-01T00:00:00Z",
+                    event_count: events.len() as i32,
+                }),
+                // Deliberately smaller than the page so chunking is exercised.
+                batch_size: 10,
+            }
+        }
+
+        commit_page(&pool, commit(&events))
+            .await
+            .expect("commit_page failed");
+
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM soroban_events WHERE contract_id = $1")
+                .bind(&contract_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count.0, 25, "every chunk of the page must land");
+        assert_eq!(get_cursor(&pool).await.unwrap(), 900);
+
+        commit_page(&pool, commit(&events))
+            .await
+            .expect("replay failed");
+
+        let recount: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM soroban_events WHERE contract_id = $1")
+                .bind(&contract_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(recount.0, 25, "replaying a page must insert nothing new");
+
+        sqlx::query("DELETE FROM soroban_events WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 }

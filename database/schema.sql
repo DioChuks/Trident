@@ -155,6 +155,24 @@ CREATE TABLE IF NOT EXISTS parse_errors (
 CREATE INDEX IF NOT EXISTS idx_parse_errors_occurred_at ON parse_errors (occurred_at DESC);
 
 -- ---------------------------------------------------------------------------
+-- event_outbox
+-- Transactional outbox guaranteeing every committed event reaches the Redis
+-- stream at least once (migration 0010).
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS event_outbox (
+    seq          BIGSERIAL   PRIMARY KEY,
+    event_id     UUID        NOT NULL UNIQUE,
+    payload      JSONB       NOT NULL,
+    published    BOOLEAN     NOT NULL DEFAULT FALSE,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    published_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_event_outbox_unpublished
+    ON event_outbox (seq)
+    WHERE published = FALSE;
+
+-- ---------------------------------------------------------------------------
 -- webhook_subscriptions
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS webhook_subscriptions (

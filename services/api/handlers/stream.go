@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Depo-dev/trident/services/api/internal/httputil"
+	"github.com/Depo-dev/trident/services/api/validation"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -40,9 +41,17 @@ const eventStreamGapEvent = `event: gap\ndata: {"message":"requested Last-Event-
 //   Last-Event-ID on reconnect.
 func Stream(rdb streamRedisClient) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		contractID := r.URL.Query().Get("contractId")
-		if contractID == "" {
-			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, "contractId is required")
+		q := r.URL.Query()
+		if verr := validation.RejectUnknownParams(q, "contractId", "topic0"); verr != nil {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
+			return
+		}
+
+		// The stream filters server-side on this id, so a malformed one would
+		// otherwise silently match nothing for the life of the connection.
+		contractID := q.Get("contractId")
+		if verr := validation.ValidateRequiredContractID("contractId", contractID); verr != nil {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
 			return
 		}
 
@@ -104,7 +113,7 @@ func Stream(rdb streamRedisClient) http.HandlerFunc {
 		w.WriteHeader(http.StatusOK)
 		flusher.Flush()
 
-		topic0 := r.URL.Query().Get("topic0")
+		topic0 := q.Get("topic0")
 
 		for {
 			streams, readErr := rdb.XRead(r.Context(), &redis.XReadArgs{

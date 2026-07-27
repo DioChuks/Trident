@@ -70,6 +70,9 @@ services:
       REDIS_URL: ${REDIS_URL}
       RUST_LOG: ${LOG_LEVEL:-info}
       GRPC_API_DB_POOL_SIZE: ${GRPC_API_DB_POOL_SIZE:-5}
+      # In-flight buffer per StreamEvents subscriber. Filling it blocks that
+      # subscriber's Redis consumer rather than queueing without limit.
+      STREAM_CHANNEL_BUFFER: ${STREAM_CHANNEL_BUFFER:-128}
     expose:
       - "50051"
     depends_on:

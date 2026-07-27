@@ -401,7 +401,9 @@ func TestGQLHandler_Topic0Filter(t *testing.T) {
 
 	var outer struct {
 		Data struct {
-			ContractEvents struct{ ID string `json:"id"` } `json:"contractEvents"`
+			ContractEvents struct {
+				ID string `json:"id"`
+			} `json:"contractEvents"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(msg.Payload, &outer); err != nil {
