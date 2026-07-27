@@ -1,4 +1,4 @@
--- 0013: Convert soroban_events to RANGE-partitioned table (#244).
+-- 0017: Convert soroban_events to RANGE-partitioned table (#244).
 --
 -- Partition key: ledger_sequence
 --   Chosen over ledger_timestamp because it is deterministic (monotonically

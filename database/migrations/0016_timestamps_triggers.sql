@@ -1,4 +1,4 @@
--- 0012: standardise created_at/updated_at + BEFORE UPDATE triggers (#253).
+-- 0016: standardise created_at/updated_at + BEFORE UPDATE triggers (#253).
 --
 -- Audit of mutable tables:
 --   system_state          — updated_at exists but was SET manually in queries.

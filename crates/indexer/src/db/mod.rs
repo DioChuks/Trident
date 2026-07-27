@@ -437,7 +437,7 @@ pub async fn commit_page(pool: &PgPool, commit: PageCommit<'_>) -> Result<(), Tr
     }
 
     // token_events.event_id logically references soroban_events(id) (the DB-level
-    // FK was dropped in migration 0013 — soroban_events is partitioned, so a
+    // FK was dropped in migration 0017 — soroban_events is partitioned, so a
     // single-column UNIQUE (id) can't be enforced globally). Referential
     // integrity is instead upheld here: projection rows must follow the event
     // insert inside the same transaction, so a token_events row can never exist

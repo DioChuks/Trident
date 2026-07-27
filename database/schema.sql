@@ -7,7 +7,7 @@
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
 -- ---------------------------------------------------------------------------
--- soroban_events  (migration 0013: RANGE-partitioned by ledger_sequence)
+-- soroban_events  (migration 0017: RANGE-partitioned by ledger_sequence)
 -- Primary store for every indexed Soroban contract event.
 --
 -- Partition key: ledger_sequence — deterministic, aligns with the ingest
@@ -181,7 +181,7 @@ CREATE INDEX IF NOT EXISTS idx_event_outbox_unpublished
     WHERE published = FALSE;
 
 -- ---------------------------------------------------------------------------
--- updated_at trigger  (migration 0012)
+-- updated_at trigger  (migration 0016)
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION set_updated_at()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
@@ -224,7 +224,7 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
     id              BIGSERIAL   PRIMARY KEY,
     subscription_id UUID        NOT NULL REFERENCES webhook_subscriptions(id) ON DELETE CASCADE,
     -- event_id is a logical FK to soroban_events(id); the DB-level constraint
-    -- was dropped in migration 0013 because soroban_events is now partitioned
+    -- was dropped in migration 0017 because soroban_events is now partitioned
     -- by ledger_sequence, and PostgreSQL does not allow a global UNIQUE (id)
     -- on a partitioned table. Referential integrity is upheld by the application.
     event_id        UUID        NOT NULL,
