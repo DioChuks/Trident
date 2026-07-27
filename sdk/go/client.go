@@ -82,7 +82,7 @@ func (c *Client) QueryEvents(ctx context.Context, params QueryEventsParams) (*Pa
 
 	if resp.StatusCode != http.StatusOK {
 		bodyBytes, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("query events failed with status %d: %s", resp.StatusCode, string(bodyBytes))
+		return nil, parseApiError(resp.StatusCode, string(bodyBytes))
 	}
 
 	var res PaginatedEvents
@@ -119,7 +119,7 @@ func (c *Client) GetEventByID(ctx context.Context, id string) (*SorobanEvent, er
 
 	if resp.StatusCode != http.StatusOK {
 		bodyBytes, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("get event failed with status %d: %s", resp.StatusCode, string(bodyBytes))
+		return nil, parseApiError(resp.StatusCode, string(bodyBytes))
 	}
 
 	var wrapper struct {
