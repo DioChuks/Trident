@@ -16,7 +16,7 @@ futures = "0.3"
 ## Quick start
 
 ```rust
-use trident_sdk::{TridentClient, TridentConfig, QueryParams, Network};
+use trident_sdk::{ContractStatsQuery, TridentClient, TridentConfig, QueryParams, Network};
 use futures::StreamExt;
 
 #[tokio::main]
@@ -51,6 +51,25 @@ async fn main() -> Result<(), trident_sdk::TridentError> {
     let event = client.get_event_by_id("550e8400-e29b-41d4-a716-446655440000").await?;
     println!("Event: {:?}", event);
 
+    // Service health + contract analytics
+    let health = client.get_health().await?;
+    let stats = client.get_indexer_stats().await?;
+    let contracts = client.get_contract_stats(ContractStatsQuery {
+        limit: Some(5),
+        ..Default::default()
+    }).await?;
+    println!("{} / {} / {}", health.status, stats.status, contracts.contracts.len());
+
+    // Stream every historical event across pages
+    let mut history = client.iter_events(QueryParams {
+        contract_id: Some("CAAAA...".into()),
+        first: Some(25),
+        ..Default::default()
+    });
+    while let Some(event) = history.next().await {
+        println!("historical: {}", event?.id);
+    }
+
     // Real-time subscription
     let mut sub = client.subscribe_to_contract("CAAAA...", Some("transfer")).await?;
     while let Some(result) = sub.next().await {
@@ -71,4 +90,12 @@ Dry-run check (runs in CI):
 
 ```bash
 cargo publish --dry-run --package trident-sdk
+```
+
+## Examples
+
+Compile or run the bundled example:
+
+```bash
+cargo run --example events_and_stats
 ```
