@@ -28,6 +28,16 @@ import (
 
 const auditCleanupInterval = 6 * time.Hour
 
+// Usage rollup: re-aggregate audit_log into usage_rollup every 5 minutes,
+// covering the last 48h so late-arriving audit rows (the writer batches
+// asynchronously) and the UTC day boundary are always caught by the next run.
+const (
+	usageRollupInterval        = 5 * time.Minute
+	usageRollupLookback        = 48 * time.Hour
+	usageRollupRetention       = 400 * 24 * time.Hour
+	usageRollupCleanupInterval = 24 * time.Hour
+)
+
 const defaultDBPoolSize = 5
 
 func initTracer(ctx context.Context) func() {
@@ -148,6 +158,13 @@ func main() {
 		defer auditWriter.Close()
 		// Background cleanup: delete audit log entries older than 90 days.
 		go runAuditCleanup(ctx, pool)
+
+		// Usage rollup (billing/usage-limit readiness): periodically aggregate
+		// audit_log into usage_rollup, then bound its own storage with a
+		// longer-horizon cleanup (it's ~1 row per key per day, but still
+		// unbounded without one).
+		go handlers.RunUsageRollupLoop(ctx, pool, usageRollupInterval, usageRollupLookback)
+		go runUsageRollupCleanup(ctx, pool)
 	}
 
 	adminCfg := handlers.AdminConfig{
@@ -157,6 +174,8 @@ func main() {
 	if adminURL := os.Getenv("PGBOUNCER_ADMIN_URL"); adminURL != "" {
 		adminCfg.StatsFunc = newPgbouncerStats(adminURL)
 	}
+
+	usageCfg := handlers.UsageConfig{DB: pool}
 
 	apiKeyCfg := handlers.APIKeyConfig{
 		AdminKey: os.Getenv("ADMIN_API_KEY"),
@@ -184,6 +203,8 @@ func main() {
 	mux.HandleFunc("GET /v1/events/stream", handlers.Stream(redisClient))
 	mux.HandleFunc("GET /v1/admin/db", handlers.AdminDB(adminCfg))
 	mux.HandleFunc("GET /v1/admin/keys/{id}/usage", handlers.AdminKeyUsage(adminCfg))
+	mux.HandleFunc("GET /v1/admin/keys/{id}/usage-rollup", handlers.AdminKeyUsageRollup(adminCfg))
+	mux.HandleFunc("GET /v1/usage", handlers.KeyUsage(usageCfg))
 	// API key management (admin-only via X-Admin-Key header)
 	mux.HandleFunc("POST /v1/api-keys", handlers.CreateAPIKey(apiKeyCfg))
 	mux.HandleFunc("GET /v1/api-keys", handlers.ListAPIKeys(apiKeyCfg))
@@ -298,6 +319,36 @@ func runAuditCleanup(ctx context.Context, pool *pgxpool.Pool) {
 			if tag.RowsAffected() == 0 {
 				return
 			}
+		}
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			cleanup()
+			return
+		case <-ticker.C:
+			cleanup()
+		}
+	}
+}
+
+// runUsageRollupCleanup bounds usage_rollup storage by deleting daily buckets
+// older than usageRollupRetention (~13 months) — generous relative to the
+// 90-day audit_log retention since usage_rollup is O(keys * days), not
+// O(requests).
+func runUsageRollupCleanup(ctx context.Context, pool *pgxpool.Pool) {
+	ticker := time.NewTicker(usageRollupCleanupInterval)
+	defer ticker.Stop()
+
+	cleanup := func() {
+		cleanupCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		if _, err := pool.Exec(cleanupCtx,
+			`DELETE FROM usage_rollup WHERE period_start < NOW() - $1::interval`,
+			fmt.Sprintf("%d seconds", int64(usageRollupRetention.Seconds())),
+		); err != nil {
+			slog.Warn("usage rollup cleanup failed", "err", err)
 		}
 	}
 

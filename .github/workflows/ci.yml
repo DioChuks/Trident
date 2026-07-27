@@ -261,6 +261,12 @@ jobs:
       - name: Cache Rust build artefacts
         uses: Swatinem/rust-cache@v2
 
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache-dependency-path: services/api/go.sum
+
       # Apply the real migration chain (0001..latest) — the same artifact CI's
       # `rust` job and production apply. This validates the migrations as an
       # ordered, idempotent chain and can never silently depend on a stale
@@ -286,6 +292,15 @@ jobs:
           REQUIRE_TEST_SERVICES: "1"
           CI: "true"
         run: cargo test --all -- --include-ignored --test-threads=1
+
+      # Go DB-backed tests (e.g. usage rollup) that the plain "Go" job's
+      # `go test ./...` silently skips without TEST_DATABASE_URL.
+      - name: Run Go DB-backed integration tests
+        working-directory: services/api
+        env:
+          TEST_DATABASE_URL: postgres://postgres:trident@localhost:5432/trident_test
+          REQUIRE_TEST_SERVICES: "1"
+        run: go test ./... -run 'Integration|RollupUsage' -v
 
   # ---------------------------------------------------------------------------
   # Docker — build images (no push)
