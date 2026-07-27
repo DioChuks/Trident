@@ -25,6 +25,10 @@ pub const RPC_FAILOVERS_TOTAL: &str = "trident_indexer_rpc_failovers_total";
 pub const OUTBOX_BACKLOG: &str = "trident_indexer_outbox_backlog";
 pub const OUTBOX_PUBLISHED_TOTAL: &str = "trident_indexer_outbox_published_total";
 pub const OUTBOX_PUBLISH_FAILURES_TOTAL: &str = "trident_indexer_outbox_publish_failures_total";
+/// Unix timestamp (seconds) of the most recent completed poll cycle. Use
+/// `time() - trident_indexer_last_poll_timestamp_seconds > N` as a
+/// dead-man's-switch alert for a stalled indexer (#218).
+pub const HEARTBEAT_TIMESTAMP: &str = "trident_indexer_last_poll_timestamp_seconds";
 
 /// Install the global Prometheus recorder and start serving `/metrics` on
 /// `port`. Must be called once, before the streamer starts recording.
@@ -85,6 +89,10 @@ pub fn install(port: u16) -> Result<(), TridentError> {
         OUTBOX_PUBLISH_FAILURES_TOTAL,
         "Outbox publish attempts that failed (issue #200)"
     );
+    describe_gauge!(
+        HEARTBEAT_TIMESTAMP,
+        "Unix timestamp (seconds) of the most recent completed poll cycle (#218)"
+    );
 
     // Counters only render in the scrape output once touched at least once;
     // seed them at zero so /metrics is complete from the very first scrape.
@@ -101,6 +109,7 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     gauge!(OUTBOX_BACKLOG).set(0.0);
     gauge!(LEDGER_LAG).set(0.0);
     gauge!(EFFECTIVE_POLL_INTERVAL_MS).set(0.0);
+    gauge!(HEARTBEAT_TIMESTAMP).set(0.0);
 
     tracing::info!(port, "Metrics endpoint listening");
     Ok(())
@@ -112,6 +121,13 @@ pub fn set_ledger_lag(lag: i64) {
 
 pub fn set_effective_poll_interval(ms: u64) {
     gauge!(EFFECTIVE_POLL_INTERVAL_MS).set(ms as f64);
+}
+
+/// Stamp the heartbeat to the current Unix time. Called at the end of every
+/// poll cycle (success or failure) so a dead-man's switch alert can detect a
+/// stalled-but-not-crashed indexer (#218).
+pub fn set_heartbeat_timestamp(secs: f64) {
+    gauge!(HEARTBEAT_TIMESTAMP).set(secs);
 }
 
 pub fn record_events_processed(count: u64) {

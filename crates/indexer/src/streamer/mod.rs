@@ -17,7 +17,7 @@
 //!   between the commit and the publish cannot drop an event.
 
 use std::collections::HashSet;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sqlx::PgPool;
 use tokio_retry::{strategy::ExponentialBackoff, Retry};
@@ -204,6 +204,13 @@ impl Streamer {
             let lag = self.last_chain_tip.saturating_sub(cursor);
             let interval = self.adaptive_poll.next_interval(lag);
             metrics::set_effective_poll_interval(interval.as_millis() as u64);
+
+            // Stamp the heartbeat after every cycle — even failed ones — so the
+            // gauge advances as long as the poll loop is alive (#218). A dead-man's
+            // switch alert fires when `time() - gauge > threshold`.
+            if let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) {
+                metrics::set_heartbeat_timestamp(now.as_secs_f64());
+            }
 
             // Sleep until the next poll interval, waking immediately on shutdown.
             tokio::select! {
@@ -779,6 +786,9 @@ mod tests {
             alert_webhook_url: None,
             alert_lag_threshold: 200,
             alert_cooldown_minutes: 30,
+            health_port: 0,
+            statement_timeout_ms: 30_000,
+            idle_in_transaction_timeout_ms: 60_000,
         };
 
         Streamer::new(config, db).await.unwrap()
