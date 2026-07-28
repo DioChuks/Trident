@@ -1,12 +1,15 @@
+use std::time::Duration;
+
 use futures::StreamExt;
 use serde::Deserialize;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::retry::{compute_backoff, is_retryable_status, parse_retry_after_seconds};
 use crate::{
-    EventType, PaginatedEvents, QueryParams, SorobanEvent, Subscription, TridentConfig,
-    TridentError,
+    EventType, PaginatedEvents, QueryParams, RetryConfig, SorobanEvent, Subscription,
+    TridentConfig, TridentError,
 };
 
 // ---------------------------------------------------------------------------
@@ -192,6 +195,85 @@ impl TridentClient {
         map
     }
 
+    /// Issue a GET request, retrying according to `retry` (`None` disables
+    /// retries — a single attempt). Honours `Retry-After` on 429/503,
+    /// falling back to exponential backoff with jitter otherwise. Once
+    /// retries are exhausted, wraps the last error in
+    /// [`TridentError::RetryExhausted`].
+    async fn send_get(
+        &self,
+        url: url::Url,
+        retry: Option<RetryConfig>,
+    ) -> Result<reqwest::Response, TridentError> {
+        let mut attempt: u32 = 1;
+        let mut total_waited = Duration::from_millis(0);
+
+        loop {
+            let send_result = self
+                .http
+                .get(url.clone())
+                .headers(self.headers())
+                .send()
+                .await;
+
+            let response = match send_result {
+                Ok(r) => r,
+                Err(e) => {
+                    let network_err = TridentError::Network(e);
+                    if let Some(cfg) = &retry {
+                        if attempt < cfg.max_attempts {
+                            let wait = compute_backoff(attempt, cfg);
+                            if total_waited + wait <= cfg.max_total_wait {
+                                total_waited += wait;
+                                tokio::time::sleep(wait).await;
+                                attempt += 1;
+                                continue;
+                            }
+                        }
+                    }
+                    return Err(if attempt > 1 {
+                        TridentError::RetryExhausted {
+                            attempts: attempt,
+                            last_error: Box::new(network_err),
+                        }
+                    } else {
+                        network_err
+                    });
+                }
+            };
+
+            let status = response.status();
+            if status.is_success() {
+                return Ok(response);
+            }
+
+            if let Some(cfg) = &retry {
+                if is_retryable_status(status.as_u16()) && attempt < cfg.max_attempts {
+                    let wait = parse_retry_after_seconds(response.headers().get("retry-after"))
+                        .unwrap_or_else(|| compute_backoff(attempt, cfg));
+                    if total_waited + wait <= cfg.max_total_wait {
+                        total_waited += wait;
+                        tokio::time::sleep(wait).await;
+                        attempt += 1;
+                        continue;
+                    }
+                }
+            }
+
+            // Status already confirmed non-success above, so check_response
+            // always returns Err here.
+            let err = check_response(response).await.unwrap_err();
+            return Err(if attempt > 1 {
+                TridentError::RetryExhausted {
+                    attempts: attempt,
+                    last_error: Box::new(err),
+                }
+            } else {
+                err
+            });
+        }
+    }
+
     /// Query historical Soroban events with optional filtering.
     ///
     /// Results are cursor-paginated. Pass `result.next_cursor` as
@@ -216,6 +298,18 @@ impl TridentClient {
     /// # });
     /// ```
     pub async fn query_events(&self, params: QueryParams) -> Result<PaginatedEvents, TridentError> {
+        self.query_events_with_retry(params, self.config.retry.clone())
+            .await
+    }
+
+    /// Same as [`query_events`](Self::query_events), overriding the
+    /// client-level retry policy for this call only. Pass `None` to disable
+    /// retries regardless of [`TridentConfig::retry`].
+    pub async fn query_events_with_retry(
+        &self,
+        params: QueryParams,
+        retry: Option<RetryConfig>,
+    ) -> Result<PaginatedEvents, TridentError> {
         let mut url = url::Url::parse(&format!("{}/v1/events", self.config.api_url))
             .map_err(|e| TridentError::WebSocket(e.to_string()))?;
 
@@ -245,9 +339,7 @@ impl TridentClient {
             }
         }
 
-        let response = self.http.get(url).headers(self.headers()).send().await?;
-
-        let response = check_response(response).await?;
+        let response = self.send_get(url, retry).await?;
         let body: ApiListResponse = response.json().await?;
 
         Ok(PaginatedEvents {
@@ -305,15 +397,26 @@ impl TridentClient {
     /// # });
     /// ```
     pub async fn get_event_by_id(&self, id: &str) -> Result<SorobanEvent, TridentError> {
+        self.get_event_by_id_with_retry(id, self.config.retry.clone())
+            .await
+    }
+
+    /// Same as [`get_event_by_id`](Self::get_event_by_id), overriding the
+    /// client-level retry policy for this call only. Pass `None` to disable
+    /// retries regardless of [`TridentConfig::retry`].
+    pub async fn get_event_by_id_with_retry(
+        &self,
+        id: &str,
+        retry: Option<RetryConfig>,
+    ) -> Result<SorobanEvent, TridentError> {
         let url = format!(
             "{}/v1/events/{}",
             self.config.api_url,
             url::form_urlencoded::byte_serialize(id.as_bytes()).collect::<String>()
         );
+        let url = url::Url::parse(&url).map_err(|e| TridentError::WebSocket(e.to_string()))?;
 
-        let response = self.http.get(&url).headers(self.headers()).send().await?;
-
-        let response = check_response(response).await?;
+        let response = self.send_get(url, retry).await?;
         let body: ApiGetResponse = response.json().await?;
         Ok(api_event_to_soroban(body.event))
     }
@@ -577,6 +680,264 @@ mod tests {
 
         assert!(matches!(result, Err(TridentError::NotFound)));
         mock.assert_async().await;
+    }
+
+    // ── Retry with backoff (#279) ─────────────────────────────────────────
+
+    fn fast_retry_config(max_attempts: u32) -> RetryConfig {
+        RetryConfig {
+            max_attempts,
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(20),
+            max_total_wait: Duration::from_secs(1),
+            jitter: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_succeeds_after_n_transient_503s() {
+        let mut server = Server::new_async().await;
+
+        let body = serde_json::json!({ "events": [], "next_cursor": null, "has_more": false });
+
+        let unavailable = server
+            .mock("GET", mockito::Matcher::Regex(r"^/v1/events".to_string()))
+            .with_status(503)
+            .with_body("temporarily unavailable")
+            .expect(2)
+            .create_async()
+            .await;
+        let ok = server
+            .mock("GET", mockito::Matcher::Regex(r"^/v1/events".to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body.to_string())
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = make_client(&server.url());
+        let result = client
+            .query_events_with_retry(QueryParams::default(), Some(fast_retry_config(3)))
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "expected success after retries: {:?}",
+            result.err()
+        );
+        unavailable.assert_async().await;
+        ok.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn retry_honours_retry_after_header_on_429() {
+        let mut server = Server::new_async().await;
+        let body = serde_json::json!({ "events": [], "next_cursor": null, "has_more": false });
+
+        let limited = server
+            .mock("GET", mockito::Matcher::Regex(r"^/v1/events".to_string()))
+            .with_status(429)
+            .with_header("retry-after", "0")
+            .with_body("slow down")
+            .expect(1)
+            .create_async()
+            .await;
+        let ok = server
+            .mock("GET", mockito::Matcher::Regex(r"^/v1/events".to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body.to_string())
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = make_client(&server.url());
+        // Base delay is large; Retry-After: 0 must be honoured instead, so
+        // this must complete well within the timeout below.
+        let large_backoff_cfg = RetryConfig {
+            max_attempts: 3,
+            base_delay: Duration::from_secs(5),
+            max_delay: Duration::from_secs(5),
+            max_total_wait: Duration::from_secs(30),
+            jitter: false,
+        };
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.query_events_with_retry(QueryParams::default(), Some(large_backoff_cfg)),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "timed out — Retry-After was not honoured over base backoff"
+        );
+        assert!(result.unwrap().is_ok());
+        limited.assert_async().await;
+        ok.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn retry_gives_up_after_max_attempts_and_surfaces_typed_error() {
+        let mut server = Server::new_async().await;
+
+        let mock = server
+            .mock("GET", mockito::Matcher::Regex(r"^/v1/events".to_string()))
+            .with_status(503)
+            .with_body("still down")
+            .expect(3)
+            .create_async()
+            .await;
+
+        let client = make_client(&server.url());
+        let result = client
+            .query_events_with_retry(QueryParams::default(), Some(fast_retry_config(3)))
+            .await;
+
+        match result {
+            Err(TridentError::RetryExhausted {
+                attempts,
+                last_error,
+            }) => {
+                assert_eq!(attempts, 3);
+                assert!(matches!(
+                    *last_error,
+                    TridentError::Http { status: 503, .. }
+                ));
+            }
+            other => panic!("expected RetryExhausted, got {:?}", other),
+        }
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn retry_does_not_retry_non_retryable_status() {
+        let mut server = Server::new_async().await;
+
+        let mock = server
+            .mock("GET", mockito::Matcher::Regex(r"^/v1/events".to_string()))
+            .with_status(401)
+            .with_body("bad key")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = make_client(&server.url());
+        let result = client
+            .query_events_with_retry(QueryParams::default(), Some(fast_retry_config(5)))
+            .await;
+
+        assert!(matches!(result, Err(TridentError::Unauthorized)));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn retry_disabled_by_default_on_client_config() {
+        let mut server = Server::new_async().await;
+
+        let mock = server
+            .mock("GET", mockito::Matcher::Regex(r"^/v1/events".to_string()))
+            .with_status(503)
+            .with_body("down")
+            .expect(1)
+            .create_async()
+            .await;
+
+        // Default TridentConfig::retry is None — a single attempt, no retry.
+        let client = make_client(&server.url());
+        let result = client.query_events(QueryParams::default()).await;
+
+        assert!(matches!(
+            result,
+            Err(TridentError::Http { status: 503, .. })
+        ));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn retry_per_call_override_disables_retries() {
+        let mut server = Server::new_async().await;
+
+        let mock = server
+            .mock("GET", mockito::Matcher::Regex(r"^/v1/events".to_string()))
+            .with_status(503)
+            .with_body("down")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let mut config = TridentConfig {
+            api_url: server.url(),
+            api_key: "test-key".to_string(),
+            ..Default::default()
+        };
+        config.retry = Some(fast_retry_config(5));
+        let client = TridentClient::new(config).unwrap();
+
+        // Explicitly disable retries for this call only.
+        let result = client
+            .query_events_with_retry(QueryParams::default(), None)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(TridentError::Http { status: 503, .. })
+        ));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn retry_applies_to_get_event_by_id() {
+        let mut server = Server::new_async().await;
+        let body = serde_json::json!({ "event": event_body() });
+
+        let unavailable = server
+            .mock("GET", "/v1/events/550e8400-e29b-41d4-a716-446655440000")
+            .with_status(503)
+            .with_body("down")
+            .expect(1)
+            .create_async()
+            .await;
+        let ok = server
+            .mock("GET", "/v1/events/550e8400-e29b-41d4-a716-446655440000")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body.to_string())
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = make_client(&server.url());
+        let result = client
+            .get_event_by_id_with_retry(
+                "550e8400-e29b-41d4-a716-446655440000",
+                Some(fast_retry_config(3)),
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "expected success after retry: {:?}",
+            result.err()
+        );
+        unavailable.assert_async().await;
+        ok.assert_async().await;
+    }
+
+    #[test]
+    fn compute_backoff_exponential_growth_capped_at_max_delay() {
+        let cfg = RetryConfig {
+            base_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(100),
+            jitter: false,
+            ..Default::default()
+        };
+        assert_eq!(compute_backoff(1, &cfg), Duration::from_millis(10));
+        assert_eq!(compute_backoff(2, &cfg), Duration::from_millis(20));
+        assert_eq!(compute_backoff(3, &cfg), Duration::from_millis(40));
+        assert_eq!(compute_backoff(4, &cfg), Duration::from_millis(80));
+        assert_eq!(compute_backoff(5, &cfg), Duration::from_millis(100)); // capped
     }
 
     #[tokio::test]

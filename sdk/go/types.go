@@ -6,6 +6,13 @@ type TridentClientConfig struct {
 	BaseURL string
 	// APIKey is the API Key used for authentication (sent via X-API-Key header)
 	APIKey string
+	// Retry configures automatic retries with backoff for idempotent (GET)
+	// requests. A nil value uses DefaultRetryConfig. Overridden per-call by
+	// WithRetry. Ignored when RetryDisabled is true.
+	Retry *RetryConfig
+	// RetryDisabled disables automatic retries for this client entirely.
+	// Overridden per-call by WithRetry/WithRetryDisabled.
+	RetryDisabled bool
 }
 
 // QueryEventsParams options to filter historical events.

@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+use crate::retry::RetryConfig;
+
 /// Stellar network selection.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Network {
@@ -21,6 +23,10 @@ pub struct TridentConfig {
     pub network: Network,
     /// Per-request timeout. Defaults to 30 seconds.
     pub timeout: Duration,
+    /// Retry policy applied to idempotent (GET) requests, honouring
+    /// `Retry-After` on 429/503 responses. `None` disables retries — the
+    /// default. Overridden per-call by the `*_with_retry` client methods.
+    pub retry: Option<RetryConfig>,
 }
 
 impl Default for TridentConfig {
@@ -30,6 +36,7 @@ impl Default for TridentConfig {
             api_key: String::new(),
             network: Network::Testnet,
             timeout: Duration::from_secs(30),
+            retry: None,
         }
     }
 }
