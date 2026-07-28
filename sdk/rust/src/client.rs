@@ -1190,12 +1190,11 @@ mod tests {
         // query_events always appends `limit=...`, so Matcher::Missing here
         // never actually matched (every request has a non-empty query
         // string) — mockito served its unmatched-request fallback (501)
-        // instead. mockito serves multiple mocks matching the same broad
-        // pattern in creation order, each until exhausted, so two
-        // unqualified mocks act as a sequence of per-request responses
-        // without needing to match on the exact query string.
+        // instead. Differentiate the two requests by the query params that
+        // actually distinguish them.
         let mock_one = server
-            .mock("GET", mockito::Matcher::Regex(r"^/v1/events".to_string()))
+            .mock("GET", "/v1/events")
+            .match_query(mockito::Matcher::UrlEncoded("limit".into(), "50".into()))
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(page_one.to_string())
@@ -1203,7 +1202,11 @@ mod tests {
             .await;
 
         let mock_two = server
-            .mock("GET", mockito::Matcher::Regex(r"^/v1/events".to_string()))
+            .mock("GET", "/v1/events")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "cursor".into(),
+                "cursor-2".into(),
+            ))
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(page_two.to_string())

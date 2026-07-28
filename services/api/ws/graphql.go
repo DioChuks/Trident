@@ -33,6 +33,11 @@ type gqlMessage struct {
 type gqlSub struct {
 	cid  string
 	send chan []byte
+	// onSlow is called at most once if this subscription's send buffer stays
+	// full for maxConsecutiveDrops broadcasts in a row (issue #224). A single
+	// connection can multiplex several subscriptions, so the callback closes
+	// the whole connection's shared closeSlow channel, not just this op.
+	onSlow func()
 }
 
 func (s *gqlSub) getContractID() string { return s.cid }
@@ -45,6 +50,12 @@ func (s *gqlSub) trySend(msg []byte) bool {
 	}
 }
 func (s *gqlSub) shutdown() { close(s.send) }
+func (s *gqlSub) disconnect() {
+	if s.onSlow == nil {
+		return // not wired up (e.g. a test double) — nothing to signal.
+	}
+	s.onSlow()
+}
 
 // gqlConn serialises writes to a hijacked WebSocket connection.
 type gqlConn struct {
@@ -60,6 +71,12 @@ func (c *gqlConn) write(msg gqlMessage) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return writeTextFrame(c.bufrw, data)
+}
+
+func (c *gqlConn) writeClose(code uint16, reason string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return writeCloseFrame(c.bufrw, code, reason)
 }
 
 func (c *gqlConn) writePong(payload []byte) error {
@@ -110,6 +127,11 @@ func serveGQL(conn net.Conn, bufrw *bufio.ReadWriter, hub *Hub, validateKey func
 	}
 	reads := make(chan frameMsg)
 	done := make(chan struct{})
+	// Shared by every gqlSub opened on this connection: one connection can
+	// multiplex several subscriptions, and any one of them exceeding the
+	// drop threshold closes the whole socket (issue #224).
+	closeSlow := make(chan struct{})
+	var closeSlowOnce sync.Once
 
 	// conn.Close() runs last so the read goroutine unblocks via I/O error.
 	defer func() { _ = conn.Close() }()
@@ -160,6 +182,12 @@ func serveGQL(conn net.Conn, bufrw *bufio.ReadWriter, hub *Hub, validateKey func
 			if err := gc.write(gqlMessage{Type: "ping"}); err != nil {
 				return
 			}
+
+		case <-closeSlow:
+			// Fill-policy disconnect (issue #224): a subscription on this
+			// connection exceeded the consecutive-drop threshold.
+			_ = gc.writeClose(closeStatusPolicyViolation, "slow consumer: buffer exceeded")
+			return
 
 		case fm := <-reads:
 			if fm.err != nil {
@@ -213,7 +241,11 @@ func serveGQL(conn net.Conn, bufrw *bufio.ReadWriter, hub *Hub, validateKey func
 					_ = gc.write(gqlErrorMsg(msg.ID, "subscription id already in use"))
 					continue
 				}
-				sub := &gqlSub{cid: contractID, send: make(chan []byte, sendBufSize)}
+				sub := &gqlSub{
+					cid:    contractID,
+					send:   make(chan []byte, sendBufSize),
+					onSlow: func() { closeSlowOnce.Do(func() { close(closeSlow) }) },
+				}
 				hub.register(sub)
 				subs[msg.ID] = sub
 				go gqlForward(sub, msg.ID, topic0, gc)

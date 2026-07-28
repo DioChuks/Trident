@@ -57,6 +57,27 @@ pub struct Streamer {
     last_chain_tip: u64,
     /// Adaptive poll-interval controller driven by chain-tip lag (issue #198).
     adaptive_poll: AdaptivePoll,
+    /// Parsed-spec cache keyed by WASM code hash (issue #260).
+    spec_cache: crate::spec::SpecCache,
+    /// Last code hash synced to `contract_specs` per contract, so a redeploy
+    /// (changed hash) is what triggers a refresh, not every poll cycle
+    /// (issue #260).
+    known_code_hashes: std::collections::HashMap<String, String>,
+    /// Tracked contracts most recently classified as SEP-41 tokens (issue
+    /// #269) — what bounds storage-snapshot fetching (issue #270) to
+    /// contracts we actually know how to read a balance from.
+    token_contracts: HashSet<String>,
+}
+
+/// One contract-storage snapshot change observed during a poll cycle,
+/// pending persistence (issue #270). Owns its data so it outlives the
+/// borrows built from `page_events`/`page_tokens` earlier in `poll_once`.
+struct OwnedStorageSnapshot {
+    contract_id: String,
+    storage_key: String,
+    key_json: serde_json::Value,
+    value_json: Option<serde_json::Value>,
+    ledger_sequence: u64,
 }
 
 impl Streamer {
@@ -81,7 +102,15 @@ impl Streamer {
             primary = %config.stellar_rpc_url,
             "RPC endpoint pool configured"
         );
-        let parser = Parser::new(config.index_diagnostic);
+        let sac_registry = crate::parser::sac::SacRegistry::build(
+            &config.tracked_sac_assets,
+            &config.network_passphrase,
+        )?;
+        tracing::info!(
+            tracked_assets = config.tracked_sac_assets.len(),
+            "SAC asset registry built"
+        );
+        let parser = Parser::new(config.index_diagnostic).with_sac_registry(sac_registry);
         let contract_filter = Self::load_filter(&db, &config.network).await?;
         let filter_plan = plan_filters(contract_filter.as_ref(), &config.topic_filters);
         let alerter = Alerter::from_config(
@@ -107,6 +136,9 @@ impl Streamer {
             alerter,
             last_chain_tip: 0,
             adaptive_poll,
+            spec_cache: crate::spec::SpecCache::new(),
+            known_code_hashes: std::collections::HashMap::new(),
+            token_contracts: HashSet::new(),
         })
     }
 
@@ -141,6 +173,56 @@ impl Streamer {
         }
     }
 
+    /// Fetch + persist specs and detected interfaces for every tracked
+    /// contract (issues #260, #269). Best-effort per contract: an RPC or
+    /// parse failure just skips that contract for this cycle. A DB write
+    /// only happens when the observed code hash differs from the last one
+    /// synced, so a contract whose code has not changed costs one cheap
+    /// `getLedgerEntries` call, not a WASM re-fetch.
+    async fn sync_contract_specs(&mut self) {
+        let Some(filter) = self.contract_filter.clone() else {
+            return;
+        };
+
+        for contract_id in filter {
+            match crate::spec::fetch_contract_spec(&self.rpc, &self.spec_cache, &contract_id).await
+            {
+                Ok(Some(contract_spec)) => {
+                    if contract_spec.interfaces.iter().any(|i| i == "sep41_token") {
+                        self.token_contracts.insert(contract_id.clone());
+                    } else {
+                        self.token_contracts.remove(&contract_id);
+                    }
+
+                    let changed =
+                        self.known_code_hashes.get(&contract_id) != Some(&contract_spec.code_hash);
+                    if changed {
+                        match db::upsert_contract_spec(
+                            &self.db,
+                            &contract_id,
+                            &self.config.network,
+                            &contract_spec,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                self.known_code_hashes
+                                    .insert(contract_id.clone(), contract_spec.code_hash.clone());
+                            }
+                            Err(e) => {
+                                tracing::warn!(contract_id = %contract_id, error = %e, "Failed to persist contract spec");
+                            }
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(contract_id = %contract_id, error = %e, "Failed to fetch contract spec");
+                }
+            }
+        }
+    }
+
     /// Start the polling loop. Runs until `shutdown` is cancelled, always
     /// finishing the current `poll_once` before stopping (never mid-batch).
     pub async fn run(&mut self, shutdown: CancellationToken) -> Result<(), TridentError> {
@@ -157,6 +239,12 @@ impl Streamer {
         let mut cursor = db::get_cursor(&self.db).await?;
         tracing::info!(cursor, "Resuming from ledger cursor");
 
+        // Populate contract specs / interface tags once at startup (issues
+        // #260, #269) so storage snapshotting (#270) has token classification
+        // available from the first poll rather than waiting for the first
+        // periodic refresh.
+        self.sync_contract_specs().await;
+
         loop {
             // Check for shutdown before starting a new poll so we never begin
             // a batch we can't finish atomically.
@@ -169,6 +257,7 @@ impl Streamer {
             self.poll_count = self.poll_count.wrapping_add(1);
             if self.poll_count.is_multiple_of(FILTER_REFRESH_EVERY_N_POLLS) {
                 self.refresh_contract_filter().await?;
+                self.sync_contract_specs().await;
             }
 
             let poll_span = tracing::info_span!("poll_cycle", cursor = cursor);
@@ -579,12 +668,93 @@ impl Streamer {
                 }
             }
 
+            // Contract storage snapshots (issue #270): bounded to tracked
+            // contracts already classified as SEP-41 tokens (issue #269), and
+            // only for holder addresses that moved funds in this page — never
+            // a scan of arbitrary storage.
+            let mut owned_storage_snapshots: Vec<OwnedStorageSnapshot> = Vec::new();
+            if !self.token_contracts.is_empty() {
+                let mut holders_by_contract: std::collections::HashMap<
+                    &str,
+                    std::collections::HashSet<&str>,
+                > = std::collections::HashMap::new();
+                for (index, token) in &page_tokens {
+                    let contract_id = page_events[*index].contract_id.as_str();
+                    if !self.token_contracts.contains(contract_id) {
+                        continue;
+                    }
+                    let holders = holders_by_contract.entry(contract_id).or_default();
+                    if let Some(from) = &token.from {
+                        holders.insert(from.as_str());
+                    }
+                    if let Some(to) = &token.to {
+                        holders.insert(to.as_str());
+                    }
+                }
+
+                let snapshot_ledger = if ledger_sequence > 0 {
+                    ledger_sequence
+                } else {
+                    *cursor
+                };
+                for (contract_id, holders) in holders_by_contract {
+                    let holder_list: Vec<String> =
+                        holders.into_iter().map(str::to_string).collect();
+                    let observations = match crate::storage::fetch_balance_snapshots(
+                        &self.rpc,
+                        contract_id,
+                        &holder_list,
+                    )
+                    .await
+                    {
+                        Ok(obs) => obs,
+                        Err(e) => {
+                            tracing::warn!(contract_id, error = %e, "Failed to fetch storage snapshot");
+                            continue;
+                        }
+                    };
+
+                    for obs in observations {
+                        let last = db::get_latest_storage_value(
+                            &self.db,
+                            contract_id,
+                            &self.config.network,
+                            &obs.storage_key,
+                        )
+                        .await
+                        .unwrap_or(None);
+
+                        if last != obs.value_json {
+                            owned_storage_snapshots.push(OwnedStorageSnapshot {
+                                contract_id: contract_id.to_string(),
+                                storage_key: obs.storage_key,
+                                key_json: obs.key_json,
+                                value_json: obs.value_json,
+                                ledger_sequence: snapshot_ledger,
+                            });
+                        }
+                    }
+                }
+            }
+            let storage_snapshots: Vec<db::StorageSnapshotRow<'_>> = owned_storage_snapshots
+                .iter()
+                .map(|s| db::StorageSnapshotRow {
+                    contract_id: &s.contract_id,
+                    storage_key: &s.storage_key,
+                    key_json: &s.key_json,
+                    value_json: s.value_json.as_ref(),
+                    ledger_sequence: s.ledger_sequence,
+                })
+                .collect();
+
             db::commit_page(
                 &self.db,
                 db::PageCommit {
                     events: &page_events,
                     token_events: &token_projections,
                     invocation_metrics: &invocation_metrics,
+                    storage_snapshots: &storage_snapshots,
+                    network: &self.config.network,
                     cursor: next_cursor,
                     ledger: next_cursor.map(|_| db::LedgerMeta {
                         sequence: ledger_sequence,
@@ -867,6 +1037,9 @@ mod tests {
             health_port: 0,
             statement_timeout_ms: 30_000,
             idle_in_transaction_timeout_ms: 60_000,
+            token_metadata_refresh_interval: Duration::from_secs(86_400),
+            network_passphrase: "Test SDF Network ; September 2015".to_string(),
+            tracked_sac_assets: Vec::new(),
         };
 
         Streamer::new(config, db).await.unwrap()

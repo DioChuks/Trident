@@ -16,6 +16,7 @@ import (
 	apigrpc "github.com/Depo-dev/trident/services/api/grpc"
 	"github.com/Depo-dev/trident/services/api/internal/httputil"
 	"github.com/Depo-dev/trident/services/api/validation"
+	"github.com/Depo-dev/trident/services/api/ws"
 	"github.com/jackc/pgx/v5"
 	"github.com/redis/go-redis/v9"
 )
@@ -47,6 +48,12 @@ var (
 	metricWebhookDeadLetter atomic.Int64
 	metricWebhookDurationMs atomic.Int64
 	metricWebhookTotal      atomic.Int64
+
+	// SSE slow-consumer disconnects (#224). SSE has no shared per-message
+	// drop path like the WS hub — a stalled SSE client is detected by the
+	// write deadline in Stream() failing, which always means "disconnect",
+	// so there is no separate drop counter to pair this with.
+	metricSSESlowConsumerDisconnects atomic.Int64
 )
 
 // RecordWebhookDelivery updates the webhook delivery counters. Call after
@@ -98,6 +105,12 @@ func MetricsHandler() http.HandlerFunc {
 		_, _ = fmt.Fprintf(w, "# HELP trident_webhook_delivery_mean_duration_ms Mean delivery round-trip latency in milliseconds.\n")
 		_, _ = fmt.Fprintf(w, "# TYPE trident_webhook_delivery_mean_duration_ms gauge\n")
 		_, _ = fmt.Fprintf(w, "trident_webhook_delivery_mean_duration_ms %g\n", meanMs)
+
+		// SSE + WS/GraphQL slow-consumer backpressure metrics (#224).
+		_, _ = fmt.Fprintf(w, "# HELP trident_sse_slow_consumer_disconnects_total SSE connections closed because a write exceeded the write deadline.\n")
+		_, _ = fmt.Fprintf(w, "# TYPE trident_sse_slow_consumer_disconnects_total counter\n")
+		_, _ = fmt.Fprintf(w, "trident_sse_slow_consumer_disconnects_total %d\n", metricSSESlowConsumerDisconnects.Load())
+		ws.WriteMetrics(w)
 	}
 }
 

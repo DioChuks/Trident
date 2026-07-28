@@ -1,0 +1,98 @@
+name: Publish SDK
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Semver version to publish (e.g. 1.2.3)"
+        required: true
+        type: string
+
+jobs:
+  publish:
+    name: Publish TypeScript SDK to npm
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk/typescript
+    # id-token: write is required so npm can mint a Sigstore-backed provenance
+    # attestation via GitHub's OIDC token — there is no secret involved.
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate version input is semver
+        run: |
+          if ! [[ "${{ inputs.version }}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::'${{ inputs.version }}' is not a valid semver version"
+            exit 1
+          fi
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check
+        run: npm run lint
+
+      - name: Test
+        run: npm test
+
+      - name: Set version
+        run: npm version "${{ inputs.version }}" --no-git-tag-version
+
+      - name: Build
+        run: npm run build
+
+      - name: Pack tarball
+        run: npm pack
+
+      - name: Smoke test packed tarball (CJS + ESM)
+        run: |
+          set -euo pipefail
+          TARBALL="$(pwd)/$(node -p "require('./package.json').name.replace('@','').replace('/','-')")-${{ inputs.version }}.tgz"
+
+          SMOKE_DIR=$(mktemp -d)
+          cd "$SMOKE_DIR"
+          npm init -y >/dev/null
+          npm install "$TARBALL" >/dev/null
+
+          cat > smoke-cjs.cjs <<'EOF'
+          const sdk = require("@trident-indexer/sdk");
+          const required = ["TridentClient", "TridentError", "TridentApiError", "iterEvents", "DEFAULT_MAX_PAGES"];
+          for (const name of required) {
+            if (typeof sdk[name] === "undefined") {
+              throw new Error(`CJS: missing export ${name}`);
+            }
+          }
+          console.log("CJS smoke test passed");
+          EOF
+
+          cat > smoke-esm.mjs <<'EOF'
+          import { TridentClient, TridentError, TridentApiError, iterEvents, DEFAULT_MAX_PAGES } from "@trident-indexer/sdk";
+          const required = { TridentClient, TridentError, TridentApiError, iterEvents, DEFAULT_MAX_PAGES };
+          for (const [name, value] of Object.entries(required)) {
+            if (typeof value === "undefined") {
+              throw new Error(`ESM: missing export ${name}`);
+            }
+          }
+          console.log("ESM smoke test passed");
+          EOF
+
+          node smoke-cjs.cjs
+          node smoke-esm.mjs
+
+          cd -
+          rm -rf "$SMOKE_DIR"
+
+      - name: Publish to npm
+        run: npm publish --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
