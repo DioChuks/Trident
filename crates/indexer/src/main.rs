@@ -17,6 +17,7 @@ mod poll;
 mod redis_stream;
 mod rpc;
 mod streamer;
+mod token_metadata;
 
 fn init_tracer() -> Option<opentelemetry_sdk::trace::Tracer> {
     let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok()?;

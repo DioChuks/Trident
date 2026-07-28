@@ -27,7 +27,11 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.21.0"
 )
 
-const auditCleanupInterval = 6 * time.Hour
+// How often contract_stats_rollup is recomputed from soroban_events (issue
+// #257). Matches the Redis response cache TTL in handlers.ContractsStats, so
+// a rollup-backed response is never staler than the cache would already
+// allow it to be.
+const contractStatsRollupRefreshInterval = 60 * time.Second
 
 const defaultDBPoolSize = 5
 
@@ -160,6 +164,13 @@ func main() {
 		startRetentionJob(ctx, pool)
 	}
 
+	// Periodically recompute contract_stats_rollup from soroban_events so
+	// GET /v1/stats/contracts can read a small pre-aggregated table instead
+	// of a live GROUP BY on every cache miss (issue #257).
+	if pool != nil {
+		go runContractStatsRollupRefresh(ctx, pool)
+	}
+
 	adminCfg := handlers.AdminConfig{
 		AdminKey: os.Getenv("ADMIN_API_KEY"),
 		DB:       pool,
@@ -218,6 +229,7 @@ func main() {
 	mux.HandleFunc("DELETE /v1/api-keys/{id}", handlers.DeleteAPIKey(apiKeyCfg))
 	mux.HandleFunc("GET /v1/stats/indexer", handlers.IndexerStats(healthDB))
 	mux.HandleFunc("GET /v1/contracts/{id}/events/schema", handlers.ContractEventSchemas(schemaRegistryDB))
+	mux.HandleFunc("GET /v1/contracts/{id}/metadata", handlers.TokenMetadata(healthDB))
 	mux.HandleFunc("GET /v1/stats/contracts", handlers.ContractsStats(pool, redisClient))
 	mux.HandleFunc("GET /v1/webhooks", listWebhooksHandler(webhookDB))
 	mux.HandleFunc("POST /v1/webhooks", createWebhookHandler(webhookDB))
@@ -330,13 +342,40 @@ func dbPoolSizeFromEnv() int32 {
 	return defaultDBPoolSize
 }
 
+// runContractStatsRollupRefresh recomputes contract_stats_rollup on a fixed
+// interval until ctx is cancelled (issue #257). Runs once immediately so the
+// rollup is populated shortly after startup rather than only after the first
+// tick.
+func runContractStatsRollupRefresh(ctx context.Context, pool *pgxpool.Pool) {
+	refresh := func() {
+		refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		if err := handlers.RefreshContractStatsRollup(refreshCtx, pool); err != nil {
+			slog.Warn("contract stats rollup refresh failed", "err", err)
+		}
+	}
+
+	refresh()
+
+	ticker := time.NewTicker(contractStatsRollupRefreshInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			refresh()
+		}
+	}
+}
+
 // retentionConfig holds per-table retention windows (in days).
 // Configured via env vars with sensible defaults.
 type retentionConfig struct {
-	AuditLogDays       int
-	ParseErrorsDays    int
+	AuditLogDays          int
+	ParseErrorsDays       int
 	WebhookDeliveriesDays int
-	SorobanEventsDays  int
+	SorobanEventsDays     int
 }
 
 func loadRetentionConfig() retentionConfig {

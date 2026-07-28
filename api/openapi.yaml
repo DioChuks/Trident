@@ -309,6 +309,40 @@ paths:
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
+  /v1/contracts/{id}/metadata:
+    get:
+      summary: Get token metadata for a contract
+      description: >-
+        Returns cached name/symbol/decimals for a SEP-41 token contract,
+        resolved via a read-only simulateTransaction call. `is_token` is
+        false, with the other fields null, both when the contract has not
+        been resolved yet and when it was resolved and found not to
+        implement the token interface.
+      operationId: getContractTokenMetadata
+      tags:
+        - Contracts
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: "^C[A-Z2-7]{55}$"
+          description: Soroban contract address
+      responses:
+        "200":
+          description: Cached token metadata (or a not-a-token / not-yet-resolved result)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenMetadataResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
   /v1/stats/indexer:
     get:
       summary: Get indexer statistics
@@ -685,6 +719,46 @@ components:
           nullable: true
           description: Timestamp of last successful poll
 
+
+    TokenMetadataResponse:
+      type: object
+      required:
+        - contract_id
+        - network
+        - is_token
+      properties:
+        contract_id:
+          type: string
+          pattern: "^C[A-Z2-7]{55}$"
+          description: Soroban contract address
+        network:
+          type: string
+          enum: [testnet, mainnet]
+          description: Network queried
+        is_token:
+          type: boolean
+          description: >-
+            True when the contract was resolved and implements the SEP-41
+            read interface. False for both "not yet resolved" and "resolved,
+            not a token".
+        name:
+          type: string
+          nullable: true
+          description: Token name, from name(). Null unless is_token is true.
+        symbol:
+          type: string
+          nullable: true
+          description: Token symbol, from symbol(). Null unless is_token is true.
+        decimals:
+          type: integer
+          format: int32
+          nullable: true
+          description: Token decimals, from decimals(). Null unless is_token is true.
+        resolved_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: When this contract was last resolved. Null if never resolved.
 
     ContractEventSchemaResponse:
       type: object
