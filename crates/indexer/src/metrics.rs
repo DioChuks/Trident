@@ -12,6 +12,17 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 use trident_common::TridentError;
 
 pub const LEDGER_LAG: &str = "trident_indexer_ledger_lag";
+/// Target Stellar ledger close time, used to convert ledger-count lag into an
+/// estimated wall-clock staleness figure (issue #294). Not measured
+/// per-deployment — the indexer does not retain per-ledger close timing once
+/// a page is processed — so this uses Stellar's protocol-target close time
+/// rather than a rolling average. Documented alongside the metric in
+/// docs/observability/data-freshness.md; keep both in sync if this changes.
+pub const AVG_LEDGER_CLOSE_SECONDS: f64 = 5.0;
+/// Estimated wall-clock staleness: `trident_indexer_ledger_lag *
+/// AVG_LEDGER_CLOSE_SECONDS` (issue #294). A derived convenience gauge, not
+/// an independent measurement — see [`AVG_LEDGER_CLOSE_SECONDS`].
+pub const LEDGER_LAG_SECONDS_ESTIMATED: &str = "trident_indexer_ledger_lag_seconds_estimated";
 pub const EVENTS_TOTAL: &str = "trident_indexer_events_total";
 pub const EVENTS_SKIPPED_TOTAL: &str = "trident_indexer_events_skipped_total";
 pub const PARSE_ERRORS_TOTAL: &str = "trident_indexer_parse_errors_total";
@@ -54,6 +65,10 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     describe_gauge!(
         LEDGER_LAG,
         "Difference between chain tip and indexer cursor (ledgers)"
+    );
+    describe_gauge!(
+        LEDGER_LAG_SECONDS_ESTIMATED,
+        "Estimated wall-clock lag: ledger lag * average ledger close time (issue #294)"
     );
     describe_counter!(EVENTS_TOTAL, "Total events processed since startup");
     describe_counter!(
@@ -125,6 +140,7 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     gauge!(RPC_ACTIVE_ENDPOINT).set(0.0);
     gauge!(OUTBOX_BACKLOG).set(0.0);
     gauge!(LEDGER_LAG).set(0.0);
+    gauge!(LEDGER_LAG_SECONDS_ESTIMATED).set(0.0);
     gauge!(EFFECTIVE_POLL_INTERVAL_MS).set(0.0);
     gauge!(HEARTBEAT_TIMESTAMP).set(0.0);
 
@@ -132,8 +148,11 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     Ok(())
 }
 
+/// Publish ledger-count lag and its derived estimated-seconds-behind gauge
+/// together, so the two figures can never drift out of sync (issue #294).
 pub fn set_ledger_lag(lag: i64) {
     gauge!(LEDGER_LAG).set(lag as f64);
+    gauge!(LEDGER_LAG_SECONDS_ESTIMATED).set(lag as f64 * AVG_LEDGER_CLOSE_SECONDS);
 }
 
 pub fn set_effective_poll_interval(ms: u64) {

@@ -38,9 +38,10 @@ func (g *atomicGauge) Get() float64 {
 }
 
 var (
-	metricLagLedgers        atomicGauge
-	metricLastPollTimestamp atomicGauge
-	metricEventsTotal       atomicGauge
+	metricLagLedgers          atomicGauge
+	metricLagSecondsEstimated atomicGauge
+	metricLastPollTimestamp   atomicGauge
+	metricEventsTotal         atomicGauge
 
 	// Webhook delivery counters (#241).
 	metricWebhookSuccess    atomic.Int64
@@ -79,6 +80,9 @@ func MetricsHandler() http.HandlerFunc {
 		_, _ = fmt.Fprintf(w, "# HELP trident_indexer_lag_ledgers Number of ledgers the indexer is behind the chain tip.\n")
 		_, _ = fmt.Fprintf(w, "# TYPE trident_indexer_lag_ledgers gauge\n")
 		_, _ = fmt.Fprintf(w, "trident_indexer_lag_ledgers %g\n", metricLagLedgers.Get())
+		_, _ = fmt.Fprintf(w, "# HELP trident_indexer_lag_seconds_estimated Estimated wall-clock lag: lag_ledgers * average ledger close time (issue #294).\n")
+		_, _ = fmt.Fprintf(w, "# TYPE trident_indexer_lag_seconds_estimated gauge\n")
+		_, _ = fmt.Fprintf(w, "trident_indexer_lag_seconds_estimated %g\n", metricLagSecondsEstimated.Get())
 		_, _ = fmt.Fprintf(w, "# HELP trident_indexer_last_poll_timestamp_seconds Unix timestamp of the last successful indexer poll.\n")
 		_, _ = fmt.Fprintf(w, "# TYPE trident_indexer_last_poll_timestamp_seconds gauge\n")
 		_, _ = fmt.Fprintf(w, "trident_indexer_last_poll_timestamp_seconds %g\n", metricLastPollTimestamp.Get())
@@ -235,17 +239,25 @@ func indexerStatus(lastPollAt *time.Time, lagLedgers *int64) string {
 // Response
 // ---------------------------------------------------------------------------
 
+// avgLedgerCloseSeconds is Stellar's protocol-target ledger close time, used
+// to convert ledger-count lag into an estimated wall-clock staleness figure
+// (issue #294). Kept in sync with crates/indexer/src/metrics.rs's
+// AVG_LEDGER_CLOSE_SECONDS; see docs/observability/data-freshness.md for the
+// full freshness contract.
+const avgLedgerCloseSeconds = 5.0
+
 // IndexerStatsResponse is the JSON body for GET /v1/stats/indexer.
 type IndexerStatsResponse struct {
-	LastLedgerIndexed  *int64  `json:"last_ledger_indexed"`
-	ChainTipLedger     *int64  `json:"chain_tip_ledger"`
-	LagLedgers         *int64  `json:"lag_ledgers"`
-	EventsIndexedTotal *int64  `json:"events_indexed_total"`
-	EventsLastPoll     *int64  `json:"events_last_poll"`
-	AvgPollDurationMs  *int64  `json:"avg_poll_duration_ms"`
-	LastPollAt         *string `json:"last_poll_at"`
-	Status             string  `json:"status"`
-	Network            string  `json:"network"`
+	LastLedgerIndexed   *int64   `json:"last_ledger_indexed"`
+	ChainTipLedger      *int64   `json:"chain_tip_ledger"`
+	LagLedgers          *int64   `json:"lag_ledgers"`
+	LagSecondsEstimated *float64 `json:"lag_seconds_estimated"`
+	EventsIndexedTotal  *int64   `json:"events_indexed_total"`
+	EventsLastPoll      *int64   `json:"events_last_poll"`
+	AvgPollDurationMs   *int64   `json:"avg_poll_duration_ms"`
+	LastPollAt          *string  `json:"last_poll_at"`
+	Status              string   `json:"status"`
+	Network             string   `json:"network"`
 }
 
 // ---------------------------------------------------------------------------
@@ -278,9 +290,12 @@ func IndexerStats(db DBPool) http.HandlerFunc {
 		chainTip := globalChainTipCache.get(r.Context())
 
 		var lagLedgers *int64
+		var lagSecondsEstimated *float64
 		if chainTip != nil && stats.lastLedgerIndexed != nil {
 			lag := *chainTip - *stats.lastLedgerIndexed
 			lagLedgers = &lag
+			estimated := float64(lag) * avgLedgerCloseSeconds
+			lagSecondsEstimated = &estimated
 		}
 
 		status := indexerStatus(stats.lastPollAt, lagLedgers)
@@ -288,6 +303,9 @@ func IndexerStats(db DBPool) http.HandlerFunc {
 		// Update Prometheus gauges with latest observed values.
 		if lagLedgers != nil {
 			metricLagLedgers.Set(float64(*lagLedgers))
+		}
+		if lagSecondsEstimated != nil {
+			metricLagSecondsEstimated.Set(*lagSecondsEstimated)
 		}
 		if stats.lastPollAt != nil {
 			metricLastPollTimestamp.Set(float64(stats.lastPollAt.Unix()))
@@ -303,15 +321,16 @@ func IndexerStats(db DBPool) http.HandlerFunc {
 		}
 
 		resp := IndexerStatsResponse{
-			LastLedgerIndexed:  stats.lastLedgerIndexed,
-			ChainTipLedger:     chainTip,
-			LagLedgers:         lagLedgers,
-			EventsIndexedTotal: stats.eventsIndexedTotal,
-			EventsLastPoll:     stats.eventsLastPoll,
-			AvgPollDurationMs:  stats.pollDurationMs,
-			LastPollAt:         lastPollAtStr,
-			Status:             status,
-			Network:            os.Getenv("NETWORK"),
+			LastLedgerIndexed:   stats.lastLedgerIndexed,
+			ChainTipLedger:      chainTip,
+			LagLedgers:          lagLedgers,
+			LagSecondsEstimated: lagSecondsEstimated,
+			EventsIndexedTotal:  stats.eventsIndexedTotal,
+			EventsLastPoll:      stats.eventsLastPoll,
+			AvgPollDurationMs:   stats.pollDurationMs,
+			LastPollAt:          lastPollAtStr,
+			Status:              status,
+			Network:             os.Getenv("NETWORK"),
 		}
 
 		httpStatus := http.StatusOK
