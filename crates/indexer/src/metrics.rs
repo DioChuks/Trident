@@ -25,6 +25,15 @@ pub const RPC_FAILOVERS_TOTAL: &str = "trident_indexer_rpc_failovers_total";
 pub const OUTBOX_BACKLOG: &str = "trident_indexer_outbox_backlog";
 pub const OUTBOX_PUBLISHED_TOTAL: &str = "trident_indexer_outbox_published_total";
 pub const OUTBOX_PUBLISH_FAILURES_TOTAL: &str = "trident_indexer_outbox_publish_failures_total";
+/// RPC call latency in seconds, labelled by `method` (e.g. `getEvents`) and
+/// `endpoint` (the pool index serving the call, `0` = primary). Covers every
+/// call regardless of outcome, so `_count` doubles as a per-method,
+/// per-endpoint call-volume counter (issue #294).
+pub const RPC_CALL_DURATION_SECONDS: &str = "trident_indexer_rpc_call_duration_seconds";
+/// RPC call failures labelled by `method` and a coarse `error_type`: one of
+/// `timeout`, `rate_limited`, `http_4xx`, `http_5xx`, `invalid_cursor`,
+/// `rpc_error`, `empty_result`, or `transport` (issue #294).
+pub const RPC_ERRORS_TOTAL: &str = "trident_indexer_rpc_errors_total";
 /// Unix timestamp (seconds) of the most recent completed poll cycle. Use
 /// `time() - trident_indexer_last_poll_timestamp_seconds > N` as a
 /// dead-man's-switch alert for a stalled indexer (#218).
@@ -92,6 +101,14 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     describe_gauge!(
         HEARTBEAT_TIMESTAMP,
         "Unix timestamp (seconds) of the most recent completed poll cycle (#218)"
+    );
+    describe_histogram!(
+        RPC_CALL_DURATION_SECONDS,
+        "RPC call latency in seconds, labelled by method and endpoint index (issue #294)"
+    );
+    describe_counter!(
+        RPC_ERRORS_TOTAL,
+        "RPC call failures labelled by method and error_type (issue #294)"
     );
 
     // Counters only render in the scrape output once touched at least once;
@@ -188,4 +205,20 @@ pub fn record_outbox_published() {
 /// Count a failed relay publish attempt (issue #200).
 pub fn record_outbox_publish_failure() {
     counter!(OUTBOX_PUBLISH_FAILURES_TOTAL).increment(1);
+}
+
+/// Record one RPC call's latency, labelled by method and the endpoint pool
+/// index that served it (0 = primary). Recorded for every call regardless of
+/// outcome, so a degraded-but-not-yet-failing provider (rising latency, no
+/// errors yet) is visible before it starts timing out (issue #294).
+pub fn record_rpc_call_duration(method: &'static str, endpoint_index: usize, seconds: f64) {
+    histogram!(RPC_CALL_DURATION_SECONDS, "method" => method, "endpoint" => endpoint_index.to_string())
+        .record(seconds);
+}
+
+/// Count an RPC failure labelled by method and a coarse error type, so ops
+/// can distinguish "chain is quiet" from "RPC is degraded" and see which
+/// failure mode is driving it (issue #294).
+pub fn record_rpc_error(method: &'static str, error_type: &'static str) {
+    counter!(RPC_ERRORS_TOTAL, "method" => method, "error_type" => error_type).increment(1);
 }

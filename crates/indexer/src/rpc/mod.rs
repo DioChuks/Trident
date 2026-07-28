@@ -1,7 +1,7 @@
 pub mod endpoints;
 
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use trident_common::TridentError;
@@ -238,9 +238,21 @@ impl RpcHttpSettings {
 fn rpc_transport_error(err: reqwest::Error, context: &'static str) -> TridentError {
     if err.is_timeout() {
         metrics::record_rpc_timeout();
+        metrics::record_rpc_error(context, "timeout");
         return TridentError::rpc(anyhow::Error::new(err).context(format!("{context} timed out")));
     }
+    metrics::record_rpc_error(context, "transport");
     TridentError::rpc(anyhow::Error::new(err).context(context))
+}
+
+/// Coarse error-type label for a non-2xx RPC HTTP response (issue #294).
+fn classify_http_status(status: reqwest::StatusCode) -> &'static str {
+    match status.as_u16() {
+        429 => "rate_limited",
+        400..=499 => "http_4xx",
+        500..=599 => "http_5xx",
+        _ => "other",
+    }
 }
 
 pub struct RpcClient {
@@ -285,15 +297,17 @@ impl RpcClient {
     }
 
     /// Endpoint to use for the next request, after any pending recovery back to
-    /// a higher-priority endpoint.
-    fn select_endpoint(&self) -> String {
+    /// a higher-priority endpoint. Also returns the endpoint's pool index, used
+    /// to label per-endpoint latency/error metrics (issue #294).
+    fn select_endpoint(&self) -> (String, usize) {
         let mut pool = self.pool.lock().expect("endpoint pool mutex poisoned");
         let (url, changed) = pool.select();
+        let index = pool.active_index();
         if changed {
-            metrics::set_rpc_active_endpoint(pool.active_index());
+            metrics::set_rpc_active_endpoint(index);
             tracing::info!(endpoint = %url, "Recovered to higher-priority RPC endpoint");
         }
-        url
+        (url, index)
     }
 
     /// Clear the failure streak for the active endpoint after a good response.
@@ -331,7 +345,7 @@ impl RpcClient {
         P: Serialize,
         R: serde::de::DeserializeOwned,
     {
-        let url = self.select_endpoint();
+        let (url, endpoint_index) = self.select_endpoint();
         let req = JsonRpcRequest {
             jsonrpc: "2.0",
             id,
@@ -339,7 +353,13 @@ impl RpcClient {
             params,
         };
 
+        // Timed regardless of outcome: a provider that's getting slower but
+        // not yet erroring is exactly what this metric exists to catch
+        // (issue #294).
+        let started = Instant::now();
         let result = self.execute(&url, &req, context).await;
+        metrics::record_rpc_call_duration(context, endpoint_index, started.elapsed().as_secs_f64());
+
         match &result {
             Ok(_) => self.record_success(),
             Err(_) => self.record_failure(),
@@ -368,9 +388,11 @@ impl RpcClient {
         // A non-2xx response (rate limit, 5xx) is an endpoint failure, not a
         // decode failure — surface it as such so failover can react.
         if !resp.status().is_success() {
+            let status = resp.status();
+            metrics::record_rpc_error(context, classify_http_status(status));
             return Err(TridentError::rpc(anyhow::anyhow!(
                 "{context}: endpoint {url} returned HTTP {}",
-                resp.status()
+                status
             )));
         }
 
@@ -380,6 +402,15 @@ impl RpcClient {
             .map_err(|e| rpc_transport_error(e, context))?;
 
         if let Some(err) = body.error {
+            // The RPC has no dedicated error code for an out-of-range cursor
+            // (issue #294 asks it be distinguishable from other JSON-RPC
+            // errors); its message is the only signal available.
+            let error_type = if err.message.to_lowercase().contains("cursor") {
+                "invalid_cursor"
+            } else {
+                "rpc_error"
+            };
+            metrics::record_rpc_error(context, error_type);
             return Err(TridentError::rpc(anyhow::anyhow!(
                 "{context}: RPC error {}: {}",
                 err.code,
@@ -387,8 +418,10 @@ impl RpcClient {
             )));
         }
 
-        body.result
-            .ok_or_else(|| TridentError::rpc(anyhow::anyhow!("{context}: empty result")))
+        body.result.ok_or_else(|| {
+            metrics::record_rpc_error(context, "empty_result");
+            TridentError::rpc(anyhow::anyhow!("{context}: empty result"))
+        })
     }
 
     /// Fetch the ledger hash for a given sequence number via `getLedgers`.
