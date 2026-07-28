@@ -614,8 +614,8 @@ jobs:
         run: |
           echo "Waiting for friendbot to start funding accounts..."
           for i in $(seq 1 60); do
-            status=$(curl -sS -o /dev/null -w '%{http_code}' "http://localhost:8000/friendbot")
-            if [ "$status" != "000" ]; then
+            status=$(curl -sS -o /dev/null -w '%{http_code}' "http://localhost:8000/friendbot?addr=GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF")
+            if [ "$status" = "200" ] || [ "$status" = "400" ]; then
               echo "Friendbot is ready (status $status)."
               exit 0
             fi
@@ -634,8 +634,22 @@ jobs:
             --network-passphrase "$LOCAL_NETWORK_PASSPHRASE" \
             || true
 
-          stellar keys generate admin --network local --fund
-          stellar keys generate recipient --network local --fund
+          fund_with_retry() {
+            local key_name="$1"
+            stellar keys generate "$key_name" --network local
+            for i in $(seq 1 30); do
+              if stellar keys fund "$key_name" --network local; then
+                return 0
+              fi
+              echo "Funding $key_name failed (attempt $i/30), retrying..." >&2
+              sleep 2
+            done
+            echo "Failed to fund $key_name after retries." >&2
+            return 1
+          }
+
+          fund_with_retry admin
+          fund_with_retry recipient
           ADMIN_ADDR=$(stellar keys address admin)
           RECIPIENT_ADDR=$(stellar keys address recipient)
 
