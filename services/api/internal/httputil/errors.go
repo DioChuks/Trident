@@ -75,6 +75,8 @@ func GRPCToHTTP(err error) (int, ErrorCode) {
 		return http.StatusBadRequest, INVALID_ARGUMENT
 	case codes.Unauthenticated:
 		return http.StatusUnauthorized, UNAUTHORIZED
+	case codes.Unavailable:
+		return http.StatusServiceUnavailable, UNAVAILABLE
 	case codes.ResourceExhausted:
 		return http.StatusTooManyRequests, RATE_LIMITED
 	case codes.DeadlineExceeded:

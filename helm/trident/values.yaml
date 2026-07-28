@@ -135,6 +135,9 @@ goApi:
     # Stricter than liveness — pod is removed from rotation faster
     failureThreshold: 1
     timeoutSeconds: 2
+  # Grace period must be >= the bounded shutdown window in main.go so SIGTERM
+  # drains in-flight requests before K8s force-kills the pod (issue #233).
+  terminationGracePeriodSeconds: 30
   resources:
     requests:
       cpu: "100m"
