@@ -16,14 +16,30 @@ spec:
         {{- include "trident.selectorLabels" (dict "root" . "component" "go-api") | nindent 8 }}
     spec:
       {{- include "trident.imagePullSecrets" . | nindent 6 }}
+      securityContext:
+        {{- include "trident.podSecurityContext" (dict "uid" .Values.goApi.securityContextUid) | nindent 8 }}
+      {{- if .Values.goApi.topologySpreadConstraints.enabled }}
+      topologySpreadConstraints:
+        - maxSkew: {{ .Values.goApi.topologySpreadConstraints.maxSkew }}
+          topologyKey: {{ .Values.goApi.topologySpreadConstraints.topologyKey }}
+          whenUnsatisfiable: {{ .Values.goApi.topologySpreadConstraints.whenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "trident.selectorLabels" (dict "root" . "component" "go-api") | nindent 14 }}
+      {{- end }}
       containers:
         - name: go-api
           image: "{{ .Values.goApi.image.repository }}:{{ .Values.goApi.image.tag }}"
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          securityContext:
+            {{- include "trident.containerSecurityContext" . | nindent 12 }}
           ports:
             - name: http
               containerPort: {{ .Values.goApi.service.port }}
               protocol: TCP
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
           env:
             - name: DATABASE_URL
               valueFrom:
@@ -50,6 +66,9 @@ spec:
             {{- toYaml .Values.goApi.readinessProbe | nindent 12 }}
           resources:
             {{- toYaml .Values.goApi.resources | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
       {{- with .Values.goApi.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -79,3 +98,18 @@ spec:
       port: {{ .Values.goApi.service.port }}
       targetPort: http
       protocol: TCP
+{{- if .Values.goApi.podDisruptionBudget.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "trident.fullname" . }}-go-api
+  labels:
+    {{- include "trident.labels" . | nindent 4 }}
+    app.kubernetes.io/component: go-api
+spec:
+  minAvailable: {{ .Values.goApi.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "trident.selectorLabels" (dict "root" . "component" "go-api") | nindent 6 }}
+{{- end }}

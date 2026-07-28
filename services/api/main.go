@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
 	"strconv"
 	"syscall"
 	"time"
@@ -35,6 +36,21 @@ import (
 const contractStatsRollupRefreshInterval = 60 * time.Second
 
 const defaultDBPoolSize = 5
+
+// connErrRegexp matches a userinfo-bearing connection URI (scheme://user:pass@host)
+// so DB/Redis connection errors — which some drivers embed the DSN in — never
+// leak the credential portion to logs (issue #305).
+var connErrRegexp = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.-]*)://[^@\s]+@`)
+
+// redactConnErr strips any embedded userinfo from a connection error's
+// message before logging it. Safe to call on any error, not just ones that
+// actually embed a DSN — a no-op when the pattern doesn't match.
+func redactConnErr(err error) string {
+	if err == nil {
+		return ""
+	}
+	return connErrRegexp.ReplaceAllString(err.Error(), "${1}://[redacted]@")
+}
 
 func initTracer(ctx context.Context) func() {
 	endpoint := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
@@ -104,7 +120,7 @@ func main() {
 		p, err := newDBPool(ctx, dsn, dbPoolSizeFromEnv())
 		cancel()
 		if err != nil {
-			slog.Warn("could not connect to database; DB-backed endpoints will return 503", "err", err)
+			slog.Warn("could not connect to database; DB-backed endpoints will return 503", "err", redactConnErr(err))
 		} else {
 			pool = p
 			defer pool.Close()
@@ -129,7 +145,7 @@ func main() {
 	}
 	redisOpts, err := redis.ParseURL(redisURL)
 	if err != nil {
-		slog.Error("invalid REDIS_URL", "err", err)
+		slog.Error("invalid REDIS_URL", "err", redactConnErr(err))
 		os.Exit(1)
 	}
 	redisClient := redis.NewClient(redisOpts)
