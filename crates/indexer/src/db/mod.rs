@@ -37,7 +37,8 @@ const EVENT_NS: Uuid = Uuid::NAMESPACE_DNS;
 
 /// Derive a deterministic UUID for an event from its natural key.
 /// Using the same inputs will always produce the same UUID, so duplicate
-/// events produce the same `id` and `ON CONFLICT (id) DO NOTHING` fires.
+/// events produce the same (ledger_sequence, id) pair and `ON CONFLICT
+/// (ledger_sequence, id) DO NOTHING` fires.
 fn event_uuid(contract_id: &str, ledger_sequence: u64, event_index: u32) -> Uuid {
     let key = format!("{contract_id}:{ledger_sequence}:{event_index}");
     Uuid::new_v5(&EVENT_NS, key.as_bytes())
@@ -158,8 +159,15 @@ impl EventColumns {
 /// Insert a batch of events in a single statement (issue #199).
 ///
 /// One round-trip per batch instead of one per row. Duplicate handling is
-/// unchanged: the deterministic UUIDv5 primary key plus `ON CONFLICT (id) DO
-/// NOTHING` means a replayed page inserts nothing new.
+/// unchanged in spirit: the deterministic UUIDv5 id plus `ON CONFLICT
+/// (ledger_sequence, id) DO NOTHING` means a replayed page inserts nothing
+/// new. The target is the full (ledger_sequence, id) pair, not just id, since
+/// migration 0017 made soroban_events RANGE-partitioned by ledger_sequence —
+/// PostgreSQL requires every unique constraint on a partitioned table to
+/// include the partition key, so a single-column PK on id alone no longer
+/// exists to match against. ledger_sequence is itself part of the input
+/// event_uuid() derives id from, so a replayed page always reproduces the
+/// same (ledger_sequence, id) pair — the idempotency guarantee is unchanged.
 pub async fn insert_events_batch<'e, E>(
     executor: E,
     events: &[SorobanEvent],
@@ -182,7 +190,7 @@ where
             $1::uuid[], $2::text[], $3::bigint[], $4::timestamptz[], $5::text[],
             $6::int[], $7::text[], $8::jsonb[], $9::jsonb[]
         )
-        ON CONFLICT (id) DO NOTHING
+        ON CONFLICT (ledger_sequence, id) DO NOTHING
         "#,
     )
     .bind(&cols.ids)
@@ -436,8 +444,12 @@ pub async fn commit_page(pool: &PgPool, commit: PageCommit<'_>) -> Result<(), Tr
         insert_outbox_batch(&mut *tx, chunk).await?;
     }
 
-    // Projection rows are foreign-keyed to soroban_events, so they must follow
-    // the event insert inside the same transaction.
+    // token_events.event_id logically references soroban_events(id) (the DB-level
+    // FK was dropped in migration 0017 — soroban_events is partitioned, so a
+    // single-column UNIQUE (id) can't be enforced globally). Referential
+    // integrity is instead upheld here: projection rows must follow the event
+    // insert inside the same transaction, so a token_events row can never exist
+    // without its corresponding soroban_events row already committed.
     for chunk in commit.token_events.chunks(batch_size) {
         insert_token_events_batch(&mut *tx, chunk).await?;
     }
