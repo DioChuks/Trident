@@ -99,7 +99,7 @@ func TestStream_SlowConsumerNeverReadingIsDisconnected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	req := "GET /stream?contractId=" + contractID + " HTTP/1.1\r\nHost: " + addr + "\r\nConnection: keep-alive\r\n\r\n"
 	if _, err := conn.Write([]byte(req)); err != nil {

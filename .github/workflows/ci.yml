@@ -610,6 +610,21 @@ jobs:
           docker logs stellar-quickstart || true
           exit 1
 
+      - name: Wait for friendbot to become available
+        run: |
+          echo "Waiting for friendbot to start funding accounts..."
+          for i in $(seq 1 60); do
+            status=$(curl -sS -o /dev/null -w '%{http_code}' "http://localhost:8000/friendbot")
+            if [ "$status" != "000" ]; then
+              echo "Friendbot is ready (status $status)."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Friendbot did not become ready in time." >&2
+          docker logs stellar-quickstart || true
+          exit 1
+
       - name: Deploy and invoke the reference token contract
         id: deploy
         run: |

@@ -76,7 +76,10 @@ func Stream(rdb streamRedisClient) http.HandlerFunc {
 			msgs, lookupErr := rdb.XRevRangeN(r.Context(), eventStreamKey, lastEventID, lastEventID, 1).Result()
 			if lookupErr != nil || len(msgs) == 0 {
 				// Emit a gap event so the client knows data was lost.
-				fmt.Fprint(w, eventStreamGapEvent)
+				if _, writeErr := fmt.Fprint(w, eventStreamGapEvent); writeErr != nil {
+					slog.Warn("sse: write failed, disconnecting slow consumer", "contractId", contractID, "err", writeErr)
+					return
+				}
 				flusher.Flush()
 
 				oldest, err := earliestStreamID(r.Context(), rdb)
