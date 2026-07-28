@@ -60,7 +60,7 @@ func InternalStatus() http.HandlerFunc {
 			return
 		}
 		providedKey := r.Header.Get("X-Internal-Key")
-		if providedKey != expectedKey {
+		if !validAdminKey(expectedKey, providedKey) {
 			httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "invalid X-Internal-Key")
 			return
 		}

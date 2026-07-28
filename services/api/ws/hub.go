@@ -71,19 +71,6 @@ func NewHub() *Hub {
 	}
 }
 
-// ShutdownAll closes every active subscriber so in-flight SSE/WS streams
-// terminate cleanly instead of being dropped by a TCP RST. It takes the write
-// lock so concurrent unregister calls do not double-close channels.
-func (h *Hub) ShutdownAll() {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	for s := range h.clients {
-		s.shutdown()
-	}
-	h.clients = make(map[subscriber]struct{})
-}
-
 // register adds s to the hub's active set. Safe to call concurrently.
 func (h *Hub) register(s subscriber) {
 	h.mu.Lock()
@@ -149,8 +136,10 @@ func (h *Hub) ClientCount() int {
 }
 
 // ShutdownAll closes all active client connections by calling shutdown on each
-// subscriber. This is called during graceful shutdown to ensure clients receive
-// a clean close instead of a TCP RST.
+// subscriber, so in-flight SSE/WS streams terminate cleanly instead of being
+// dropped by a TCP RST. This is called during graceful shutdown to ensure
+// clients receive a clean close. Takes the write lock so concurrent
+// register/unregister calls do not race on the client map.
 func (h *Hub) ShutdownAll() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
