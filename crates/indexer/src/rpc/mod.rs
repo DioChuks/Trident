@@ -119,6 +119,25 @@ struct GetTransactionParams<'a> {
     hash: &'a str,
 }
 
+#[derive(Serialize)]
+struct GetLedgerEntriesParams<'a> {
+    keys: &'a [String],
+}
+
+#[derive(Deserialize)]
+struct GetLedgerEntriesResult {
+    entries: Option<Vec<LedgerEntryResult>>,
+}
+
+/// One entry returned by `getLedgerEntries` (issue #260 / #270). `key` and
+/// `xdr` are base64-encoded `LedgerKey` / `LedgerEntryData` XDR respectively;
+/// decoding them is owned by the caller (`crate::spec`, `crate::storage`).
+#[derive(Debug, Deserialize)]
+pub struct LedgerEntryResult {
+    pub key: String,
+    pub xdr: String,
+}
+
 /// Result of the Soroban RPC `getTransaction` call (issue #266).
 ///
 /// `envelope_xdr` / `result_xdr` are only present when `status` is not
@@ -399,6 +418,24 @@ impl RpcClient {
         let params = GetTransactionParams { hash };
         self.call("getTransaction", 3, params, "getTransaction")
             .await
+    }
+
+    /// Fetch a batch of ledger entries (contract instance, contract code, or
+    /// contract data) via `getLedgerEntries` (issues #260, #270). Keys not
+    /// present on-chain (e.g. never written, or archived) are simply absent
+    /// from the returned list rather than erroring.
+    pub async fn get_ledger_entries(
+        &self,
+        keys: &[String],
+    ) -> Result<Vec<LedgerEntryResult>, TridentError> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let params = GetLedgerEntriesParams { keys };
+        let result: GetLedgerEntriesResult = self
+            .call("getLedgerEntries", 5, params, "getLedgerEntries")
+            .await?;
+        Ok(result.entries.unwrap_or_default())
     }
 }
 

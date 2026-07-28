@@ -16,6 +16,8 @@ mod parser;
 mod poll;
 mod redis_stream;
 mod rpc;
+mod spec;
+mod storage;
 mod streamer;
 
 fn init_tracer() -> Option<opentelemetry_sdk::trace::Tracer> {
