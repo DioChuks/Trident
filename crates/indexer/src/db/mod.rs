@@ -234,6 +234,8 @@ where
     let mut admin_addresses = Vec::with_capacity(projections.len());
     let mut amounts = Vec::with_capacity(projections.len());
     let mut expiration_ledgers = Vec::with_capacity(projections.len());
+    let mut asset_codes = Vec::with_capacity(projections.len());
+    let mut asset_issuers = Vec::with_capacity(projections.len());
     let mut ledger_sequences = Vec::with_capacity(projections.len());
     let mut ledger_timestamps = Vec::with_capacity(projections.len());
     let mut transaction_hashes = Vec::with_capacity(projections.len());
@@ -259,6 +261,8 @@ where
         admin_addresses.push(token.admin.clone());
         amounts.push(token.amount.clone());
         expiration_ledgers.push(token.expiration_ledger);
+        asset_codes.push(token.asset_code.clone());
+        asset_issuers.push(token.asset_issuer.clone());
         ledger_sequences.push(event.ledger_sequence as i64);
         ledger_timestamps.push(ledger_ts);
         transaction_hashes.push(event.transaction_hash.clone());
@@ -270,11 +274,13 @@ where
         INSERT INTO token_events
             (event_id, contract_id, event_type, from_address, to_address,
              spender_address, admin_address, amount, expiration_ledger,
+             asset_code, asset_issuer,
              ledger_sequence, ledger_timestamp, transaction_hash, event_index)
         SELECT * FROM UNNEST(
             $1::uuid[], $2::text[], $3::text[], $4::text[], $5::text[],
             $6::text[], $7::text[], $8::text[], $9::bigint[],
-            $10::bigint[], $11::timestamptz[], $12::text[], $13::int[]
+            $10::text[], $11::text[],
+            $12::bigint[], $13::timestamptz[], $14::text[], $15::int[]
         )
         ON CONFLICT (event_id) DO NOTHING
         "#,
@@ -288,6 +294,8 @@ where
     .bind(&admin_addresses)
     .bind(&amounts)
     .bind(&expiration_ledgers)
+    .bind(&asset_codes)
+    .bind(&asset_issuers)
     .bind(&ledger_sequences)
     .bind(&ledger_timestamps)
     .bind(&transaction_hashes)
@@ -907,7 +915,7 @@ mod tests {
         // Not yet resolved: absent from the fresh set.
         let fresh = fresh_token_metadata_contract_ids(
             &pool,
-            &[contract_id.clone()],
+            std::slice::from_ref(&contract_id),
             network,
             Utc::now() - chrono::Duration::days(1),
         )
@@ -943,7 +951,7 @@ mod tests {
         // Fresh (updated within the last day) after resolution.
         let fresh = fresh_token_metadata_contract_ids(
             &pool,
-            &[contract_id.clone()],
+            std::slice::from_ref(&contract_id),
             network,
             Utc::now() - chrono::Duration::days(1),
         )

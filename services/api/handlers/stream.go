@@ -17,6 +17,12 @@ import (
 const (
 	eventStreamKey = "trident:events"
 	streamReadWait = time.Second
+
+	// sseWriteDeadline bounds a single SSE write. A stalled client (full TCP
+	// send buffer) must not block this connection's goroutine forever
+	// (issue #224); the deadline turns a stuck socket into a write error so
+	// the handler returns and cleans up instead of leaking.
+	sseWriteDeadline = 10 * time.Second
 )
 
 type streamRedisClient interface {
@@ -106,10 +112,7 @@ func Stream(rdb streamRedisClient) http.HandlerFunc {
 		h.Set("Cache-Control", "no-cache")
 		h.Set("X-Accel-Buffering", "no")
 		h.Set("Connection", "keep-alive")
-		if err := http.NewResponseController(w).SetWriteDeadline(time.Time{}); err != nil &&
-			!errors.Is(err, http.ErrNotSupported) {
-			slog.Warn("sse: failed to disable response write deadline", "err", err)
-		}
+		rc := http.NewResponseController(w)
 		w.WriteHeader(http.StatusOK)
 		flusher.Flush()
 
@@ -156,8 +159,14 @@ func Stream(rdb streamRedisClient) http.HandlerFunc {
 						continue
 					}
 
+					if err := rc.SetWriteDeadline(time.Now().Add(sseWriteDeadline)); err != nil &&
+						!errors.Is(err, http.ErrNotSupported) {
+						slog.Warn("sse: failed to set write deadline", "err", err)
+					}
 					// Emit SSE id: field so browsers auto-send Last-Event-ID on reconnect.
 					if _, writeErr := fmt.Fprintf(w, "id: %s\ndata: %s\n\n", msg.ID, payload); writeErr != nil {
+						metricSSESlowConsumerDisconnects.Add(1)
+						slog.Warn("sse: write failed, disconnecting slow consumer", "contractId", contractID, "err", writeErr)
 						return
 					}
 					flusher.Flush()
