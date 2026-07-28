@@ -17,7 +17,7 @@
 //!   between the commit and the publish cannot drop an event.
 
 use std::collections::HashSet;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sqlx::PgPool;
 use tokio_retry::{strategy::ExponentialBackoff, Retry};
@@ -32,6 +32,7 @@ use crate::{
     parser::Parser,
     poll::{AdaptivePoll, AdaptivePollConfig},
     rpc::{filters::build_event_filters, FilterPlan, RpcClient, RpcHttpSettings},
+    token_metadata,
 };
 /// How often (in poll loop iterations) we re-query `indexed_contracts`.
 /// At the default 5 s poll interval this is ≈ 60 s — matches the env-var default.
@@ -205,6 +206,13 @@ impl Streamer {
             let interval = self.adaptive_poll.next_interval(lag);
             metrics::set_effective_poll_interval(interval.as_millis() as u64);
 
+            // Stamp the heartbeat after every cycle — even failed ones — so the
+            // gauge advances as long as the poll loop is alive (#218). A dead-man's
+            // switch alert fires when `time() - gauge > threshold`.
+            if let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) {
+                metrics::set_heartbeat_timestamp(now.as_secs_f64());
+            }
+
             // Sleep until the next poll interval, waking immediately on shutdown.
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {}
@@ -270,6 +278,74 @@ impl Streamer {
             Err(e) => {
                 tracing::warn!(tx_hash, error = %e, "Failed to decode invocation metrics");
                 None
+            }
+        }
+    }
+
+    /// Resolve and cache SEP-41 token metadata for every distinct contract
+    /// among `token_projections` whose `token_metadata` row is missing or
+    /// older than `token_metadata_refresh_interval` (issue #263).
+    ///
+    /// Best-effort: an RPC/simulation failure for one contract is logged and
+    /// skipped, leaving its row (if any) untouched so the next page carrying
+    /// activity for that contract retries it — the poll cycle itself never
+    /// fails because of this.
+    async fn resolve_stale_token_metadata(&self, token_projections: &[db::TokenProjection<'_>]) {
+        if token_projections.is_empty() {
+            return;
+        }
+
+        let mut contract_ids: Vec<String> = token_projections
+            .iter()
+            .map(|p| p.event.contract_id.clone())
+            .collect();
+        contract_ids.sort_unstable();
+        contract_ids.dedup();
+
+        let cutoff = chrono::Utc::now()
+            - chrono::Duration::from_std(self.config.token_metadata_refresh_interval)
+                .unwrap_or(chrono::Duration::zero());
+        let fresh = match db::fresh_token_metadata_contract_ids(
+            &self.db,
+            &contract_ids,
+            &self.config.network,
+            cutoff,
+        )
+        .await
+        {
+            Ok(fresh) => fresh,
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to load fresh token_metadata contract ids; skipping this cycle's resolution");
+                return;
+            }
+        };
+
+        for contract_id in contract_ids {
+            if fresh.contains(&contract_id) {
+                continue;
+            }
+
+            let resolution = match token_metadata::resolve(&self.rpc, &contract_id).await {
+                Ok(resolution) => resolution,
+                Err(e) => {
+                    tracing::warn!(
+                        contract_id = %contract_id,
+                        error = %e,
+                        "Failed to resolve token metadata; will retry on a future poll"
+                    );
+                    continue;
+                }
+            };
+
+            if let Err(e) =
+                db::upsert_token_metadata(&self.db, &contract_id, &self.config.network, &resolution)
+                    .await
+            {
+                tracing::warn!(
+                    contract_id = %contract_id,
+                    error = %e,
+                    "Failed to cache token metadata"
+                );
             }
         }
     }
@@ -529,6 +605,15 @@ impl Streamer {
                 *cursor = seq;
             }
 
+            // Resolve + cache SEP-41 token metadata for any contract seen in
+            // this page's token events whose cached row is missing or stale
+            // (issue #263). Best-effort, like `fetch_invocation_metrics`
+            // above: a resolution failure is logged and skipped rather than
+            // failing the poll cycle.
+            self.resolve_stale_token_metadata(&token_projections)
+                .instrument(tracing::info_span!("resolve_token_metadata"))
+                .await;
+
             // Delivery is not done here. The commit above wrote an outbox row
             // per event, and `redis_stream::relay` publishes them (issue #200).
             // Publishing inline would still lose events: a crash between the
@@ -779,6 +864,9 @@ mod tests {
             alert_webhook_url: None,
             alert_lag_threshold: 200,
             alert_cooldown_minutes: 30,
+            health_port: 0,
+            statement_timeout_ms: 30_000,
+            idle_in_transaction_timeout_ms: 60_000,
         };
 
         Streamer::new(config, db).await.unwrap()

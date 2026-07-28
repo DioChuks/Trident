@@ -1,4 +1,7 @@
+use std::net::SocketAddr;
+
 use opentelemetry_otlp::WithExportConfig;
+use sqlx::postgres::PgPoolOptions;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -7,12 +10,14 @@ use tracing_subscriber::EnvFilter;
 mod alerting;
 mod config;
 mod db;
+mod health;
 mod metrics;
 mod parser;
 mod poll;
 mod redis_stream;
 mod rpc;
 mod streamer;
+mod token_metadata;
 
 fn init_tracer() -> Option<opentelemetry_sdk::trace::Tracer> {
     let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok()?;
@@ -64,12 +69,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     metrics::install(cfg.metrics_port)?;
 
-    let db_pool = db::connect_pool(&cfg.database_url, cfg.db_pool_size).await?;
-    tracing::info!(pool_size = cfg.db_pool_size, "Database connected via pool");
+    // Set statement_timeout and idle_in_transaction_session_timeout on every
+    // new connection so a pathological query or leaked transaction cannot hold
+    // the pool indefinitely (#249).
+    let stmt_timeout = cfg.statement_timeout_ms;
+    let idle_timeout = cfg.idle_in_transaction_timeout_ms;
+    let db_pool = PgPoolOptions::new()
+        .max_connections(cfg.db_pool_size)
+        .after_connect(move |conn, _| {
+            Box::pin(async move {
+                sqlx::query(&format!("SET statement_timeout = '{stmt_timeout}ms'"))
+                    .execute(&mut *conn)
+                    .await?;
+                sqlx::query(&format!(
+                    "SET idle_in_transaction_session_timeout = '{idle_timeout}ms'"
+                ))
+                .execute(&mut *conn)
+                .await?;
+                Ok(())
+            })
+        })
+        .connect(&cfg.database_url)
+        .await?;
+    tracing::info!(
+        pool_size = cfg.db_pool_size,
+        statement_timeout_ms = stmt_timeout,
+        idle_in_transaction_timeout_ms = idle_timeout,
+        "Database connected with timeout defaults"
+    );
 
     let redis_client = redis::Client::open(cfg.redis_url.as_str())?;
     let redis_conn = redis_client.get_multiplexed_async_connection().await?;
     tracing::info!("Redis connected");
+
+    // Spawn health and readiness endpoints on HEALTH_PORT (default 8080, separate
+    // from the Prometheus /metrics listener on METRICS_PORT) (#206).
+    let health_addr: SocketAddr = ([0, 0, 0, 0], cfg.health_port).into();
+    let health_db = db_pool.clone();
+    let health_redis_url = cfg.redis_url.clone();
+    tokio::spawn(async move {
+        health::serve(health_addr, health_db, health_redis_url).await;
+    });
 
     let shutdown = CancellationToken::new();
 

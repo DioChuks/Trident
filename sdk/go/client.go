@@ -108,8 +108,8 @@ func (c *Client) GetEventByID(ctx context.Context, id string, opts ...RequestOpt
 
 // doGet issues a GET request to reqURL, retrying according to the effective
 // retry policy (client-level config merged with any per-call opts). Returns
-// the response body on a 200 OK, or a typed error (*APIError / *RequestError)
-// once retries are exhausted or the status is non-retryable.
+// the response body on a 200 OK, or a typed error (*TridentApiError /
+// *RequestError) once retries are exhausted or the status is non-retryable.
 func (c *Client) doGet(ctx context.Context, reqURL string, opts []RequestOption) ([]byte, error) {
 	retryCfg := c.effectiveRetryConfig(opts)
 	maxAttempts := 1
@@ -157,7 +157,9 @@ func (c *Client) doGet(ctx context.Context, reqURL string, opts []RequestOption)
 					continue
 				}
 			}
-			return nil, &APIError{StatusCode: resp.StatusCode, Body: string(bodyBytes), Attempts: attempt}
+			apiErr := parseApiError(resp.StatusCode, string(bodyBytes))
+			apiErr.Attempts = attempt
+			return nil, apiErr
 		}
 
 		bodyBytes, err := io.ReadAll(resp.Body)

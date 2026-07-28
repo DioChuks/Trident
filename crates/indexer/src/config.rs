@@ -49,9 +49,21 @@ pub struct Config {
     pub db_batch_size: usize,
     pub redis_stream_maxlen: u64,
     pub metrics_port: u16,
+    pub health_port: u16,
     pub alert_webhook_url: Option<String>,
     pub alert_lag_threshold: u64,
     pub alert_cooldown_minutes: u64,
+    /// statement_timeout for every DB connection (ms). Prevents runaway queries
+    /// from holding the pool indefinitely (#249).
+    pub statement_timeout_ms: u64,
+    /// idle_in_transaction_session_timeout (ms). Reclaims connections leaked by
+    /// open transactions (#249).
+    pub idle_in_transaction_timeout_ms: u64,
+    /// How long a cached `token_metadata` row is considered fresh before the
+    /// indexer re-simulates name()/symbol()/decimals() for that contract
+    /// (issue #263). Applies to both positive and negative (non-token)
+    /// results.
+    pub token_metadata_refresh_interval: Duration,
 }
 
 /// Default Postgres pool size for the indexer. It is a single writer with low
@@ -197,9 +209,31 @@ impl Config {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(9090),
+            health_port: std::env::var("HEALTH_PORT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(8080),
             alert_webhook_url,
             alert_lag_threshold,
             alert_cooldown_minutes,
+            statement_timeout_ms: parse_bounded_u64(
+                "DB_STATEMENT_TIMEOUT_MS",
+                30_000,
+                100,
+                3_600_000,
+            )?,
+            idle_in_transaction_timeout_ms: parse_bounded_u64(
+                "DB_IDLE_IN_TRANSACTION_TIMEOUT_MS",
+                10_000,
+                100,
+                3_600_000,
+            )?,
+            token_metadata_refresh_interval: Duration::from_secs(parse_bounded_u64(
+                "TOKEN_METADATA_REFRESH_INTERVAL_SECS",
+                86_400,
+                60,
+                2_592_000,
+            )?),
         })
     }
 }
@@ -719,6 +753,16 @@ mod tests {
         with_env(&vars, || {
             let err = Config::from_env().unwrap_err();
             assert!(err.to_string().contains("INDEX_TOPIC_FILTERS"));
+        });
+    }
+
+    #[test]
+    fn token_metadata_refresh_interval_defaults_to_24h() {
+        let vars = required_vars();
+        with_env(&vars, || {
+            env::remove_var("TOKEN_METADATA_REFRESH_INTERVAL_SECS");
+            let cfg = Config::from_env().unwrap();
+            assert_eq!(cfg.token_metadata_refresh_interval.as_secs(), 86_400);
         });
     }
 

@@ -130,12 +130,12 @@ func TestQueryEvents_GivesUpAfterMaxAttempts(t *testing.T) {
 		t.Fatal("expected error after exhausting retries, got nil")
 	}
 
-	apiErr, ok := err.(*APIError)
+	apiErr, ok := err.(*TridentApiError)
 	if !ok {
-		t.Fatalf("expected *APIError, got %T: %v", err, err)
+		t.Fatalf("expected *TridentApiError, got %T: %v", err, err)
 	}
-	if apiErr.StatusCode != http.StatusServiceUnavailable {
-		t.Errorf("expected status 503, got %d", apiErr.StatusCode)
+	if apiErr.Status != http.StatusServiceUnavailable {
+		t.Errorf("expected status 503, got %d", apiErr.Status)
 	}
 	if apiErr.Attempts != 3 {
 		t.Errorf("expected 3 attempts, got %d", apiErr.Attempts)
@@ -163,9 +163,9 @@ func TestQueryEvents_DoesNotRetryNonRetryableStatus(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
-	apiErr, ok := err.(*APIError)
+	apiErr, ok := err.(*TridentApiError)
 	if !ok {
-		t.Fatalf("expected *APIError, got %T", err)
+		t.Fatalf("expected *TridentApiError, got %T", err)
 	}
 	if apiErr.Attempts != 1 {
 		t.Errorf("expected 1 attempt for non-retryable status, got %d", apiErr.Attempts)
@@ -299,8 +299,8 @@ func TestComputeBackoff_ExponentialGrowthCappedAtMaxDelay(t *testing.T) {
 	}
 }
 
-func TestAPIError_ErrorMessageIncludesAttempts(t *testing.T) {
-	err := &APIError{StatusCode: 503, Body: "down", Attempts: 3}
+func TestTridentApiError_ErrorMessageIncludesAttempts(t *testing.T) {
+	err := &TridentApiError{Status: 503, Code: "INTERNAL", Message: "down", Attempts: 3}
 	msg := err.Error()
 	if want := strconv.Itoa(3); msg == "" || !contains(msg, want) {
 		t.Errorf("expected error message to mention attempts, got %q", msg)

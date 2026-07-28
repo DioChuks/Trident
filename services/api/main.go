@@ -27,7 +27,11 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.21.0"
 )
 
-const auditCleanupInterval = 6 * time.Hour
+// How often contract_stats_rollup is recomputed from soroban_events (issue
+// #257). Matches the Redis response cache TTL in handlers.ContractsStats, so
+// a rollup-backed response is never staler than the cache would already
+// allow it to be.
+const contractStatsRollupRefreshInterval = 60 * time.Second
 
 const defaultDBPoolSize = 5
 
@@ -113,6 +117,11 @@ func main() {
 		healthDB = pool
 	}
 
+	var schemaRegistryDB handlers.SchemaRegistryDB
+	if pool != nil {
+		schemaRegistryDB = pool
+	}
+
 	redisURL := os.Getenv("REDIS_URL")
 	if redisURL == "" {
 		redisURL = "redis://localhost:6379"
@@ -147,8 +156,19 @@ func main() {
 			pool, slog.Default(), 500*time.Millisecond, 100, 10000,
 		)
 		defer auditWriter.Close()
-		// Background cleanup: delete audit log entries older than 90 days.
-		go runAuditCleanup(ctx, pool)
+	}
+
+	// Start automated retention job (issue #245). Replaces the ad-hoc audit
+	// cleanup with a configurable per-table retention policy.
+	if pool != nil {
+		startRetentionJob(ctx, pool)
+	}
+
+	// Periodically recompute contract_stats_rollup from soroban_events so
+	// GET /v1/stats/contracts can read a small pre-aggregated table instead
+	// of a live GROUP BY on every cache miss (issue #257).
+	if pool != nil {
+		go runContractStatsRollupRefresh(ctx, pool)
 	}
 
 	adminCfg := handlers.AdminConfig{
@@ -157,6 +177,13 @@ func main() {
 	}
 	if adminURL := os.Getenv("PGBOUNCER_ADMIN_URL"); adminURL != "" {
 		adminCfg.StatsFunc = newPgbouncerStats(adminURL)
+	}
+
+	// Validate CORS allowlist at startup (issue #234).
+	allowedOrigins, err := middleware.ValidateAllowedOrigins()
+	if err != nil {
+		slog.Error("invalid CORS configuration", "err", err)
+		os.Exit(1)
 	}
 
 	// Shared tier cache so an admin tier change (PATCH /v1/api-keys/{id}) can
@@ -190,12 +217,19 @@ func main() {
 	mux.HandleFunc("GET /v1/events/stream", handlers.Stream(redisClient))
 	mux.HandleFunc("GET /v1/admin/db", handlers.AdminDB(adminCfg))
 	mux.HandleFunc("GET /v1/admin/keys/{id}/usage", handlers.AdminKeyUsage(adminCfg))
+	// Admin contract registration CRUD (issue #230)
+	contractCfg := handlers.ContractConfig{AdminKey: os.Getenv("ADMIN_API_KEY"), DB: pool}
+	mux.HandleFunc("POST /v1/admin/contracts", handlers.CreateContract(contractCfg))
+	mux.HandleFunc("GET /v1/admin/contracts", handlers.ListContracts(contractCfg))
+	mux.HandleFunc("DELETE /v1/admin/contracts/{id}", handlers.DeleteContract(contractCfg))
 	// API key management (admin-only via X-Admin-Key header)
 	mux.HandleFunc("POST /v1/api-keys", handlers.CreateAPIKey(apiKeyCfg))
 	mux.HandleFunc("GET /v1/api-keys", handlers.ListAPIKeys(apiKeyCfg))
 	mux.HandleFunc("PATCH /v1/api-keys/{id}", handlers.UpdateAPIKey(apiKeyCfg))
 	mux.HandleFunc("DELETE /v1/api-keys/{id}", handlers.DeleteAPIKey(apiKeyCfg))
 	mux.HandleFunc("GET /v1/stats/indexer", handlers.IndexerStats(healthDB))
+	mux.HandleFunc("GET /v1/contracts/{id}/events/schema", handlers.ContractEventSchemas(schemaRegistryDB))
+	mux.HandleFunc("GET /v1/contracts/{id}/metadata", handlers.TokenMetadata(healthDB))
 	mux.HandleFunc("GET /v1/stats/contracts", handlers.ContractsStats(pool, redisClient))
 	mux.HandleFunc("GET /v1/webhooks", listWebhooksHandler(webhookDB))
 	mux.HandleFunc("POST /v1/webhooks", createWebhookHandler(webhookDB))
@@ -203,6 +237,8 @@ func main() {
 	mux.HandleFunc("PATCH /v1/webhooks/{id}/pause", pauseWebhookHandler(webhookDB))
 	mux.HandleFunc("PATCH /v1/webhooks/{id}/resume", resumeWebhookHandler(webhookDB))
 	mux.HandleFunc("GET /v1/webhooks/{id}/deliveries", deliveriesWebhookHandler(webhookDB))
+	mux.HandleFunc("GET /v1/webhooks/{id}/dead-letters", deadLettersWebhookHandler(webhookDB))
+	mux.HandleFunc("POST /v1/webhooks/{id}/dead-letters/{deliveryId}/replay", replayDeadLetterHandler(webhookDB))
 	mux.HandleFunc("GET /metrics", handlers.MetricsHandler())
 	mux.HandleFunc("GET /internal/status", handlers.InternalStatus())
 	mux.Handle("/ws", middleware.WSConnectionLimit(ws.Handler(hub)))
@@ -229,7 +265,8 @@ func main() {
 		handler = middleware.AuditMiddleware(auditWriter)(handler)
 	}
 	handler = middleware.NewDBAuth(authDB)(handler)
-	handler = middleware.NewCORSFromEnv()(middleware.NewTimeoutFromEnv()(handler))
+	handler = middleware.NewCORSFromEnv(allowedOrigins)(middleware.NewTimeoutFromEnv()(handler))
+	handler = middleware.SecurityHeaders(true)(handler)
 	// RequestID + StructuredLogging are outermost so every response — including
 	// auth and rate-limit rejections — is assigned a request id, echoes it on
 	// X-Request-ID, and is captured in structured logs (issue #226). RequestID
@@ -241,6 +278,9 @@ func main() {
 	// never mounted on the public mux above (#299).
 	pprofSrv := profiling.Start()
 	defer profiling.Shutdown(pprofSrv)
+
+	// Grace period mirrors Helm terminationGracePeriodSeconds (default 30s).
+	const shutdownGrace = 30 * time.Second
 
 	server := &http.Server{
 		Addr:         fmt.Sprintf(":%s", port),
@@ -258,12 +298,20 @@ func main() {
 	}()
 
 	<-ctx.Done()
-	slog.Info("shutting down")
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	slog.Info("shutting down", "grace", shutdownGrace)
+
+	// Stop accepting new connections and begin draining in-flight requests.
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
 	defer cancel()
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		slog.Error("graceful shutdown failed", "err", err)
 	}
+
+	// After the HTTP server stops accepting requests, close active SSE/WS
+	// streams so connected clients receive a clean close instead of a TCP RST.
+	hub.ShutdownAll()
+
+	slog.Info("shutdown complete")
 }
 
 func newDBPool(ctx context.Context, dsn string, poolSize int32) (*pgxpool.Pool, error) {
@@ -294,36 +342,125 @@ func dbPoolSizeFromEnv() int32 {
 	return defaultDBPoolSize
 }
 
-func runAuditCleanup(ctx context.Context, pool *pgxpool.Pool) {
-	ticker := time.NewTicker(auditCleanupInterval)
-	defer ticker.Stop()
-
-	cleanup := func() {
-		cleanupCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+// runContractStatsRollupRefresh recomputes contract_stats_rollup on a fixed
+// interval until ctx is cancelled (issue #257). Runs once immediately so the
+// rollup is populated shortly after startup rather than only after the first
+// tick.
+func runContractStatsRollupRefresh(ctx context.Context, pool *pgxpool.Pool) {
+	refresh := func() {
+		refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
-		for {
-			tag, err := pool.Exec(cleanupCtx,
-				`DELETE FROM audit_log WHERE ts < NOW() - INTERVAL '90 days' AND ctid IN (
-					SELECT ctid FROM audit_log WHERE ts < NOW() - INTERVAL '90 days' LIMIT 1000
-				)`,
-			)
-			if err != nil {
-				slog.Warn("audit cleanup failed", "err", err)
-				return
-			}
-			if tag.RowsAffected() == 0 {
-				return
-			}
+		if err := handlers.RefreshContractStatsRollup(refreshCtx, pool); err != nil {
+			slog.Warn("contract stats rollup refresh failed", "err", err)
 		}
 	}
 
+	refresh()
+
+	ticker := time.NewTicker(contractStatsRollupRefreshInterval)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			cleanup()
 			return
 		case <-ticker.C:
-			cleanup()
+			refresh()
 		}
 	}
+}
+
+// retentionConfig holds per-table retention windows (in days).
+// Configured via env vars with sensible defaults.
+type retentionConfig struct {
+	AuditLogDays          int
+	ParseErrorsDays       int
+	WebhookDeliveriesDays int
+	SorobanEventsDays     int
+}
+
+func loadRetentionConfig() retentionConfig {
+	return retentionConfig{
+		AuditLogDays:          envInt("RETENTION_AUDIT_LOG_DAYS", 90),
+		ParseErrorsDays:       envInt("RETENTION_PARSE_ERRORS_DAYS", 30),
+		WebhookDeliveriesDays: envInt("RETENTION_WEBHOOK_DELIVERIES_DAYS", 30),
+		SorobanEventsDays:     envInt("RETENTION_SOROBAN_EVENTS_DAYS", 0), // 0 = disabled
+	}
+}
+
+func envInt(key string, defaultVal int) int {
+	if raw := os.Getenv(key); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n >= 0 {
+			return n
+		}
+	}
+	return defaultVal
+}
+
+// startRetentionJob runs a periodic retention cleanup loop (issue #245).
+// It replaces the ad-hoc audit cleanup with a configurable per-table policy.
+func startRetentionJob(ctx context.Context, pool *pgxpool.Pool) {
+	cfg := loadRetentionConfig()
+	interval := 6 * time.Hour
+
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		run := func() {
+			cleanupCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+			defer cancel()
+
+			tables := []struct {
+				name   string
+				days   int
+				query  string
+			}{
+				{"audit_log", cfg.AuditLogDays,
+					`DELETE FROM audit_log WHERE ts < NOW() - ($1 || ' days')::INTERVAL AND ctid IN (
+						SELECT ctid FROM audit_log WHERE ts < NOW() - ($1 || ' days')::INTERVAL LIMIT 1000
+					)`},
+				{"parse_errors", cfg.ParseErrorsDays,
+					`DELETE FROM parse_errors WHERE occurred_at < NOW() - ($1 || ' days')::INTERVAL AND ctid IN (
+						SELECT ctid FROM parse_errors WHERE occurred_at < NOW() - ($1 || ' days')::INTERVAL LIMIT 1000
+					)`},
+				{"webhook_deliveries", cfg.WebhookDeliveriesDays,
+					`DELETE FROM webhook_deliveries WHERE delivered_at < NOW() - ($1 || ' days')::INTERVAL AND ctid IN (
+						SELECT ctid FROM webhook_deliveries WHERE delivered_at < NOW() - ($1 || ' days')::INTERVAL LIMIT 1000
+					)`},
+				{"soroban_events", cfg.SorobanEventsDays,
+					`DELETE FROM soroban_events WHERE created_at < NOW() - ($1 || ' days')::INTERVAL AND ctid IN (
+						SELECT ctid FROM soroban_events WHERE created_at < NOW() - ($1 || ' days')::INTERVAL LIMIT 1000
+					)`},
+			}
+
+			for _, t := range tables {
+				if t.days <= 0 {
+					continue
+				}
+				for {
+					tag, err := pool.Exec(cleanupCtx, t.query, fmt.Sprintf("%d", t.days))
+					if err != nil {
+						slog.Warn("retention: cleanup failed", "table", t.name, "err", err)
+						break
+					}
+					if tag.RowsAffected() == 0 {
+						break
+					}
+				}
+			}
+		}
+
+		// Run once at startup, then on ticker.
+		run()
+
+		for {
+			select {
+			case <-ctx.Done():
+				run()
+				return
+			case <-ticker.C:
+				run()
+			}
+		}
+	}()
 }
