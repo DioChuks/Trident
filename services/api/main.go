@@ -230,7 +230,9 @@ func main() {
 	mux.HandleFunc("DELETE /v1/api-keys/{id}", handlers.DeleteAPIKey(apiKeyCfg))
 	mux.HandleFunc("GET /v1/stats/indexer", handlers.IndexerStats(healthDB))
 	mux.HandleFunc("GET /v1/contracts/{id}/events/schema", handlers.ContractEventSchemas(schemaRegistryDB))
-	mux.HandleFunc("GET /v1/contracts/{id}/metadata", handlers.TokenMetadata(healthDB))
+	mux.HandleFunc("GET /v1/contracts/{id}/spec", handlers.ContractSpec(schemaRegistryDB))
+	mux.HandleFunc("GET /v1/contracts/{id}/storage", handlers.ContractStorageLatest(schemaRegistryDB))
+	mux.HandleFunc("GET /v1/contracts/{id}/storage/history", handlers.ContractStorageHistory(schemaRegistryDB))
 	mux.HandleFunc("GET /v1/stats/contracts", handlers.ContractsStats(pool, redisClient))
 	// nil (untyped) when STELLAR_RPC_URL is unset, so CallContract's `rpc ==
 	// nil` check reports 503 rather than a typed-nil interface slipping

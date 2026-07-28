@@ -1,14 +1,10 @@
 [workspace]
 resolver = "2"
-members = [
-    "counter",
-    "token",
-    "nft",
-    "escrow",
-]
+members = ["token"]
 
-[workspace.dependencies]
-soroban-sdk = "=26.1.0"
+# Deliberately not a member of the root workspace (root Cargo.toml): Soroban
+# contracts build for wasm32-unknown-unknown with #![no_std] and their own
+# release profile, which does not belong alongside the indexer/api services.
 
 [profile.release]
 opt-level = "z"

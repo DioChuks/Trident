@@ -16,6 +16,8 @@ mod parser;
 mod poll;
 mod redis_stream;
 mod rpc;
+mod spec;
+mod storage;
 mod streamer;
 mod token_metadata;
 
