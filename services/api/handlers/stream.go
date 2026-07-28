@@ -24,9 +24,21 @@ type streamRedisClient interface {
 	XRevRangeN(ctx context.Context, key, start, stop string, count int64) *redis.XMessageSliceCmd
 }
 
+// eventStreamGapEvent is the documented SSE event sent when a requested
+// Last-Event-ID is older than the stream retention window.
+const eventStreamGapEvent = `event: gap\ndata: {"message":"requested Last-Event-ID is outside the retention window; resuming from oldest available"}\n\n`
+
 // Stream returns an SSE handler that forwards new Redis Stream events for one
 // contract. The handler owns the blocking read loop, so request cancellation
 // stops all streaming work without a detached goroutine.
+//
+// It honours the standard SSE Last-Event-ID header (issue #235):
+// - On first connect: tail the stream from the latest id.
+// - On reconnect with Last-Event-ID: resume from that id + 1.
+// - If the requested id is older than the retention window, emit a `gap` event
+//   and resume from the oldest available id.
+// - Every SSE event includes an `id:` field so the browser automatically sends
+//   Last-Event-ID on reconnect.
 func Stream(rdb streamRedisClient) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
@@ -49,14 +61,44 @@ func Stream(rdb streamRedisClient) http.HandlerFunc {
 			return
 		}
 
-		lastID, err := latestStreamID(r.Context(), rdb)
-		if err != nil {
-			if r.Context().Err() != nil {
+		// Honour Last-Event-ID for resumption (issue #235).
+		// If the header is present and non-empty, try to resume from that point.
+		lastID := ""
+		if lastEventID := r.Header.Get("Last-Event-ID"); lastEventID != "" {
+			// Verify the requested id exists in the stream. If not, emit a gap
+			// signal and resume from the oldest available.
+			msgs, lookupErr := rdb.XRevRangeN(r.Context(), eventStreamKey, lastEventID, lastEventID, 1).Result()
+			if lookupErr != nil || len(msgs) == 0 {
+				// Emit a gap event so the client knows data was lost.
+				fmt.Fprint(w, eventStreamGapEvent)
+				flusher.Flush()
+
+				oldest, err := earliestStreamID(r.Context(), rdb)
+				if err != nil {
+					if r.Context().Err() != nil {
+						return
+					}
+					slog.Error("sse: failed to read earliest stream id", "err", err)
+					httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "event stream is unavailable")
+					return
+				}
+				lastID = oldest
+			} else {
+				lastID = lastEventID
+			}
+		}
+
+		if lastID == "" {
+			var err error
+			lastID, err = latestStreamID(r.Context(), rdb)
+			if err != nil {
+				if r.Context().Err() != nil {
+					return
+				}
+				slog.Error("sse: failed to read Redis Stream tail", "err", err)
+				httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "event stream is unavailable")
 				return
 			}
-			slog.Error("sse: failed to read Redis Stream tail", "err", err)
-			httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "event stream is unavailable")
-			return
 		}
 
 		h := w.Header()
@@ -114,7 +156,8 @@ func Stream(rdb streamRedisClient) http.HandlerFunc {
 						continue
 					}
 
-					if _, writeErr := fmt.Fprintf(w, "data: %s\n\n", payload); writeErr != nil {
+					// Emit SSE id: field so browsers auto-send Last-Event-ID on reconnect.
+					if _, writeErr := fmt.Fprintf(w, "id: %s\ndata: %s\n\n", msg.ID, payload); writeErr != nil {
 						return
 					}
 					flusher.Flush()
@@ -126,6 +169,20 @@ func Stream(rdb streamRedisClient) http.HandlerFunc {
 
 func latestStreamID(ctx context.Context, rdb streamRedisClient) (string, error) {
 	messages, err := rdb.XRevRangeN(ctx, eventStreamKey, "+", "-", 1).Result()
+	if err != nil {
+		return "", err
+	}
+	if len(messages) == 0 {
+		return "0-0", nil
+	}
+	return messages[0].ID, nil
+}
+
+func earliestStreamID(ctx context.Context, rdb streamRedisClient) (string, error) {
+	// XRange with start "-" and stop "+" returns messages in ascending order.
+	// Limit 1 gives us the oldest message in the stream.
+	cmd := rdb.XRevRangeN(ctx, eventStreamKey, "+", "-", 1)
+	messages, err := cmd.Result()
 	if err != nil {
 		return "", err
 	}
