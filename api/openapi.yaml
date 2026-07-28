@@ -781,6 +781,46 @@ components:
           description: Timestamp of last successful poll
 
 
+    TokenMetadataResponse:
+      type: object
+      required:
+        - contract_id
+        - network
+        - is_token
+      properties:
+        contract_id:
+          type: string
+          pattern: "^C[A-Z2-7]{55}$"
+          description: Soroban contract address
+        network:
+          type: string
+          enum: [testnet, mainnet]
+          description: Network queried
+        is_token:
+          type: boolean
+          description: >-
+            True when the contract was resolved and implements the SEP-41
+            read interface. False for both "not yet resolved" and "resolved,
+            not a token".
+        name:
+          type: string
+          nullable: true
+          description: Token name, from name(). Null unless is_token is true.
+        symbol:
+          type: string
+          nullable: true
+          description: Token symbol, from symbol(). Null unless is_token is true.
+        decimals:
+          type: integer
+          format: int32
+          nullable: true
+          description: Token decimals, from decimals(). Null unless is_token is true.
+        resolved_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: When this contract was last resolved. Null if never resolved.
+
     ContractEventSchemaResponse:
       type: object
       required:

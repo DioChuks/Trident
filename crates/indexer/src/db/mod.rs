@@ -786,6 +786,80 @@ pub async fn insert_parse_error(
     Ok(())
 }
 
+/// Contracts among `contract_ids` whose `token_metadata` row is still fresh
+/// (resolved or refreshed since `cutoff`), for either a positive or a cached
+/// negative ("not a token") result (issue #263). Contracts absent from this
+/// set need a fresh resolution attempt.
+pub async fn fresh_token_metadata_contract_ids(
+    pool: &PgPool,
+    contract_ids: &[String],
+    network: &str,
+    cutoff: DateTime<Utc>,
+) -> Result<HashSet<String>, TridentError> {
+    if contract_ids.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT contract_id FROM token_metadata
+         WHERE contract_id = ANY($1) AND network = $2 AND updated_at > $3",
+    )
+    .bind(contract_ids)
+    .bind(network)
+    .bind(cutoff)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| {
+        TridentError::storage(anyhow::Error::new(e).context("fresh_token_metadata_contract_ids"))
+    })?;
+
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+/// Cache a resolved (or negative) token metadata result for one contract
+/// (issue #263). Re-resolving an already-cached contract refreshes the row in
+/// place rather than duplicating it.
+pub async fn upsert_token_metadata(
+    pool: &PgPool,
+    contract_id: &str,
+    network: &str,
+    resolution: &crate::token_metadata::TokenMetadataResolution,
+) -> Result<(), TridentError> {
+    let (name, symbol, decimals, is_token) = match resolution {
+        crate::token_metadata::TokenMetadataResolution::Token(meta) => (
+            Some(meta.name.as_str()),
+            Some(meta.symbol.as_str()),
+            Some(meta.decimals as i32),
+            true,
+        ),
+        crate::token_metadata::TokenMetadataResolution::NotAToken => (None, None, None, false),
+    };
+
+    sqlx::query(
+        r#"
+        INSERT INTO token_metadata (contract_id, network, name, symbol, decimals, is_token)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        ON CONFLICT (contract_id, network) DO UPDATE SET
+            name       = EXCLUDED.name,
+            symbol     = EXCLUDED.symbol,
+            decimals   = EXCLUDED.decimals,
+            is_token   = EXCLUDED.is_token,
+            updated_at = NOW()
+        "#,
+    )
+    .bind(contract_id)
+    .bind(network)
+    .bind(name)
+    .bind(symbol)
+    .bind(decimals)
+    .bind(is_token)
+    .execute(pool)
+    .await
+    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("upsert_token_metadata")))?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -952,6 +1026,114 @@ mod tests {
         assert_eq!(recount.0, 25, "replaying a page must insert nothing new");
 
         sqlx::query("DELETE FROM soroban_events WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    /// Upserting token metadata twice for the same (contract_id, network)
+    /// must update the row in place, not duplicate it, and a resolved
+    /// contract must count as fresh until the refresh interval elapses
+    /// (issue #263).
+    #[tokio::test]
+    async fn token_metadata_upsert_refreshes_in_place() {
+        let db_url = match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) if std::env::var("REQUIRE_TEST_SERVICES").is_ok() => {
+                panic!("TEST_DATABASE_URL must be set when REQUIRE_TEST_SERVICES is set");
+            }
+            Err(_) => {
+                eprintln!("SKIP: TEST_DATABASE_URL not set");
+                return;
+            }
+        };
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        let contract_id = format!("CTOKENMETA_{}", Uuid::new_v4());
+        let network = "testnet";
+
+        sqlx::query("DELETE FROM token_metadata WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Not yet resolved: absent from the fresh set.
+        let fresh = fresh_token_metadata_contract_ids(
+            &pool,
+            &[contract_id.clone()],
+            network,
+            Utc::now() - chrono::Duration::days(1),
+        )
+        .await
+        .unwrap();
+        assert!(!fresh.contains(&contract_id));
+
+        let token = crate::token_metadata::TokenMetadataResolution::Token(
+            crate::token_metadata::TokenMetadata {
+                name: "Example Token".to_string(),
+                symbol: "EXT".to_string(),
+                decimals: 7,
+            },
+        );
+        upsert_token_metadata(&pool, &contract_id, network, &token)
+            .await
+            .expect("upsert failed");
+
+        let row: (String, String, i32, bool) = sqlx::query_as(
+            "SELECT name, symbol, decimals, is_token FROM token_metadata
+             WHERE contract_id = $1 AND network = $2",
+        )
+        .bind(&contract_id)
+        .bind(network)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            row,
+            ("Example Token".to_string(), "EXT".to_string(), 7, true)
+        );
+
+        // Fresh (updated within the last day) after resolution.
+        let fresh = fresh_token_metadata_contract_ids(
+            &pool,
+            &[contract_id.clone()],
+            network,
+            Utc::now() - chrono::Duration::days(1),
+        )
+        .await
+        .unwrap();
+        assert!(fresh.contains(&contract_id));
+
+        // Re-resolving as "not a token" updates the same row rather than
+        // inserting a second one.
+        upsert_token_metadata(
+            &pool,
+            &contract_id,
+            network,
+            &crate::token_metadata::TokenMetadataResolution::NotAToken,
+        )
+        .await
+        .expect("re-upsert failed");
+
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM token_metadata WHERE contract_id = $1")
+                .bind(&contract_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count.0, 1, "re-resolution must update, not duplicate");
+
+        let is_token: (bool,) =
+            sqlx::query_as("SELECT is_token FROM token_metadata WHERE contract_id = $1")
+                .bind(&contract_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(!is_token.0);
+
+        sqlx::query("DELETE FROM token_metadata WHERE contract_id = $1")
             .bind(&contract_id)
             .execute(&pool)
             .await

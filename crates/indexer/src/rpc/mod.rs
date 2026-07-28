@@ -152,6 +152,32 @@ pub struct GetTransactionResult {
     pub result_xdr: Option<String>,
 }
 
+#[derive(Serialize)]
+struct SimulateTransactionParams<'a> {
+    transaction: &'a str,
+}
+
+/// One entry of `simulateTransaction`'s `results` array — the base64 XDR
+/// `ScVal` a read-only host function call returned.
+#[derive(Debug, Deserialize)]
+pub struct SimulateHostFunctionResult {
+    pub xdr: String,
+}
+
+/// Result of the Soroban RPC `simulateTransaction` call (issue #263).
+///
+/// `error` is set (and `results` empty) when the simulated invocation failed,
+/// e.g. the contract has no function by that name — the caller treats that as
+/// "not a token" rather than a transport failure. Decoding `results[].xdr` is
+/// owned by `crate::token_metadata`.
+#[derive(Debug, Deserialize)]
+pub struct SimulateTransactionResult {
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub results: Vec<SimulateHostFunctionResult>,
+}
+
 // ---------------------------------------------------------------------------
 // RPC client
 // ---------------------------------------------------------------------------
@@ -610,5 +636,49 @@ mod tests {
         }
         assert_eq!(client.active_endpoint_index(), 0);
         assert_eq!(secondary.received_requests().await.unwrap().len(), 0);
+    }
+
+    /// A read-only `simulateTransaction` call decodes the result envelope's
+    /// XDR return value (issue #263).
+    #[tokio::test]
+    async fn simulate_transaction_returns_decoded_result() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "result": { "results": [{ "xdr": "AAAAAwAAAAo=" }] }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = RpcClient::with_settings(server.uri(), &fast_timeout_settings()).unwrap();
+        let result = client.simulate_transaction("deadbeef").await.unwrap();
+
+        assert!(result.error.is_none());
+        assert_eq!(result.results.len(), 1);
+        assert_eq!(result.results[0].xdr, "AAAAAwAAAAo=");
+    }
+
+    /// A simulation error (e.g. the contract has no such function) is
+    /// surfaced on the result rather than as a transport error, so the
+    /// caller can treat it as "not a token" (issue #263).
+    #[tokio::test]
+    async fn simulate_transaction_surfaces_simulation_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "result": { "error": "HostError: Error(Value, MissingValue)", "results": [] }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = RpcClient::with_settings(server.uri(), &fast_timeout_settings()).unwrap();
+        let result = client.simulate_transaction("deadbeef").await.unwrap();
+
+        assert!(result.error.is_some());
+        assert!(result.results.is_empty());
     }
 }
