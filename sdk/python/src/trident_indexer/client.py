@@ -171,7 +171,7 @@ class TridentClient:
     def _get(
         self,
         path: str,
-        params: Optional[dict] = None,
+        params: Optional[dict[str, Any]] = None,
         retry: RetryOverride = None,
     ) -> Any:
         retry_cfg = resolve_retry_config(retry, self._retry)
