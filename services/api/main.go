@@ -14,6 +14,7 @@ import (
 	"github.com/Depo-dev/trident/services/api/grpc"
 	"github.com/Depo-dev/trident/services/api/handlers"
 	"github.com/Depo-dev/trident/services/api/internal/profiling"
+	"github.com/Depo-dev/trident/services/api/internal/sorobanrpc"
 	"github.com/Depo-dev/trident/services/api/middleware"
 	"github.com/Depo-dev/trident/services/api/ws"
 	"github.com/jackc/pgx/v5"
@@ -231,6 +232,14 @@ func main() {
 	mux.HandleFunc("GET /v1/contracts/{id}/events/schema", handlers.ContractEventSchemas(schemaRegistryDB))
 	mux.HandleFunc("GET /v1/contracts/{id}/metadata", handlers.TokenMetadata(healthDB))
 	mux.HandleFunc("GET /v1/stats/contracts", handlers.ContractsStats(pool, redisClient))
+	// nil (untyped) when STELLAR_RPC_URL is unset, so CallContract's `rpc ==
+	// nil` check reports 503 rather than a typed-nil interface slipping
+	// through and panicking on first use.
+	var sorobanCaller handlers.SorobanRPCCaller
+	if rpcURL := os.Getenv("STELLAR_RPC_URL"); rpcURL != "" {
+		sorobanCaller = sorobanrpc.NewClient(rpcURL)
+	}
+	mux.HandleFunc("POST /v1/contracts/{id}/call", handlers.CallContract(sorobanCaller))
 	mux.HandleFunc("GET /v1/webhooks", listWebhooksHandler(webhookDB))
 	mux.HandleFunc("POST /v1/webhooks", createWebhookHandler(webhookDB))
 	mux.HandleFunc("DELETE /v1/webhooks/{id}", deleteWebhookHandler(webhookDB))

@@ -17,6 +17,12 @@ type ContractConfig struct {
 	DB       *pgxpool.Pool
 }
 
+// errorBody builds the {"error":{"message":...}} envelope used by this
+// file's writeJSON error responses.
+func errorBody(message string) map[string]any {
+	return map[string]any{"error": map[string]any{"message": message}}
+}
+
 // ContractResponse is the JSON representation of an indexed_contracts row.
 type ContractResponse struct {
 	ID         string  `json:"id"`

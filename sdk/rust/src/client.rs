@@ -296,7 +296,7 @@ impl TridentClient {
     pub fn iter_events(
         &self,
         params: QueryParams,
-    ) -> impl Stream<Item = Result<SorobanEvent, TridentError>> {
+    ) -> std::pin::Pin<Box<dyn Stream<Item = Result<SorobanEvent, TridentError>> + Send>> {
         #[derive(Clone)]
         struct IterState {
             client: TridentClient,
@@ -334,6 +334,7 @@ impl TridentClient {
                 }
             }
         })
+        .boxed()
     }
 
     /// Fetch a single event by its UUID.
@@ -403,7 +404,9 @@ impl TridentClient {
             if let Some(limit) = params.limit {
                 qs.append_pair("limit", &limit.to_string());
             }
-            let network = params.network.unwrap_or_else(|| self.config.network.clone());
+            let network = params
+                .network
+                .unwrap_or_else(|| self.config.network.clone());
             if !matches!(network, Network::Futurenet) {
                 qs.append_pair("network", network.as_str());
             }
@@ -785,7 +788,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(stats.contracts.len(), 1);
-        assert_eq!(stats.contracts[0].contract_id, "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4");
+        assert_eq!(
+            stats.contracts[0].contract_id,
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+        );
         mock.assert_async().await;
     }
 
@@ -817,7 +823,7 @@ mod tests {
 
         let mock_one = server
             .mock("GET", "/v1/events")
-            .match_query(mockito::Matcher::Missing)
+            .match_query(mockito::Matcher::UrlEncoded("limit".into(), "50".into()))
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(page_one.to_string())
@@ -826,7 +832,10 @@ mod tests {
 
         let mock_two = server
             .mock("GET", "/v1/events")
-            .match_query(mockito::Matcher::UrlEncoded("cursor".into(), "cursor-2".into()))
+            .match_query(mockito::Matcher::UrlEncoded(
+                "cursor".into(),
+                "cursor-2".into(),
+            ))
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(page_two.to_string())

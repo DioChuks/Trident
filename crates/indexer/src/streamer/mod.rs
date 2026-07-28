@@ -81,7 +81,15 @@ impl Streamer {
             primary = %config.stellar_rpc_url,
             "RPC endpoint pool configured"
         );
-        let parser = Parser::new(config.index_diagnostic);
+        let sac_registry = crate::parser::sac::SacRegistry::build(
+            &config.tracked_sac_assets,
+            &config.network_passphrase,
+        )?;
+        tracing::info!(
+            tracked_assets = config.tracked_sac_assets.len(),
+            "SAC asset registry built"
+        );
+        let parser = Parser::new(config.index_diagnostic).with_sac_registry(sac_registry);
         let contract_filter = Self::load_filter(&db, &config.network).await?;
         let filter_plan = plan_filters(contract_filter.as_ref(), &config.topic_filters);
         let alerter = Alerter::from_config(
@@ -867,6 +875,9 @@ mod tests {
             health_port: 0,
             statement_timeout_ms: 30_000,
             idle_in_transaction_timeout_ms: 60_000,
+            token_metadata_refresh_interval: Duration::from_secs(86_400),
+            network_passphrase: "Test SDF Network ; September 2015".to_string(),
+            tracked_sac_assets: Vec::new(),
         };
 
         Streamer::new(config, db).await.unwrap()
