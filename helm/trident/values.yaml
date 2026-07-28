@@ -6,10 +6,51 @@
 global:
   # Name of a pre-existing Secret that holds sensitive env vars.
   # Required keys: DATABASE_URL, REDIS_URL, ADMIN_API_KEY
+  #
+  # This name is also the *target* Secret when externalSecret.enabled is
+  # true below — the operator writes/syncs into a Secret with this same
+  # name, so every deployment's secretKeyRef keeps working unmodified
+  # regardless of which provisioning method populates it.
   existingSecret: trident-secrets
   imagePullPolicy: IfNotPresent
   # Optional: imagePullSecrets for private registries
   imagePullSecrets: []
+
+  # ---------------------------------------------------------------------------
+  # Secrets provisioning (issue #305): existingSecret above is always the
+  # source every deployment reads from via secretKeyRef. This block is the
+  # *external-secrets operator* option for populating that same Secret from
+  # a real secrets backend, so no plaintext secret ever needs to be
+  # `kubectl create secret`'d by hand. See docs/kubernetes.md#secrets for
+  # the CSI Secrets Store alternative (deliberately not templated here —
+  # it varies per CSI provider/driver installed on the cluster).
+  # ---------------------------------------------------------------------------
+  externalSecret:
+    enabled: false
+    # SecretStore/ClusterSecretStore name already configured to talk to your
+    # backend (Vault, AWS Secrets Manager, GCP Secret Manager, etc.) — see
+    # https://external-secrets.io/latest/api/secretstore/ for how to create one.
+    secretStoreRef:
+      name: trident-secret-store
+      kind: ClusterSecretStore
+    refreshInterval: 1h
+    # Maps each key the chart's Secret needs (DATABASE_URL, REDIS_URL,
+    # ADMIN_API_KEY) to its path in the backend. Defaults assume a
+    # single JSON/KV secret at "trident/prod" with matching keys —
+    # override remoteRef.key / .property per backend layout.
+    data:
+      - secretKey: DATABASE_URL
+        remoteRef:
+          key: trident/prod
+          property: DATABASE_URL
+      - secretKey: REDIS_URL
+        remoteRef:
+          key: trident/prod
+          property: REDIS_URL
+      - secretKey: ADMIN_API_KEY
+        remoteRef:
+          key: trident/prod
+          property: ADMIN_API_KEY
 
 # ---------------------------------------------------------------------------
 # Indexer — 1 replica (distributed cursor not yet supported)
@@ -58,6 +99,8 @@ indexer:
   nodeSelector: {}
   tolerations: []
   affinity: {}
+  # Matches the `USER trident` (uid 1001) added to crates/indexer/Dockerfile.
+  securityContextUid: 1001
 
 # ---------------------------------------------------------------------------
 # Rust gRPC API — 1 replica
@@ -100,6 +143,8 @@ grpcApi:
   nodeSelector: {}
   tolerations: []
   affinity: {}
+  # Matches the `USER trident` (uid 1001) added to crates/api/Dockerfile.
+  securityContextUid: 1001
 
 # ---------------------------------------------------------------------------
 # Go API — configurable replicas with HPA
@@ -148,6 +193,23 @@ goApi:
   nodeSelector: {}
   tolerations: []
   affinity: {}
+  # Matches the `USER trident` (uid 1001) already set in services/api/Dockerfile.
+  securityContextUid: 1001
+  # PodDisruptionBudget: keep at least this many Go API pods up through a
+  # voluntary disruption (node drain, rollout). Multi-replica by default
+  # (values.yaml goApi.replicaCount: 2, HPA up to 10), so a naive drain
+  # could otherwise take the whole service down at once.
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  # Spread replicas across nodes so a single node loss/drain doesn't take
+  # out a disproportionate share of the Go API. ScheduleAnyway (not a hard
+  # requirement) so scheduling still succeeds on small/single-node clusters.
+  topologySpreadConstraints:
+    enabled: true
+    maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
 
 # ---------------------------------------------------------------------------
 # Nginx — reverse proxy / static gateway
@@ -186,6 +248,14 @@ nginx:
   nodeSelector: {}
   tolerations: []
   affinity: {}
+  # The official nginx:alpine image's built-in `nginx` user/group.
+  securityContextUid: 101
+  # Only rendered when nginx.replicaCount > 1 — with the default single
+  # replica, minAvailable: 1 would forbid any voluntary eviction at all
+  # (nothing left to keep "available" during the disruption).
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
 
 # ---------------------------------------------------------------------------
 # Ingress — use when nginx.enabled is false and a cluster Ingress controller

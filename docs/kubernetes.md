@@ -143,6 +143,145 @@ curl -X POST "$TRIDENT_HOST/v1/api-keys" \
   -d '{"label": "my-app", "network": "mainnet"}'
 ```
 
+## Secrets management {#secrets}
+
+Every deployment reads `DATABASE_URL`, `REDIS_URL`, and `ADMIN_API_KEY` from a
+single Kubernetes Secret named by `global.existingSecret` (default
+`trident-secrets`) via `secretKeyRef` — never from `values.yaml`, and never
+`COPY`'d into an image layer (see [crates/api/Dockerfile](../crates/api/Dockerfile),
+[crates/indexer/Dockerfile](../crates/indexer/Dockerfile), and
+[services/api/Dockerfile](../services/api/Dockerfile): each only copies the
+compiled binary out of its builder stage — no `.env` file, no secret, is ever
+part of an image layer). How that one Secret gets *populated* is a separate
+choice, with three supported options:
+
+### Option 1 — `kubectl create secret` (quick start / dev)
+
+What the Quick Start above uses. Simplest option, but the plaintext value
+passes through your shell history and the `kubectl` process — fine for a
+local kind cluster, not recommended for production.
+
+### Option 2 — external-secrets operator (recommended for production)
+
+Syncs the Secret from a real secrets backend (Vault, AWS Secrets Manager, GCP
+Secret Manager, Azure Key Vault, ...) on a refresh interval, so no plaintext
+value is ever typed into `kubectl` or committed anywhere.
+
+1. Install the [external-secrets operator](https://external-secrets.io/latest/introduction/getting-started/) into the cluster (once, cluster-wide).
+2. Create a `SecretStore` or `ClusterSecretStore` pointing at your backend — see the
+   [external-secrets provider docs](https://external-secrets.io/latest/provider/aws-secrets-manager/)
+   for backend-specific examples. Example for AWS Secrets Manager:
+
+   ```yaml
+   apiVersion: external-secrets.io/v1beta1
+   kind: ClusterSecretStore
+   metadata:
+     name: trident-secret-store
+   spec:
+     provider:
+       aws:
+         service: SecretsManager
+         region: us-east-1
+         auth:
+           jwt:
+             serviceAccountRef:
+               name: trident-external-secrets
+   ```
+
+3. Enable the chart's `ExternalSecret` and point it at that store:
+
+   ```bash
+   helm upgrade trident ./helm/trident \
+     --set global.externalSecret.enabled=true \
+     --set global.externalSecret.secretStoreRef.name=trident-secret-store \
+     --set global.externalSecret.secretStoreRef.kind=ClusterSecretStore
+   ```
+
+   By default this expects a single backend secret at `trident/prod` with
+   `DATABASE_URL`/`REDIS_URL`/`ADMIN_API_KEY` keys — override
+   `global.externalSecret.data[].remoteRef` per key if your backend layout
+   differs (see `helm/trident/values.yaml`).
+
+The operator owns and continuously syncs a Secret named
+`global.existingSecret` — every other deployment keeps reading it exactly the
+same way, so there's no chart change needed anywhere else.
+
+### Option 3 — Secrets Store CSI Driver
+
+An alternative to the external-secrets operator: mount the backend secret as
+a volume via the [Secrets Store CSI Driver](https://secrets-store-csi-driver.sigs.k8s.io/)
+and its provider for your backend (e.g.
+[aws-secrets-store-csi-driver-provider](https://github.com/aws/secrets-store-csi-driver-provider-aws),
+[secrets-store-csi-driver-provider-gcp](https://github.com/GoogleCloudPlatform/secrets-store-csi-driver-provider-gcp),
+[secrets-store-csi-driver-provider-azure](https://github.com/Azure/secrets-store-csi-driver-provider-azure)).
+Not templated directly in this chart — the CSI driver/provider combination is
+cluster- and backend-specific — but the driver's `secretObjects` field can
+sync the mounted secret into a native Kubernetes Secret with the same name
+(`global.existingSecret`) and keys this chart expects, so no other chart
+changes are needed either. Example `SecretProviderClass`:
+
+```yaml
+apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata:
+  name: trident-secrets-csi
+spec:
+  provider: aws  # or gcp / azure — matches your installed CSI provider
+  parameters:
+    objects: |
+      - objectName: "trident/prod/DATABASE_URL"
+        objectType: "secretsmanager"
+      - objectName: "trident/prod/REDIS_URL"
+        objectType: "secretsmanager"
+      - objectName: "trident/prod/ADMIN_API_KEY"
+        objectType: "secretsmanager"
+  secretObjects:
+    - secretName: trident-secrets   # global.existingSecret
+      type: Opaque
+      data:
+        - objectName: "trident/prod/DATABASE_URL"
+          key: DATABASE_URL
+        - objectName: "trident/prod/REDIS_URL"
+          key: REDIS_URL
+        - objectName: "trident/prod/ADMIN_API_KEY"
+          key: ADMIN_API_KEY
+```
+
+Then mount the CSI volume on at least one pod referencing this
+`SecretProviderClass` (a single mount is enough to trigger the sync — the
+resulting `trident-secrets` Secret is then available cluster-wide via
+`secretKeyRef` exactly as with the other two options).
+
+### Verifying no secret ends up in an image layer
+
+```bash
+docker history --no-trunc ghcr.io/telocel-labs/trident-go-api:latest | grep -i -E "DATABASE_URL|REDIS_URL|ADMIN_API_KEY|secret"
+```
+
+Should print nothing. Each Dockerfile's runtime stage only ever `COPY
+--from=builder` the compiled binary — no `ENV`, no `ARG`, no `COPY` of a
+secret or `.env` file appears in any layer.
+
+### Verifying no secret is ever logged
+
+The Go API, gRPC API, and indexer all read `DATABASE_URL`/`REDIS_URL` only to
+open a connection at startup — none of the three log the connection string
+itself (only connection *success/failure*, without the credential-bearing
+URL). `ADMIN_API_KEY` is compared, never logged. If you add a log line near
+any of these, redact the credential portion — don't log the raw env var value.
+
+### Rotating secrets
+
+1. Update the value in your backend (Vault/Secrets Manager/etc., or `kubectl create secret --dry-run=client -o yaml | kubectl apply -f -` for the manual path).
+2. **external-secrets**: happens automatically on the next `refreshInterval` tick (default `1h` in this chart) — no manual step. To force it immediately: `kubectl annotate externalsecret trident-secrets force-sync=$(date +%s) --overwrite`.
+3. **CSI**: re-mount (pod restart) picks up the new value; `secretObjects` sync depends on your provider's rotation reconciler — check its docs for a reconciliation interval.
+4. **Manual `kubectl create secret`**: re-run the command with the new value, or `kubectl create secret generic trident-secrets --from-literal=... --dry-run=client -o yaml | kubectl apply -f -`.
+5. **After any of the above**, roll the consuming pods so they pick up the new value — none of the three services currently hot-reload env vars:
+   ```bash
+   kubectl rollout restart deployment/trident-go-api deployment/trident-grpc-api deployment/trident-indexer
+   ```
+   (A future improvement would be [Reloader](https://github.com/stakater/Reloader) to automate this step.)
+
 ## Health checks
 
 The Go API exposes `GET /v1/health`. Kubernetes liveness and readiness probes are pre-configured in the chart:

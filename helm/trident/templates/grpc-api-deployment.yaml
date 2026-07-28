@@ -16,14 +16,21 @@ spec:
         {{- include "trident.selectorLabels" (dict "root" . "component" "grpc-api") | nindent 8 }}
     spec:
       {{- include "trident.imagePullSecrets" . | nindent 6 }}
+      securityContext:
+        {{- include "trident.podSecurityContext" (dict "uid" .Values.grpcApi.securityContextUid) | nindent 8 }}
       containers:
         - name: grpc-api
           image: "{{ .Values.grpcApi.image.repository }}:{{ .Values.grpcApi.image.tag }}"
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          securityContext:
+            {{- include "trident.containerSecurityContext" . | nindent 12 }}
           ports:
             - name: grpc
               containerPort: {{ .Values.grpcApi.service.port }}
               protocol: TCP
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
           env:
             - name: DATABASE_URL
               valueFrom:
@@ -45,6 +52,9 @@ spec:
             {{- toYaml .Values.grpcApi.readinessProbe | nindent 12 }}
           resources:
             {{- toYaml .Values.grpcApi.resources | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
       {{- with .Values.grpcApi.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

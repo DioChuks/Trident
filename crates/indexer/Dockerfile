@@ -40,9 +40,12 @@ FROM debian:bookworm-slim@sha256:89b32b4e9f3e7f5d4a7c2c5c9b5c5c4e4e4e4e4e4e4e4e4
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl libssl3 \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 1001 --no-create-home trident
 
 COPY --from=builder /app/target/release/trident-indexer /usr/local/bin/trident-indexer
+
+USER trident
 
 EXPOSE 9090
 
