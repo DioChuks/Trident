@@ -772,6 +772,18 @@ jobs:
           docker rm -f stellar-quickstart || true
 
   # ---------------------------------------------------------------------------
+  # Environment reference — fails if code reads an env var undocumented in
+  # docs/ENVIRONMENT.md (issue #312).
+  # ---------------------------------------------------------------------------
+  env-reference:
+    name: Env reference
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+      - name: Check every env var the code reads is documented
+        run: bash scripts/check-env-reference.sh
+
+  # ---------------------------------------------------------------------------
   # Helm — lint, template render, and kind cluster deployment validation
   # ---------------------------------------------------------------------------
   helm:
