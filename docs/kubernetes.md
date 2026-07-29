@@ -85,6 +85,13 @@ ingress:
   className: nginx
   annotations:
     cert-manager.io/cluster-issuer: letsencrypt-prod
+    # TLS termination + HSTS at the ingress-nginx controller (issue #320).
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/hsts: "true"
+    nginx.ingress.kubernetes.io/hsts-max-age: "31536000"
+    nginx.ingress.kubernetes.io/hsts-include-subdomains: "true"
+    nginx.ingress.kubernetes.io/hsts-preload: "true"
   host: api.trident.example.com
   tls:
     - secretName: trident-tls
@@ -95,6 +102,136 @@ ingress:
 ```bash
 helm upgrade trident ./helm/trident -f custom-values.yaml
 ```
+
+## TLS termination, HSTS, and internal mTLS {#tls}
+
+All public traffic terminates TLS at the edge — either the bundled Nginx
+deployment (`nginx.enabled: true`, the default) or the Ingress resource
+above. Internal gRPC traffic between the Go API and the Rust gRPC service
+stays inside the cluster network and is plaintext by default, with an
+optional mTLS mode. This section documents both.
+
+### Public-edge TLS + HSTS
+
+- **Bundled Nginx** (`docker/nginx/nginx.conf`): listens on 80 (redirects to
+  443) and 443 (TLS, `ssl_protocols TLSv1.2 TLSv1.3`, certs mounted at
+  `/etc/nginx/certs/{fullchain,privkey}.pem`). Every 443 response now sends
+  `Strict-Transport-Security: max-age=31536000; includeSubDomains; preload`
+  so browsers refuse to downgrade this host to plain HTTP for a year,
+  including its subdomains, and it can be submitted to browsers' HSTS
+  preload lists once you're confident every subdomain is HTTPS-only.
+- **Ingress** (`ingress.enabled: true`): configure the controller-level
+  equivalent, as in the `custom-values.yaml` example above — the
+  `nginx.ingress.kubernetes.io/hsts*` annotations for ingress-nginx, or the
+  equivalent for your controller (ALB, GKE, etc.).
+
+### Internal gRPC is not reachable externally
+
+Neither the bundled Nginx `server {}` block nor the Ingress `rules[]` expose
+a path to the gRPC port (`grpcApi.service.port`, default 5000/50051) — the
+gRPC Service is `ClusterIP`, so it has no external address at all, and no
+Ingress/Nginx rule forwards to it. The only externally reachable paths are
+the ones the Go API's HTTP server explicitly registers (`/v1/*`, `/ws`), and
+`/internal/*` is additionally denied at both layers as defense in depth (see
+below) even though it's also served over the same ClusterIP-only path.
+
+`/internal/status` (services/api/handlers/status.go, issue #316) is
+internal-only in three independent layers:
+1. The handler itself requires `X-Internal-Key` to match `INTERNAL_API_KEY`
+   (constant-time compare; fails closed — an unset `INTERNAL_API_KEY` rejects
+   every request, it never means "no auth required").
+2. `docker/nginx/nginx.conf` has an explicit `location /internal/ { deny all; return 403; }`.
+3. `helm/trident/templates/ingress.yaml` routes `/internal/` to a dedicated,
+   more-specific path rule ahead of the catch-all `/`, so a controller-level
+   deny (e.g. `nginx.ingress.kubernetes.io/configuration-snippet` returning
+   403, or an equivalent NetworkPolicy) can target it precisely.
+
+To verify in your own cluster:
+```bash
+# Should NOT succeed from outside the cluster:
+curl -k https://api.trident.example.com/internal/status   # -> 403 (nginx/ingress deny)
+# From inside the cluster, still requires the key:
+kubectl run -it --rm curl --image=curlimages/curl --restart=Never -- \
+  curl -s -o /dev/null -w '%{http_code}\n' http://trident-go-api:3000/internal/status  # -> 401 without X-Internal-Key
+```
+
+### Internal mTLS between the Go API and the Rust gRPC service (optional)
+
+Off by default: `internalMTLS.enabled: false` in `values.yaml`, meaning
+plaintext gRPC over the cluster-internal network (the model above already
+ensures that network isn't reachable from outside). Turn it on for
+defense-in-depth (e.g. compliance requirements, multi-tenant clusters, zero
+trust network policies):
+
+```yaml
+# custom-values.yaml
+internalMTLS:
+  enabled: true
+```
+
+This requires five PEM-encoded keys to already exist in `global.existingSecret`
+(populated via `kubectl create secret`, the external-secrets operator, or the
+CSI driver — see [Secrets management](#secrets); never commit these to
+`values.yaml`):
+
+| Secret key | Used by | Purpose |
+|---|---|---|
+| `INTERNAL_CA_CERT` | both | CA bundle used to verify the peer's certificate |
+| `INTERNAL_SERVER_CERT` / `INTERNAL_SERVER_KEY` | grpc-api | Server identity presented to the Go API |
+| `INTERNAL_CLIENT_CERT` / `INTERNAL_CLIENT_KEY` | go-api | Client identity presented to the gRPC service |
+
+When enabled, the chart mounts these (renamed to `ca.crt`/`server.crt`/etc.)
+into both deployments at `internalMTLS.mountPath` (default
+`/etc/trident/mtls`) and sets `GRPC_MTLS_ENABLED=true` plus the matching
+`GRPC_MTLS_*` path env vars. The Rust gRPC server
+(`crates/api/src/main.rs`) requires and verifies a client certificate via
+`tonic::transport::ServerTlsConfig::client_ca_root`; the Go API
+(`services/api/grpc/client.go`) presents a client certificate and verifies
+the server's certificate against the same CA. If `GRPC_MTLS_ENABLED=true`
+but any of the three required paths for that side are missing or unreadable,
+both sides fail to start/connect rather than silently falling back to
+plaintext.
+
+**Generating certs for a first test** (self-signed CA, for non-production use):
+```bash
+openssl req -x509 -newkey rsa:4096 -days 365 -nodes \
+  -keyout ca.key -out ca.crt -subj "/CN=trident-internal-ca"
+
+for role in server client; do
+  openssl req -newkey rsa:4096 -nodes -keyout ${role}.key -out ${role}.csr \
+    -subj "/CN=trident-${role}"
+  openssl x509 -req -in ${role}.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+    -out ${role}.crt -days 365
+done
+
+kubectl create secret generic trident-secrets \
+  --from-literal=DATABASE_URL=... --from-literal=REDIS_URL=... --from-literal=ADMIN_API_KEY=... \
+  --from-file=INTERNAL_CA_CERT=ca.crt \
+  --from-file=INTERNAL_SERVER_CERT=server.crt --from-file=INTERNAL_SERVER_KEY=server.key \
+  --from-file=INTERNAL_CLIENT_CERT=client.crt --from-file=INTERNAL_CLIENT_KEY=client.key
+```
+In production, issue these from a real CA (e.g. your organization's Vault PKI
+secrets engine, or cert-manager's `Certificate`/`Issuer` CRDs targeting an
+internal `ClusterIssuer`) rather than the ad hoc openssl commands above.
+
+### Cert rotation
+
+- **Public edge (Nginx)**: replace the `fullchain.pem`/`privkey.pem` files
+  mounted at `/etc/nginx/certs/` (typically via a Secret volume) and reload
+  Nginx (`nginx -s reload` or a rolling pod restart) — no downtime if
+  `nginx.replicaCount > 1` or the PodDisruptionBudget is respected.
+- **Public edge (Ingress + cert-manager)**: automatic — cert-manager renews
+  well before expiry and updates the referenced `tls.secretName`; the
+  ingress controller picks up the new cert without a restart.
+- **Internal mTLS**: same rotation mechanics as any other value in
+  `global.existingSecret` — see [Rotating secrets](#secrets) below. Because
+  both the server and client sides re-read cert files from a mounted volume,
+  a `kubectl rollout restart` of both `trident-go-api` and `trident-grpc-api`
+  deployments is required after the Secret updates (unlike `DATABASE_URL`
+  etc., these are read from disk once at process TLS-config time, not on
+  every request) — projected/mounted Secret volumes update automatically
+  within the kubelet's sync period, but the running process must be
+  restarted to pick up the new files.
 
 ### Horizontal Pod Autoscaler
 

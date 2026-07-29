@@ -599,3 +599,77 @@ fly secrets set -a trident-indexer   OTEL_SAMPLING_RATIO=0.1
 | `trident-indexer` | `parse_events` | — |
 | `trident-indexer` | `db_insert_events` | `contract_id` |
 | `trident-indexer` | `redis_xadd` | — |
+
+## Staging Environment {#staging}
+
+Issue #313: `.github/workflows/staging-deploy.yml` builds and deploys the
+`dev` branch to a staging environment automatically on every push to `dev`,
+then runs a post-deploy smoke test before staging is considered promotable.
+
+### What's fully working
+
+- **Build + push**: every push to `dev` builds all three service images
+  (indexer, grpc-api, go-api) and pushes them to GHCR tagged `staging` and
+  `staging-<short-sha>`, reusing the same Dockerfiles and Buildx setup as the
+  tag-triggered `release.yml` (issue #302).
+- **Helm deploy**: `helm upgrade --install trident-staging` using
+  `helm/trident/values-staging.yaml` (a scaled-down overlay: single replicas,
+  smaller resource requests, ingress disabled) plus the new image tags.
+- **Smoke test**: health check, a real `GET /v1/events` query, a bounded read
+  of the `GET /v1/events/stream` SSE endpoint, and an error-path check
+  (invalid API key -> 401) — mirroring the shape of the existing CI `e2e` job
+  (issue #301) but against the deployed staging URL.
+- **Failure alerting**: a failed deploy or smoke test posts to
+  `STAGING_ALERT_WEBHOOK_URL` if configured.
+- **Env reference lint** (`scripts/check-env-reference.sh`, issue #312) is
+  wired into `ci.yml` as the `env-reference` job so config drift on any
+  branch — including `dev` — is caught before it reaches staging.
+
+### What's best-effort / requires setup this environment couldn't provision
+
+This was written and validated (workflow YAML, Helm values, `helm lint`)
+without access to a real Kubernetes cluster or cloud credentials — the
+following require you to provision them once:
+
+- **Secrets**: `STAGING_KUBECONFIG` (repo/org secret, base64-encoded
+  kubeconfig scoped to the staging namespace) and `STAGING_API_KEY` must be
+  set for `deploy-staging`/`smoke-test-staging` to run at all. Without them,
+  those jobs are skipped (not failed) — see `check-staging-config` in the
+  workflow.
+- **Variables**: `STAGING_NAMESPACE` (defaults to `trident-staging`),
+  `STAGING_URL` (public URL of the deployed staging stack, used by the smoke
+  test), `STAGING_DATABASE_URL` (for the migration step, if runner-reachable),
+  and `STAGING_ALERT_WEBHOOK_URL` (optional).
+- **Migrations are stubbed pending issue #308** ("database migration job as
+  a Helm hook", still open): the workflow currently runs
+  `sqlx migrate run` directly from the GitHub Actions runner against
+  `STAGING_DATABASE_URL`, the same mechanism CI's `rust` job already uses.
+  This is a reasonable stand-in but is **not** the in-cluster,
+  chart-versioned Helm pre-upgrade hook Job that #308 calls for — that hook
+  would run migrations from inside the cluster (no runner network path to
+  the DB required) and block the Helm rollout itself on migration failure.
+  Once #308 lands, replace the "Run database migrations" step with
+  `helm upgrade --wait` relying on the hook's own `helm.sh/hook-weight`
+  ordering, and delete the runner-side `sqlx migrate run` step.
+- **Blocking promotion on smoke test failure**: the workflow file makes the
+  failure visible (job fails, `alert-on-failure` fires) and is a natural gate
+  for a required status check, but GitHub Environment protection rules
+  (Settings -> Environments -> `staging` -> required reviewers / deployment
+  branch policies) must be configured in the repository UI — a workflow file
+  alone cannot set repo-level branch protection.
+
+### Promotion path: staging -> prod (dev -> main)
+
+1. Changes land on `dev` via PR, triggering `staging-deploy.yml` automatically.
+2. Once staging's smoke test passes (green `smoke-test-staging` job), open a
+   PR from `dev` into `main`.
+3. Merging into `main` does not itself deploy anything — production deploys
+   are tag-triggered: `git tag vX.Y.Z && git push origin vX.Y.Z` runs
+   `release.yml`, which builds and pushes the same three images tagged with
+   that version and `latest` (issue #302).
+4. Roll out to production the same way as any other release — see
+   [Updating (Rolling Update)](#updating-rolling-update) above — pointing
+   `helm/trident/values.yaml` (production defaults, no `-staging` overlay) at
+   the new tag.
+5. If a smoke test on `dev` fails, treat the branch as un-promotable until
+   fixed — do not cut a `main` PR or tag from a red `dev`.
