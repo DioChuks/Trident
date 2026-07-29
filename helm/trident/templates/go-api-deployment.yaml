@@ -40,6 +40,11 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            {{- if .Values.internalMTLS.enabled }}
+            - name: internal-mtls
+              mountPath: {{ .Values.internalMTLS.mountPath }}
+              readOnly: true
+            {{- end }}
           env:
             - name: DATABASE_URL
               valueFrom:
@@ -56,6 +61,19 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.global.existingSecret }}
                   key: ADMIN_API_KEY
+            {{- if .Values.internalMTLS.enabled }}
+            # Behind a flag (issue #320): the Go API dials the gRPC server
+            # with a client cert and verifies the server against
+            # INTERNAL_CA_CERT. See services/api/grpcclient/client.go.
+            - name: GRPC_MTLS_ENABLED
+              value: "true"
+            - name: GRPC_MTLS_CA_CERT
+              value: "{{ .Values.internalMTLS.mountPath }}/ca.crt"
+            - name: GRPC_MTLS_CLIENT_CERT
+              value: "{{ .Values.internalMTLS.mountPath }}/client.crt"
+            - name: GRPC_MTLS_CLIENT_KEY
+              value: "{{ .Values.internalMTLS.mountPath }}/client.key"
+            {{- end }}
             {{- range $k, $v := .Values.goApi.env }}
             - name: {{ $k }}
               value: {{ $v | quote }}
@@ -69,6 +87,18 @@ spec:
       volumes:
         - name: tmp
           emptyDir: {}
+        {{- if .Values.internalMTLS.enabled }}
+        - name: internal-mtls
+          secret:
+            secretName: {{ .Values.global.existingSecret }}
+            items:
+              - key: INTERNAL_CA_CERT
+                path: ca.crt
+              - key: INTERNAL_CLIENT_CERT
+                path: client.crt
+              - key: INTERNAL_CLIENT_KEY
+                path: client.key
+        {{- end }}
       {{- with .Values.goApi.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

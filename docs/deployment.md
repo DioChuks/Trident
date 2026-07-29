@@ -51,6 +51,12 @@ Open `.env` and set every value below. Do not leave defaults in production.
 | `POSTGRES_DB` | PostgreSQL database name |
 | `ALLOWED_ORIGINS` | Comma-separated allowed CORS origins, or `*` to allow all |
 | `REQUEST_TIMEOUT_MS` | HTTP request timeout in milliseconds (default: `30000`) |
+| `MAX_REQUEST_BODY_BYTES` | Maximum request body size for POST/PUT/PATCH, in bytes (default: `1048576`, 1 MiB); oversized bodies get `413` |
+| `MAX_BATCH_BODY_BYTES` | Maximum request body size specifically for `POST /v1/events/batch`, in bytes (default: `2097152`, 2 MiB) |
+| `PER_IP_RATE_LIMIT_RPS` | Per-IP sliding-window request limit, applied before auth on public paths (default: `20`) |
+| `PER_IP_RATE_LIMIT_WINDOW_MS` | Window for the per-IP limit above, in milliseconds (default: `1000`) |
+| `TRUSTED_PROXY_ENABLED` | Set `true` **only** when the API is known to sit entirely behind the provided nginx config (or an equivalent proxy) that is the sole path reachable by clients — resolves the per-IP rate limiter's client IP from the last hop of `X-Forwarded-For` instead of the raw TCP peer address. Leaving this unset/`false` is always safe; enabling it when untrusted clients can reach the API directly lets them spoof their rate-limit bucket via a forged header. See `services/api/middleware/abuse.go` (`trustedClientIP`) and `docs/threat-model.md`. |
+| `MAX_IN_FLIGHT_REQUESTS` | Global concurrency cap — requests beyond this many in-flight get `503` to shed load (default: `500`) |
 
 #### Indexer RPC transport and failover
 
@@ -405,6 +411,12 @@ no `too many connections` errors with p99 latency under 500ms.
 BASE_URL=http://localhost:3000 k6 run load-tests/pgbouncer-validation.js
 ```
 
+`load-tests/` also has k6 scenarios for the top API endpoints (events list/get,
+batch, stats, SSE stream) with SLO-derived thresholds, and a sustained ingest
+soak test — see [`load-tests/README.md`](../load-tests/README.md) for the
+full runbook. These run in CI only via `workflow_dispatch`/a weekly schedule
+(`.github/workflows/load-tests.yml`), not on every PR.
+
 ---
 
 ## Fly.io Deployment
@@ -599,3 +611,77 @@ fly secrets set -a trident-indexer   OTEL_SAMPLING_RATIO=0.1
 | `trident-indexer` | `parse_events` | — |
 | `trident-indexer` | `db_insert_events` | `contract_id` |
 | `trident-indexer` | `redis_xadd` | — |
+
+## Staging Environment {#staging}
+
+Issue #313: `.github/workflows/staging-deploy.yml` builds and deploys the
+`dev` branch to a staging environment automatically on every push to `dev`,
+then runs a post-deploy smoke test before staging is considered promotable.
+
+### What's fully working
+
+- **Build + push**: every push to `dev` builds all three service images
+  (indexer, grpc-api, go-api) and pushes them to GHCR tagged `staging` and
+  `staging-<short-sha>`, reusing the same Dockerfiles and Buildx setup as the
+  tag-triggered `release.yml` (issue #302).
+- **Helm deploy**: `helm upgrade --install trident-staging` using
+  `helm/trident/values-staging.yaml` (a scaled-down overlay: single replicas,
+  smaller resource requests, ingress disabled) plus the new image tags.
+- **Smoke test**: health check, a real `GET /v1/events` query, a bounded read
+  of the `GET /v1/events/stream` SSE endpoint, and an error-path check
+  (invalid API key -> 401) — mirroring the shape of the existing CI `e2e` job
+  (issue #301) but against the deployed staging URL.
+- **Failure alerting**: a failed deploy or smoke test posts to
+  `STAGING_ALERT_WEBHOOK_URL` if configured.
+- **Env reference lint** (`scripts/check-env-reference.sh`, issue #312) is
+  wired into `ci.yml` as the `env-reference` job so config drift on any
+  branch — including `dev` — is caught before it reaches staging.
+
+### What's best-effort / requires setup this environment couldn't provision
+
+This was written and validated (workflow YAML, Helm values, `helm lint`)
+without access to a real Kubernetes cluster or cloud credentials — the
+following require you to provision them once:
+
+- **Secrets**: `STAGING_KUBECONFIG` (repo/org secret, base64-encoded
+  kubeconfig scoped to the staging namespace) and `STAGING_API_KEY` must be
+  set for `deploy-staging`/`smoke-test-staging` to run at all. Without them,
+  those jobs are skipped (not failed) — see `check-staging-config` in the
+  workflow.
+- **Variables**: `STAGING_NAMESPACE` (defaults to `trident-staging`),
+  `STAGING_URL` (public URL of the deployed staging stack, used by the smoke
+  test), `STAGING_DATABASE_URL` (for the migration step, if runner-reachable),
+  and `STAGING_ALERT_WEBHOOK_URL` (optional).
+- **Migrations are stubbed pending issue #308** ("database migration job as
+  a Helm hook", still open): the workflow currently runs
+  `sqlx migrate run` directly from the GitHub Actions runner against
+  `STAGING_DATABASE_URL`, the same mechanism CI's `rust` job already uses.
+  This is a reasonable stand-in but is **not** the in-cluster,
+  chart-versioned Helm pre-upgrade hook Job that #308 calls for — that hook
+  would run migrations from inside the cluster (no runner network path to
+  the DB required) and block the Helm rollout itself on migration failure.
+  Once #308 lands, replace the "Run database migrations" step with
+  `helm upgrade --wait` relying on the hook's own `helm.sh/hook-weight`
+  ordering, and delete the runner-side `sqlx migrate run` step.
+- **Blocking promotion on smoke test failure**: the workflow file makes the
+  failure visible (job fails, `alert-on-failure` fires) and is a natural gate
+  for a required status check, but GitHub Environment protection rules
+  (Settings -> Environments -> `staging` -> required reviewers / deployment
+  branch policies) must be configured in the repository UI — a workflow file
+  alone cannot set repo-level branch protection.
+
+### Promotion path: staging -> prod (dev -> main)
+
+1. Changes land on `dev` via PR, triggering `staging-deploy.yml` automatically.
+2. Once staging's smoke test passes (green `smoke-test-staging` job), open a
+   PR from `dev` into `main`.
+3. Merging into `main` does not itself deploy anything — production deploys
+   are tag-triggered: `git tag vX.Y.Z && git push origin vX.Y.Z` runs
+   `release.yml`, which builds and pushes the same three images tagged with
+   that version and `latest` (issue #302).
+4. Roll out to production the same way as any other release — see
+   [Updating (Rolling Update)](#updating-rolling-update) above — pointing
+   `helm/trident/values.yaml` (production defaults, no `-staging` overlay) at
+   the new tag.
+5. If a smoke test on `dev` fails, treat the branch as un-promotable until
+   fixed — do not cut a `main` PR or tag from a red `dev`.

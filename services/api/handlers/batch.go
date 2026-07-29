@@ -11,6 +11,7 @@ import (
 
 	"github.com/Depo-dev/trident/services/api/gen"
 	"github.com/Depo-dev/trident/services/api/internal/httputil"
+	"github.com/Depo-dev/trident/services/api/middleware"
 	"github.com/Depo-dev/trident/services/api/validation"
 )
 
@@ -38,6 +39,10 @@ type BatchEventsResponse struct {
 func BatchGetEvents(w http.ResponseWriter, r *http.Request) {
 	var req batchRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if middleware.IsBodyTooLarge(err) {
+			middleware.WriteBodyTooLarge(w, r)
+			return
+		}
 		httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, "request body must be valid JSON")
 		return
 	}

@@ -20,6 +20,18 @@ const (
 	gqlInitTimeout  = 10 * time.Second
 	gqlPingInterval = 30 * time.Second
 	gqlMaxFrameSize = 1 << 20 // 1 MiB per frame
+
+	// gqlMaxQueryLen and gqlMaxSubsPerConn are the "depth/complexity" guard
+	// equivalents for this protocol (issue #317). There is no general
+	// GraphQL execution engine here — subscribe payloads are parsed by
+	// gqlParseSubscribe into a fixed shape (contractId, topic0), so there is
+	// no query tree to compute a depth/complexity score over. What actually
+	// exists to abuse is (a) an arbitrarily long `query` string being sent
+	// repeatedly, and (b) a single connection opening unbounded numbers of
+	// concurrent subscriptions, each with its own forwarding goroutine and
+	// hub registration. Both are capped directly instead.
+	gqlMaxQueryLen    = 8 << 10 // 8 KiB — generous for a hand-written subscribe query string
+	gqlMaxSubsPerConn = 50
 )
 
 // gqlMessage is a graphql-transport-ws protocol envelope.
@@ -241,6 +253,15 @@ func serveGQL(conn net.Conn, bufrw *bufio.ReadWriter, hub *Hub, validateKey func
 					_ = gc.write(gqlErrorMsg(msg.ID, "subscription id already in use"))
 					continue
 				}
+				// Cap concurrent subscriptions per connection (issue #317):
+				// each subscription holds a hub registration and a forwarding
+				// goroutine, so an unbounded number of them on one socket is
+				// a resource-exhaustion vector even though no single one is
+				// individually "complex".
+				if len(subs) >= gqlMaxSubsPerConn {
+					_ = gc.write(gqlErrorMsg(msg.ID, fmt.Sprintf("maximum %d concurrent subscriptions per connection", gqlMaxSubsPerConn)))
+					continue
+				}
 				sub := &gqlSub{
 					cid:    contractID,
 					send:   make(chan []byte, sendBufSize),
@@ -386,6 +407,13 @@ func gqlParseSubscribe(payload json.RawMessage) (contractID, topic0 string, err 
 	}
 	if jsonErr := json.Unmarshal(payload, &p); jsonErr != nil {
 		return "", "", fmt.Errorf("invalid subscribe payload")
+	}
+
+	// Reject an abusively long query string outright rather than regex-
+	// matching against it — the "depth/complexity" guard equivalent for a
+	// protocol with no query executor (issue #317).
+	if len(p.Query) > gqlMaxQueryLen {
+		return "", "", fmt.Errorf("query exceeds maximum length of %d bytes", gqlMaxQueryLen)
 	}
 
 	if p.Variables != nil {
