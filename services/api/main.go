@@ -287,11 +287,17 @@ func main() {
 	}
 	authDB.Redis = redisClient
 
-	handler := middleware.TieredRateLimit(rlCfg)(mux)
+	handler := middleware.NewBodySizeLimitFromEnv()(mux)
+	handler = middleware.TieredRateLimit(rlCfg)(handler)
 	if auditWriter != nil {
 		handler = middleware.AuditMiddleware(auditWriter)(handler)
 	}
 	handler = middleware.NewDBAuth(authDB)(handler)
+	// Per-IP rate limit runs BEFORE auth (issue #318): it wraps the handler
+	// chain built so far, so it executes ahead of NewDBAuth for every
+	// request, containing abusive/unauthenticated traffic before a DB/Redis
+	// lookup is spent on it.
+	handler = middleware.NewPerIPRateLimitFromEnv(redisClient)(handler)
 	handler = middleware.NewCORSFromEnv(allowedOrigins)(middleware.NewTimeoutFromEnv()(handler))
 	handler = middleware.SecurityHeaders(true)(handler)
 	// RequestID + StructuredLogging are outermost so every response — including
@@ -300,6 +306,11 @@ func main() {
 	// must precede StructuredLogging so the id is in context when the log line
 	// is emitted.
 	handler = middleware.Chain(handler, middleware.RequestID, middleware.StructuredLogging)
+	// Global concurrency cap is the outermost middleware of all (issue #318):
+	// it must shed load before any other work — auth lookups, rate-limit
+	// Redis calls, logging — is spent on a request that's going to be
+	// rejected anyway.
+	handler = middleware.NewGlobalConcurrencyLimitFromEnv()(handler)
 
 	// Opt-in, internal-only pprof server (off unless PPROF_ENABLED=true). It is
 	// never mounted on the public mux above (#299).
@@ -315,6 +326,12 @@ func main() {
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  120 * time.Second,
+		// Bounds total request-line + header size (issue #317). nginx also
+		// enforces large_client_header_buffers in front of this in the
+		// docker-compose deployment, but MaxHeaderBytes is set independently
+		// since nginx is not guaranteed to be in front of every deployment
+		// (e.g. Fly.io apps hit the Go server directly).
+		MaxHeaderBytes: 1 << 20, // 1 MiB
 	}
 	go func() {
 		slog.Info("Trident API server listening", "port", port)
@@ -438,9 +455,9 @@ func startRetentionJob(ctx context.Context, pool *pgxpool.Pool) {
 			defer cancel()
 
 			tables := []struct {
-				name   string
-				days   int
-				query  string
+				name  string
+				days  int
+				query string
 			}{
 				{"audit_log", cfg.AuditLogDays,
 					`DELETE FROM audit_log WHERE ts < NOW() - ($1 || ' days')::INTERVAL AND ctid IN (

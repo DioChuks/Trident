@@ -19,6 +19,13 @@ const (
 	INVALID_ARGUMENT ErrorCode = "INVALID_ARGUMENT"
 	UNAVAILABLE      ErrorCode = "UNAVAILABLE"
 	INTERNAL         ErrorCode = "INTERNAL"
+	// PAYLOAD_TOO_LARGE is returned when a request body exceeds the
+	// configured http.MaxBytesReader limit (issue #317).
+	PAYLOAD_TOO_LARGE ErrorCode = "PAYLOAD_TOO_LARGE"
+	// FORBIDDEN is returned when abuse-protection middleware rejects a
+	// request outright (e.g. the global concurrency cap shedding load,
+	// issue #318) rather than for a normal auth failure.
+	FORBIDDEN ErrorCode = "FORBIDDEN"
 )
 
 // ErrorDetail is the nested error object required by the OpenAPI ErrorResponse
@@ -75,8 +82,6 @@ func GRPCToHTTP(err error) (int, ErrorCode) {
 		return http.StatusBadRequest, INVALID_ARGUMENT
 	case codes.Unauthenticated:
 		return http.StatusUnauthorized, UNAUTHORIZED
-	case codes.Unavailable:
-		return http.StatusServiceUnavailable, UNAVAILABLE
 	case codes.ResourceExhausted:
 		return http.StatusTooManyRequests, RATE_LIMITED
 	case codes.DeadlineExceeded:

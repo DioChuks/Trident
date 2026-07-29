@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/Depo-dev/trident/services/api/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -63,6 +64,10 @@ func CreateContract(cfg ContractConfig) http.HandlerFunc {
 
 		var req CreateContractRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			if middleware.IsBodyTooLarge(err) {
+				middleware.WriteBodyTooLarge(w, r)
+				return
+			}
 			writeJSON(w, http.StatusBadRequest, errorBody("invalid request body"))
 			return
 		}

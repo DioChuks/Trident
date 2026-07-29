@@ -51,6 +51,12 @@ Open `.env` and set every value below. Do not leave defaults in production.
 | `POSTGRES_DB` | PostgreSQL database name |
 | `ALLOWED_ORIGINS` | Comma-separated allowed CORS origins, or `*` to allow all |
 | `REQUEST_TIMEOUT_MS` | HTTP request timeout in milliseconds (default: `30000`) |
+| `MAX_REQUEST_BODY_BYTES` | Maximum request body size for POST/PUT/PATCH, in bytes (default: `1048576`, 1 MiB); oversized bodies get `413` |
+| `MAX_BATCH_BODY_BYTES` | Maximum request body size specifically for `POST /v1/events/batch`, in bytes (default: `2097152`, 2 MiB) |
+| `PER_IP_RATE_LIMIT_RPS` | Per-IP sliding-window request limit, applied before auth on public paths (default: `20`) |
+| `PER_IP_RATE_LIMIT_WINDOW_MS` | Window for the per-IP limit above, in milliseconds (default: `1000`) |
+| `TRUSTED_PROXY_ENABLED` | Set `true` **only** when the API is known to sit entirely behind the provided nginx config (or an equivalent proxy) that is the sole path reachable by clients — resolves the per-IP rate limiter's client IP from the last hop of `X-Forwarded-For` instead of the raw TCP peer address. Leaving this unset/`false` is always safe; enabling it when untrusted clients can reach the API directly lets them spoof their rate-limit bucket via a forged header. See `services/api/middleware/abuse.go` (`trustedClientIP`) and `docs/threat-model.md`. |
+| `MAX_IN_FLIGHT_REQUESTS` | Global concurrency cap — requests beyond this many in-flight get `503` to shed load (default: `500`) |
 
 #### Indexer RPC transport and failover
 
@@ -404,6 +410,12 @@ no `too many connections` errors with p99 latency under 500ms.
 ```bash
 BASE_URL=http://localhost:3000 k6 run load-tests/pgbouncer-validation.js
 ```
+
+`load-tests/` also has k6 scenarios for the top API endpoints (events list/get,
+batch, stats, SSE stream) with SLO-derived thresholds, and a sustained ingest
+soak test — see [`load-tests/README.md`](../load-tests/README.md) for the
+full runbook. These run in CI only via `workflow_dispatch`/a weekly schedule
+(`.github/workflows/load-tests.yml`), not on every PR.
 
 ---
 

@@ -15,6 +15,7 @@ import (
 
 	apigrpc "github.com/Depo-dev/trident/services/api/grpc"
 	"github.com/Depo-dev/trident/services/api/internal/httputil"
+	"github.com/Depo-dev/trident/services/api/middleware"
 	"github.com/Depo-dev/trident/services/api/validation"
 	"github.com/Depo-dev/trident/services/api/ws"
 	"github.com/jackc/pgx/v5"
@@ -111,6 +112,34 @@ func MetricsHandler() http.HandlerFunc {
 		_, _ = fmt.Fprintf(w, "# TYPE trident_sse_slow_consumer_disconnects_total counter\n")
 		_, _ = fmt.Fprintf(w, "trident_sse_slow_consumer_disconnects_total %d\n", metricSSESlowConsumerDisconnects.Load())
 		ws.WriteMetrics(w)
+
+		// Abuse-protection rejection counters, split by reason (issue #318):
+		// per-key (existing TieredRateLimit), per-IP, and global concurrency
+		// shedding.
+		rlAllowedN, rlRejectedN := middleware.RateLimitMetrics()
+		_, _ = fmt.Fprintf(w, "# HELP trident_ratelimit_key_allowed_total Requests allowed by the per-API-key tiered rate limiter.\n")
+		_, _ = fmt.Fprintf(w, "# TYPE trident_ratelimit_key_allowed_total counter\n")
+		_, _ = fmt.Fprintf(w, "trident_ratelimit_key_allowed_total %d\n", rlAllowedN)
+		_, _ = fmt.Fprintf(w, "# HELP trident_ratelimit_key_rejected_total Requests rejected by the per-API-key tiered rate limiter.\n")
+		_, _ = fmt.Fprintf(w, "# TYPE trident_ratelimit_key_rejected_total counter\n")
+		_, _ = fmt.Fprintf(w, "trident_ratelimit_key_rejected_total %d\n", rlRejectedN)
+
+		ipAllowedN, ipRejectedN, globalAllowedN, globalRejectedN := middleware.AbuseMetrics()
+		_, _ = fmt.Fprintf(w, "# HELP trident_ratelimit_ip_allowed_total Requests allowed by the pre-auth per-IP rate limiter.\n")
+		_, _ = fmt.Fprintf(w, "# TYPE trident_ratelimit_ip_allowed_total counter\n")
+		_, _ = fmt.Fprintf(w, "trident_ratelimit_ip_allowed_total %d\n", ipAllowedN)
+		_, _ = fmt.Fprintf(w, "# HELP trident_ratelimit_ip_rejected_total Requests rejected by the pre-auth per-IP rate limiter.\n")
+		_, _ = fmt.Fprintf(w, "# TYPE trident_ratelimit_ip_rejected_total counter\n")
+		_, _ = fmt.Fprintf(w, "trident_ratelimit_ip_rejected_total %d\n", ipRejectedN)
+		_, _ = fmt.Fprintf(w, "# HELP trident_concurrency_allowed_total Requests allowed through the global concurrency cap.\n")
+		_, _ = fmt.Fprintf(w, "# TYPE trident_concurrency_allowed_total counter\n")
+		_, _ = fmt.Fprintf(w, "trident_concurrency_allowed_total %d\n", globalAllowedN)
+		_, _ = fmt.Fprintf(w, "# HELP trident_concurrency_rejected_total Requests shed by the global concurrency cap.\n")
+		_, _ = fmt.Fprintf(w, "# TYPE trident_concurrency_rejected_total counter\n")
+		_, _ = fmt.Fprintf(w, "trident_concurrency_rejected_total %d\n", globalRejectedN)
+		_, _ = fmt.Fprintf(w, "# HELP trident_concurrency_in_flight Requests currently in flight.\n")
+		_, _ = fmt.Fprintf(w, "# TYPE trident_concurrency_in_flight gauge\n")
+		_, _ = fmt.Fprintf(w, "trident_concurrency_in_flight %d\n", middleware.InFlightRequests())
 	}
 }
 

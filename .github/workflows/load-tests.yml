@@ -1,0 +1,225 @@
+name: Load Tests
+
+# Opt-in / scheduled load + soak testing (issue #322). Deliberately NOT run
+# on push/pull_request — only workflow_dispatch (manual) and a weekly
+# schedule, so it never gates a PR (explicitly out of scope per the issue:
+# "not a full performance-regression gate on every PR").
+#
+# Spins up the same docker-compose stack as ci.yml's `e2e` job, runs the k6
+# scenarios in load-tests/ against it, and uploads the k6 summaries as
+# artifacts. The ingest soak test (load-tests/ingest-soak.sh) is run
+# separately with a shorter duration than a real staging soak run would use,
+# since this workflow runs against an ephemeral single-node CI runner rather
+# than a representative environment — see load-tests/README.md's
+# limitations section.
+#
+# grafana/k6-action is pinned to a release tag rather than a commit SHA,
+# matching the same tradeoff already made in security-scan.yml (see that
+# file's header comment) — verifying and recording the correct SHA requires
+# an authenticated network lookup this change was authored without; pin to
+# SHA as a follow-up.
+
+on:
+  workflow_dispatch:
+    inputs:
+      soak_duration_seconds:
+        description: "Ingest soak test duration in seconds"
+        required: false
+        default: "600"
+  schedule:
+    # Weekly, off-peak — catches capacity/latency regressions that
+    # accumulated over a week of merged PRs without gating any single one.
+    - cron: "0 7 * * 1"
+
+concurrency:
+  group: load-tests-${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  api-load:
+    name: API load scenarios (k6)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@2b51285047da1547ffb1b2203d8be4c0af6b1f20 # v3.2.0
+
+      - name: Build and start the stack
+        run: |
+          docker compose \
+            -f docker/docker-compose.yml \
+            -f docker/docker-compose.ci.yml \
+            --env-file .env.ci \
+            up -d --build
+
+      - name: Wait for Go API to become healthy
+        run: |
+          curl --silent --fail --retry 20 --retry-delay 5 --retry-connrefused \
+            --max-time 10 http://localhost:3000/v1/health
+
+      - name: Run k6 load scenarios
+        uses: grafana/k6-action@v0.3.1
+        env:
+          BASE_URL: http://localhost:3000
+          # Pre-seeded in Postgres via docker/ci-seed.sql (see ci.yml's e2e
+          # job) — DO NOT use this key outside CI.
+          API_KEY: ci-test-api-key-do-not-use-in-production
+          DURATION: "1m"
+        with:
+          filename: load-tests/events-load.js
+
+      - name: Run k6 batch scenario
+        uses: grafana/k6-action@v0.3.1
+        env:
+          BASE_URL: http://localhost:3000
+          API_KEY: ci-test-api-key-do-not-use-in-production
+          DURATION: "1m"
+        with:
+          filename: load-tests/batch-load.js
+
+      - name: Run k6 stats scenario
+        uses: grafana/k6-action@v0.3.1
+        env:
+          BASE_URL: http://localhost:3000
+          API_KEY: ci-test-api-key-do-not-use-in-production
+          DURATION: "1m"
+        with:
+          filename: load-tests/stats-load.js
+
+      - name: Run k6 stream scenario
+        uses: grafana/k6-action@v0.3.1
+        env:
+          BASE_URL: http://localhost:3000
+          API_KEY: ci-test-api-key-do-not-use-in-production
+          CONCURRENT_STREAMS: "10"
+          HOLD_SECONDS: "15"
+        with:
+          filename: load-tests/stream-load.js
+
+      - name: Dump service logs
+        if: always()
+        run: |
+          docker compose \
+            -f docker/docker-compose.yml \
+            -f docker/docker-compose.ci.yml \
+            --env-file .env.ci \
+            logs --no-color --timestamps
+
+      - name: Tear down
+        if: always()
+        run: |
+          docker compose \
+            -f docker/docker-compose.yml \
+            -f docker/docker-compose.ci.yml \
+            --env-file .env.ci \
+            down -v --remove-orphans
+
+  ingest-soak:
+    name: Ingest soak test
+    runs-on: ubuntu-latest
+    env:
+      STELLAR_CLI_VERSION: "25.2.0"
+      LOCAL_RPC_URL: http://localhost:8000/rpc
+      LOCAL_NETWORK_PASSPHRASE: "Standalone Network ; February 2017"
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1482605bfc5719782e1267fd0c0cc350fe7646b8 # v1.74.0
+        with:
+          targets: wasm32v1-none
+
+      - name: Cache Rust build artefacts
+        uses: Swatinem/rust-cache@23bce251a8cd2ffc3c1075eaa2367cf899916d84 # v2.7.3
+        with:
+          workspaces: contracts
+
+      - name: Build the reference token contract
+        working-directory: contracts
+        run: cargo build --release --target wasm32v1-none -p token
+
+      - name: Install the stellar CLI
+        run: |
+          set -euo pipefail
+          curl -sSfL \
+            "https://github.com/stellar/stellar-cli/releases/download/v${STELLAR_CLI_VERSION}/stellar-cli-${STELLAR_CLI_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar xz -C /usr/local/bin stellar
+          stellar --version
+
+      - name: Start local Soroban network
+        run: |
+          docker run -d --name stellar-quickstart -p 8000:8000 \
+            stellar/quickstart:testing --local --enable rpc,horizon
+
+      - name: Wait for the local network to become healthy
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sSf -X POST "$LOCAL_RPC_URL" \
+                -H 'Content-Type: application/json' \
+                -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' \
+                | grep -q '"status":"healthy"'; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Local network did not become healthy in time." >&2
+          exit 1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@2b51285047da1547ffb1b2203d8be4c0af6b1f20 # v3.2.0
+
+      - name: Start the full stack against the local network
+        run: |
+          docker compose \
+            -f docker/docker-compose.yml \
+            -f docker/docker-compose.ci.yml \
+            -f docker/docker-compose.e2e.yml \
+            --env-file .env.ci \
+            up -d --build
+
+      - name: Wait for Go API to become healthy
+        run: |
+          curl --silent --fail --retry 20 --retry-delay 5 --retry-connrefused \
+            --max-time 10 http://localhost:3000/v1/health
+
+      - name: Run ingest soak test
+        run: |
+          chmod +x load-tests/ingest-soak.sh
+          SOAK_DURATION_SECONDS="${{ github.event.inputs.soak_duration_seconds || '600' }}" \
+          SAMPLE_INTERVAL_SECONDS=15 \
+          MINT_INTERVAL_SECONDS=2 \
+          GO_API_CONTAINER=docker-api-1 \
+          INDEXER_CONTAINER=docker-indexer-1 \
+            ./load-tests/ingest-soak.sh
+
+      - name: Upload soak results
+        if: always()
+        uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6a1 # v4.4.0
+        with:
+          name: ingest-soak-results
+          path: load-tests/soak-results/
+          retention-days: 30
+
+      - name: Dump service logs
+        if: always()
+        run: |
+          echo "=== quickstart logs ==="
+          docker logs stellar-quickstart || true
+          docker compose \
+            -f docker/docker-compose.yml \
+            -f docker/docker-compose.ci.yml \
+            -f docker/docker-compose.e2e.yml \
+            --env-file .env.ci \
+            logs --no-color --timestamps
+
+      - name: Tear down
+        if: always()
+        run: |
+          docker compose \
+            -f docker/docker-compose.yml \
+            -f docker/docker-compose.ci.yml \
+            -f docker/docker-compose.e2e.yml \
+            --env-file .env.ci \
+            down -v --remove-orphans
+          docker rm -f stellar-quickstart || true
