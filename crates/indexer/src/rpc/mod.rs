@@ -1,6 +1,7 @@
 pub mod endpoints;
+pub mod health;
 
-use std::sync::Mutex;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -11,7 +12,7 @@ pub mod filters;
 pub use filters::{EventFilter, FilterPlan};
 
 use crate::metrics;
-use endpoints::EndpointPool;
+use health::RpcHealthScorer;
 
 /// A single raw event as returned by the Stellar RPC `getEvents` method.
 /// Topics and data are base64-encoded XDR strings; the parser decodes them.
@@ -245,9 +246,8 @@ fn rpc_transport_error(err: reqwest::Error, context: &'static str) -> TridentErr
 
 pub struct RpcClient {
     http: reqwest::Client,
-    /// Prioritised endpoint pool; a single-endpoint deployment is just a pool
-    /// of length one (issue #213).
-    pool: Mutex<EndpointPool>,
+    /// Health scorer for multi-RPC failover with dynamic scoring.
+    scorer: Arc<RpcHealthScorer>,
 }
 
 impl RpcClient {
@@ -255,67 +255,51 @@ impl RpcClient {
     /// timeouts and connection-pool settings (issue #214).
     #[cfg(test)]
     pub fn with_settings(url: String, settings: &RpcHttpSettings) -> Result<Self, TridentError> {
-        Self::with_endpoints(vec![url], settings, 3, Duration::from_secs(30))
+        Self::with_endpoints(vec![url], settings)
     }
 
     /// Build a client over a prioritised endpoint list with health-based
-    /// failover (issue #213).
+    /// failover using dynamic scoring (multi-RPC failover).
     pub fn with_endpoints(
         urls: Vec<String>,
         settings: &RpcHttpSettings,
-        failover_threshold: u32,
-        endpoint_cooldown: Duration,
     ) -> Result<Self, TridentError> {
-        let pool = EndpointPool::new(urls, failover_threshold, endpoint_cooldown)?;
-        metrics::set_rpc_active_endpoint(pool.active_index());
+        let scorer = Arc::new(RpcHealthScorer::new(urls)?);
 
         Ok(Self {
             http: settings.build_client()?,
-            pool: Mutex::new(pool),
+            scorer,
         })
     }
 
-    /// Index of the endpoint currently serving traffic (0 = primary).
-    #[cfg(test)]
-    pub fn active_endpoint_index(&self) -> usize {
-        self.pool
-            .lock()
-            .expect("endpoint pool mutex poisoned")
-            .active_index()
+    /// Get the health scorer for testing and monitoring purposes.
+    pub fn health_scorer(&self) -> &Arc<RpcHealthScorer> {
+        &self.scorer
     }
 
-    /// Endpoint to use for the next request, after any pending recovery back to
-    /// a higher-priority endpoint.
+    /// Select the healthiest endpoint for the next request.
     fn select_endpoint(&self) -> String {
-        let mut pool = self.pool.lock().expect("endpoint pool mutex poisoned");
-        let (url, changed) = pool.select();
-        if changed {
-            metrics::set_rpc_active_endpoint(pool.active_index());
-            tracing::info!(endpoint = %url, "Recovered to higher-priority RPC endpoint");
-        }
-        url
+        self.scorer.select_best_endpoint()
     }
 
-    /// Clear the failure streak for the active endpoint after a good response.
-    fn record_success(&self) {
-        self.pool
-            .lock()
-            .expect("endpoint pool mutex poisoned")
-            .record_success();
+    /// Record a successful response from the given endpoint.
+    fn record_success(&self, url: &str, ledger: Option<u64>) {
+        self.scorer.record_success(url, ledger);
     }
 
-    /// Record a failed call; fails over to the next healthy endpoint once the
-    /// configured threshold is reached.
-    fn record_failure(&self) {
-        let mut pool = self.pool.lock().expect("endpoint pool mutex poisoned");
-        if pool.record_failure() {
-            metrics::record_rpc_failover();
-            metrics::set_rpc_active_endpoint(pool.active_index());
-            tracing::warn!(
-                endpoint = %pool.active_url(),
-                "RPC endpoint failed repeatedly, failing over"
-            );
-        }
+    /// Record a timeout error from the given endpoint.
+    fn record_timeout(&self, url: &str) {
+        self.scorer.record_timeout(url);
+    }
+
+    /// Record a non-200 HTTP response from the given endpoint.
+    fn record_non_200(&self, url: &str) {
+        self.scorer.record_non_200(url);
+    }
+
+    /// Record a JSON-RPC error from the given endpoint.
+    fn record_rpc_error(&self, url: &str) {
+        self.scorer.record_rpc_error(url);
     }
 
     /// Run one JSON-RPC call against the active endpoint, updating endpoint
@@ -341,10 +325,29 @@ impl RpcClient {
 
         let result = self.execute(&url, &req, context).await;
         match &result {
-            Ok(_) => self.record_success(),
-            Err(_) => self.record_failure(),
+            Ok(_) => self.record_success(&url, None),
+            Err(e) => self.record_error(&url, e),
         }
         result
+    }
+
+    /// Record an error based on its type.
+    fn record_error(&self, url: &str, error: &TridentError) {
+        let error_str = error.to_string();
+        if error_str.contains("timed out") {
+            self.record_timeout(url);
+        } else if error_str.contains("HTTP 4") || error_str.contains("HTTP 5") {
+            self.record_non_200(url);
+        } else if error_str.contains("RPC error") {
+            self.record_rpc_error(url);
+        } else if error_str.contains("connection refused") {
+            self.record_connection_refused(url);
+        }
+    }
+
+    /// Record a connection refused error from the given endpoint.
+    fn record_connection_refused(&self, url: &str) {
+        self.scorer.record_connection_refused(url);
     }
 
     async fn execute<P, R>(
@@ -422,14 +425,31 @@ impl RpcClient {
         limit: u32,
         filters: &[EventFilter],
     ) -> Result<EventsPage, TridentError> {
+        let url = self.select_endpoint();
         let params = GetEventsParams {
             start_ledger,
             filters,
             pagination: Pagination { limit, cursor },
         };
 
-        let result: GetEventsResult = self.call("getEvents", 1, params, "getEvents").await?;
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0",
+            id: 1,
+            method: "getEvents",
+            params: &params,
+        };
 
+        let result: Result<GetEventsResult, TridentError> = self.execute(&url, &req, "getEvents").await;
+        match &result {
+            Ok(r) => {
+                self.record_success(&url, Some(r.latest_ledger));
+                // Check for stale ledger
+                self.scorer.check_and_record_stale(&url);
+            }
+            Err(e) => self.record_error(&url, e),
+        }
+
+        let result = result?;
         Ok(EventsPage {
             events: result.events,
             latest_ledger: result.latest_ledger,
@@ -462,6 +482,18 @@ impl RpcClient {
             .call("getLedgerEntries", 5, params, "getLedgerEntries")
             .await?;
         Ok(result.entries.unwrap_or_default())
+    }
+
+    /// Simulate a Soroban transaction via `simulateTransaction` (issue #263).
+    ///
+    /// Used for read-only host function calls (e.g., token name/symbol/decimals).
+    pub async fn simulate_transaction(
+        &self,
+        transaction: &str,
+    ) -> Result<SimulateTransactionResult, TridentError> {
+        let params = SimulateTransactionParams { transaction };
+        self.call("simulateTransaction", 4, params, "simulateTransaction")
+            .await
     }
 }
 
@@ -570,15 +602,16 @@ mod tests {
         let client = RpcClient::with_endpoints(
             vec![primary.uri(), secondary.uri()],
             &fast_timeout_settings(),
-            2,
-            Duration::from_millis(200),
         )
         .unwrap();
 
-        // Two failures on the primary trip the failover threshold.
+        // Two failures on the primary should cause it to be scored lower.
         assert!(client.get_events(Some(1), None, 10, &[]).await.is_err());
         assert!(client.get_events(Some(1), None, 10, &[]).await.is_err());
-        assert_eq!(client.active_endpoint_index(), 1);
+
+        // The health scorer should now prefer the secondary endpoint.
+        let best_endpoint = client.health_scorer().select_best_endpoint();
+        assert_eq!(best_endpoint, secondary.uri());
 
         // The secondary now serves traffic successfully.
         let page = client
@@ -586,15 +619,6 @@ mod tests {
             .await
             .expect("secondary must serve the request");
         assert_eq!(page.latest_ledger, 100);
-
-        // Once the primary's cooldown elapses it is selected again.
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        assert!(client.get_events(Some(1), None, 10, &[]).await.is_err());
-        assert_eq!(
-            client.active_endpoint_index(),
-            0,
-            "primary should be probed again after cooldown"
-        );
     }
 
     /// A single healthy endpoint never fails over, and non-2xx responses from
@@ -612,7 +636,6 @@ mod tests {
 
         assert!(err.to_string().contains("429"), "got: {err}");
         assert_eq!(err.severity(), Severity::Retryable);
-        assert_eq!(client.active_endpoint_index(), 0);
     }
 
     /// Requests are served by the primary while it is healthy.
@@ -626,15 +649,15 @@ mod tests {
         let client = RpcClient::with_endpoints(
             vec![primary.uri(), secondary.uri()],
             &fast_timeout_settings(),
-            2,
-            Duration::from_millis(200),
         )
         .unwrap();
 
         for _ in 0..3 {
             client.get_events(Some(1), None, 10, &[]).await.unwrap();
         }
-        assert_eq!(client.active_endpoint_index(), 0);
+        // Primary should still be preferred (both at 100, primary was first)
+        let best_endpoint = client.health_scorer().select_best_endpoint();
+        assert_eq!(best_endpoint, primary.uri());
         assert_eq!(secondary.received_requests().await.unwrap().len(), 0);
     }
 
