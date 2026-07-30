@@ -3,6 +3,7 @@
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _version
 
+from ._config import TridentConfigError
 from .client import TridentClient
 from .async_client import AsyncTridentClient
 from .errors import TridentApiError
@@ -21,6 +22,7 @@ __all__ = [
     "TridentClient",
     "AsyncTridentClient",
     "TridentApiError",
+    "TridentConfigError",
     "SorobanEvent",
     "PaginatedEvents",
     "Network",

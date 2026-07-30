@@ -96,6 +96,7 @@ func TestGetEventByID(t *testing.T) {
 
 	client := NewClient(TridentClientConfig{
 		BaseURL: server.URL,
+		APIKey:  "test-key",
 	})
 
 	res, err := client.GetEventByID(context.Background(), "550e8400-e29b-41d4-a716-446655440000")
@@ -342,6 +343,10 @@ func TestSubscribeToContract_ReceivesAndDecodesEvent(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(TridentClientConfig{BaseURL: server.URL})
+	client := NewClient(TridentClientConfig{
+		BaseURL: server.URL,
+		APIKey:  "test-key",
+	})
 
 	sub, err := client.SubscribeToContract(context.Background(), SubscribeToContractParams{
 		ContractID: "C123",

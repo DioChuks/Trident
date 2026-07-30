@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Depo-dev/trident/services/api/internal/httputil"
+	"github.com/Depo-dev/trident/services/api/middleware"
 	"github.com/Depo-dev/trident/services/api/validation"
 	"github.com/stellar/go/strkey"
 	"github.com/stellar/go/txnbuild"
@@ -91,6 +92,10 @@ func CallContract(rpc SorobanRPCCaller) http.HandlerFunc {
 
 		var req contractCallRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			if middleware.IsBodyTooLarge(err) {
+				middleware.WriteBodyTooLarge(w, r)
+				return
+			}
 			httputil.WriteErrorCtx(ctx, w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, "request body must be valid JSON")
 			return
 		}

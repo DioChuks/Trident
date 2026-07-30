@@ -49,6 +49,12 @@ pub const RPC_ERRORS_TOTAL: &str = "trident_indexer_rpc_errors_total";
 /// `time() - trident_indexer_last_poll_timestamp_seconds > N` as a
 /// dead-man's-switch alert for a stalled indexer (#218).
 pub const HEARTBEAT_TIMESTAMP: &str = "trident_indexer_last_poll_timestamp_seconds";
+/// Bounded per-contract event counter. Labels: `contract` (allowlisted contract ID or `"other"`).
+/// Cardinality: |allowlist| + 1. In index-all mode (no allowlist) all events land in `"other"`.
+pub const EVENTS_BY_CONTRACT_TOTAL: &str = "trident_indexer_events_by_contract_total";
+pub const EVENT_DECODE_DURATION_SECONDS: &str = "trident_indexer_event_decode_duration_seconds";
+/// Health score (0-100) for each RPC endpoint. Label: `endpoint` (URL).
+pub const RPC_HEALTH_SCORE: &str = "trident_rpc_health_score";
 
 /// Install the global Prometheus recorder and start serving `/metrics` on
 /// `port`. Must be called once, before the streamer starts recording.
@@ -124,6 +130,17 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     describe_counter!(
         RPC_ERRORS_TOTAL,
         "RPC call failures labelled by method and error_type (issue #294)"
+    describe_counter!(
+        EVENTS_BY_CONTRACT_TOTAL,
+        "Events processed per contract (bounded: allowlisted contract IDs + 'other' bucket)"
+    );
+    describe_histogram!(
+        EVENT_DECODE_DURATION_SECONDS,
+        "Time to XDR-decode a single event, in seconds (per-event parse latency)"
+    );
+    describe_gauge!(
+        RPC_HEALTH_SCORE,
+        "Health score (0-100) for each RPC endpoint (multi-RPC failover)"
     );
 
     // Counters only render in the scrape output once touched at least once;
@@ -240,4 +257,22 @@ pub fn record_rpc_call_duration(method: &'static str, endpoint_index: usize, sec
 /// failure mode is driving it (issue #294).
 pub fn record_rpc_error(method: &'static str, error_type: &'static str) {
     counter!(RPC_ERRORS_TOTAL, "method" => method, "error_type" => error_type).increment(1);
+/// Increment the per-contract event counter. `contract_id` must be either an
+/// allowlisted contract ID or the sentinel `"other"` — never an unbounded value.
+pub fn record_events_by_contract(contract_id: &str, count: u64) {
+    if count > 0 {
+        counter!(EVENTS_BY_CONTRACT_TOTAL, "contract" => contract_id.to_string()).increment(count);
+    }
+}
+
+pub fn record_decode_duration(seconds: f64) {
+    histogram!(EVENT_DECODE_DURATION_SECONDS).record(seconds);
+}
+
+/// Set the health score for a specific RPC endpoint.
+///
+/// Called by the health scorer after each score update so operators can see
+/// which endpoints are degraded and whether failover is working.
+pub fn set_rpc_health_score(endpoint: &str, score: u8) {
+    gauge!(RPC_HEALTH_SCORE, "endpoint" => endpoint.to_string()).set(score as f64);
 }

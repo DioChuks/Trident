@@ -6,6 +6,13 @@ on:
   pull_request:
     branches: [dev, main]
 
+# Cancel superseded runs on the same branch/PR so we don't burn CI minutes
+# (and queue time for everyone else) compiling a commit nobody cares about
+# anymore once a newer push has landed.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   # ---------------------------------------------------------------------------
   # Rust — format, lint, test, and SQLx prepare
@@ -13,6 +20,9 @@ jobs:
   rust:
     name: Rust
     runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     services:
       postgres:
         image: postgres:15-alpine
@@ -36,8 +46,24 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      # Check formatting first: it needs neither the Postgres service nor a
+      # compiled dependency graph, so a formatting mistake (the most common
+      # CI failure) is reported in seconds instead of after the DB migration
+      # and sqlx-prepare steps below have already run.
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      # sccache caches compiled objects in the GitHub Actions cache, keyed by
+      # crate/flags/rustc version, and is shared with the rust-integration
+      # job below (same workspace, same Cargo.lock) via the same GHA cache
+      # scope. Cuts recompilation between the two jobs to near-zero on a hit.
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+
       - name: Cache Rust build artefacts
         uses: Swatinem/rust-cache@23bce251a8cd2ffc3c1075eaa2367cf899916d84 # v2.7.3
+        with:
+          shared-key: rust-workspace
 
       - name: Install sqlx-cli
         uses: baptiste0928/cargo-install@904927dbe77864e0f2281519fe9d5bd097a220b3 # v3.0.1
@@ -57,9 +83,6 @@ jobs:
           DATABASE_URL: postgres://trident:password@localhost:5432/trident
         run: cargo sqlx prepare --workspace
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
       - name: Clippy (deny warnings)
         run: cargo clippy --all-targets --all-features -- -D warnings
 
@@ -67,6 +90,10 @@ jobs:
         env:
           DATABASE_URL: postgres://trident:password@localhost:5432/trident
         run: cargo test --all -- --test-threads=1
+
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats
 
   # ---------------------------------------------------------------------------
   # Go — vet and lint
@@ -192,6 +219,9 @@ jobs:
   sdk-rust:
     name: SDK (Rust)
     runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     defaults:
       run:
         working-directory: sdk/rust
@@ -199,6 +229,8 @@ jobs:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1482605bfc5719782e1267fd0c0cc350fe7646b8 # v1.74.0
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
       - name: Cache Rust build artefacts
         uses: Swatinem/rust-cache@23bce251a8cd2ffc3c1075eaa2367cf899916d84 # v2.7.3
         with:
@@ -207,6 +239,9 @@ jobs:
         run: cargo test --examples
       - name: Test library and docs
         run: cargo test
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats
 
   # ---------------------------------------------------------------------------
   # Contracts — reference Soroban contracts (issue #258).
@@ -220,6 +255,9 @@ jobs:
   contracts:
     name: Contracts
     runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     defaults:
       run:
         working-directory: contracts
@@ -231,16 +269,28 @@ jobs:
         with:
           targets: wasm32v1-none
 
+      # Shared with e2e-contract-events below via the same sccache GHA cache
+      # scope, so that job's rebuild of the token contract to wasm32v1-none
+      # (needed there to get a fresh Soroban deployment) reuses these
+      # compiled objects instead of building the same crate twice per CI run.
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+
       - name: Cache Rust build artefacts
         uses: Swatinem/rust-cache@23bce251a8cd2ffc3c1075eaa2367cf899916d84 # v2.7.3
         with:
           workspaces: contracts
+          shared-key: contracts-wasm
 
       - name: Run contract unit tests
         run: cargo test --workspace
 
       - name: Build contracts to WASM
         run: cargo build --release --target wasm32v1-none --workspace
+
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats
 
   # ---------------------------------------------------------------------------
   # OpenAPI specification — Spectral linting
@@ -285,6 +335,9 @@ jobs:
     if: >
       github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev') ||
       github.event_name == 'pull_request' && (github.base_ref == 'main' || github.base_ref == 'dev')
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     services:
       postgres:
         image: postgres:16
@@ -313,8 +366,22 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1482605bfc5719782e1267fd0c0cc350fe7646b8 # v1.74.0
 
+      # Shares the sccache object cache with the rust job (same workspace,
+      # same Cargo.lock) so this job's build reuses objects already compiled
+      # there instead of recompiling the whole workspace from scratch.
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+
       - name: Cache Rust build artefacts
         uses: Swatinem/rust-cache@23bce251a8cd2ffc3c1075eaa2367cf899916d84 # v2.7.3
+        with:
+          shared-key: rust-workspace
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache-dependency-path: services/api/go.sum
 
       # Apply the real migration chain (0001..latest) — the same artifact CI's
       # `rust` job and production apply. This validates the migrations as an
@@ -342,6 +409,10 @@ jobs:
           CI: "true"
         run: cargo test --all -- --include-ignored --test-threads=1
 
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats
+
   # ---------------------------------------------------------------------------
   # Docker — build images (no push)
   # Both application images are built here so the layer cache is warm when
@@ -357,6 +428,11 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@2b51285047da1547ffb1b2203d8be4c0af6b1f20 # v3.2.0
 
+      # Each image gets its own cache scope. Without an explicit `scope`, the
+      # gha cache backend defaults every build in the workflow to the same
+      # "buildkit" scope, so these three builds were overwriting each other's
+      # cache blobs on every run instead of accumulating a per-image cache —
+      # the main source of poor Docker cache hit-rate here.
       - name: Build Go API image
         uses: docker/build-push-action@2cdde995de11925a030ce8070c3d77a52ffcf1c0 # v5.3.0
         with:
@@ -364,8 +440,8 @@ jobs:
           file: services/api/Dockerfile
           push: false
           tags: trident-go-api:ci
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=go-api
+          cache-to: type=gha,mode=max,scope=go-api
 
       - name: Build Rust gRPC API image
         uses: docker/build-push-action@2cdde995de11925a030ce8070c3d77a52ffcf1c0 # v5.3.0
@@ -374,8 +450,8 @@ jobs:
           file: crates/api/Dockerfile
           push: false
           tags: trident-grpc-api:ci
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=grpc-api
+          cache-to: type=gha,mode=max,scope=grpc-api
 
       - name: Build Rust indexer image
         uses: docker/build-push-action@2cdde995de11925a030ce8070c3d77a52ffcf1c0 # v5.3.0
@@ -384,6 +460,16 @@ jobs:
           file: crates/indexer/Dockerfile
           push: false
           tags: trident-indexer:ci
+          cache-from: type=gha,scope=indexer
+          cache-to: type=gha,mode=max,scope=indexer
+
+      - name: Build database migration image
+        uses: docker/build-push-action@2cdde995de11925a030ce8070c3d77a52ffcf1c0 # v5.3.0
+        with:
+          context: .
+          file: database/Dockerfile
+          push: false
+          tags: trident-migrate:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -424,8 +510,8 @@ jobs:
           file: services/api/Dockerfile
           push: false
           tags: trident-go-api:ci
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=go-api
+          cache-to: type=gha,mode=max,scope=go-api
 
       - name: Restore Rust gRPC API image cache
         uses: docker/build-push-action@2cdde995de11925a030ce8070c3d77a52ffcf1c0 # v5.3.0
@@ -434,8 +520,8 @@ jobs:
           file: crates/api/Dockerfile
           push: false
           tags: trident-grpc-api:ci
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=grpc-api
+          cache-to: type=gha,mode=max,scope=grpc-api
 
       - name: Restore Rust indexer image cache
         uses: docker/build-push-action@2cdde995de11925a030ce8070c3d77a52ffcf1c0 # v5.3.0
@@ -444,8 +530,8 @@ jobs:
           file: crates/indexer/Dockerfile
           push: false
           tags: trident-indexer:ci
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=indexer
+          cache-to: type=gha,mode=max,scope=indexer
 
       - name: Build full stack images
         run: |
@@ -564,6 +650,8 @@ jobs:
       STELLAR_CLI_VERSION: "25.2.0"
       LOCAL_RPC_URL: http://localhost:8000/rpc
       LOCAL_NETWORK_PASSPHRASE: "Standalone Network ; February 2017"
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
 
     steps:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
@@ -573,14 +661,25 @@ jobs:
         with:
           targets: wasm32v1-none
 
+      # needs: [contracts, ...] above guarantees the contracts job (and its
+      # sccache writes) has already completed, so this reuses its compiled
+      # objects for the same token crate/target instead of rebuilding them.
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+
       - name: Cache Rust build artefacts
         uses: Swatinem/rust-cache@23bce251a8cd2ffc3c1075eaa2367cf899916d84 # v2.7.3
         with:
           workspaces: contracts
+          shared-key: contracts-wasm
 
       - name: Build the reference token contract
         working-directory: contracts
         run: cargo build --release --target wasm32v1-none -p token
+
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats
 
       - name: Install the stellar CLI
         run: |
@@ -686,7 +785,7 @@ jobs:
           file: services/api/Dockerfile
           push: false
           tags: trident-go-api:ci
-          cache-from: type=gha
+          cache-from: type=gha,scope=go-api
 
       - name: Restore Rust gRPC API image cache
         uses: docker/build-push-action@2cdde995de11925a030ce8070c3d77a52ffcf1c0 # v5.3.0
@@ -695,7 +794,7 @@ jobs:
           file: crates/api/Dockerfile
           push: false
           tags: trident-grpc-api:ci
-          cache-from: type=gha
+          cache-from: type=gha,scope=grpc-api
 
       - name: Restore Rust indexer image cache
         uses: docker/build-push-action@2cdde995de11925a030ce8070c3d77a52ffcf1c0 # v5.3.0
@@ -704,7 +803,7 @@ jobs:
           file: crates/indexer/Dockerfile
           push: false
           tags: trident-indexer:ci
-          cache-from: type=gha
+          cache-from: type=gha,scope=indexer
 
       - name: Start the full stack against the local network
         run: |
@@ -772,6 +871,18 @@ jobs:
             --env-file .env.ci \
             down -v --remove-orphans
           docker rm -f stellar-quickstart || true
+
+  # ---------------------------------------------------------------------------
+  # Environment reference — fails if code reads an env var undocumented in
+  # docs/ENVIRONMENT.md (issue #312).
+  # ---------------------------------------------------------------------------
+  env-reference:
+    name: Env reference
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+      - name: Check every env var the code reads is documented
+        run: bash scripts/check-env-reference.sh
 
   # ---------------------------------------------------------------------------
   # Helm — lint, template render, and kind cluster deployment validation
