@@ -33,6 +33,8 @@ pub const HEARTBEAT_TIMESTAMP: &str = "trident_indexer_last_poll_timestamp_secon
 /// Cardinality: |allowlist| + 1. In index-all mode (no allowlist) all events land in `"other"`.
 pub const EVENTS_BY_CONTRACT_TOTAL: &str = "trident_indexer_events_by_contract_total";
 pub const EVENT_DECODE_DURATION_SECONDS: &str = "trident_indexer_event_decode_duration_seconds";
+/// Health score (0-100) for each RPC endpoint. Label: `endpoint` (URL).
+pub const RPC_HEALTH_SCORE: &str = "trident_rpc_health_score";
 
 /// Install the global Prometheus recorder and start serving `/metrics` on
 /// `port`. Must be called once, before the streamer starts recording.
@@ -104,6 +106,10 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     describe_histogram!(
         EVENT_DECODE_DURATION_SECONDS,
         "Time to XDR-decode a single event, in seconds (per-event parse latency)"
+    );
+    describe_gauge!(
+        RPC_HEALTH_SCORE,
+        "Health score (0-100) for each RPC endpoint (multi-RPC failover)"
     );
 
     // Counters only render in the scrape output once touched at least once;
@@ -212,4 +218,12 @@ pub fn record_events_by_contract(contract_id: &str, count: u64) {
 
 pub fn record_decode_duration(seconds: f64) {
     histogram!(EVENT_DECODE_DURATION_SECONDS).record(seconds);
+}
+
+/// Set the health score for a specific RPC endpoint.
+///
+/// Called by the health scorer after each score update so operators can see
+/// which endpoints are degraded and whether failover is working.
+pub fn set_rpc_health_score(endpoint: &str, score: u8) {
+    gauge!(RPC_HEALTH_SCORE, "endpoint" => endpoint.to_string()).set(score as f64);
 }
