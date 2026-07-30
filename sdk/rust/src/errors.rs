@@ -27,4 +27,11 @@ pub enum TridentError {
 
     #[error("Deserialization error: {0}")]
     Deserialize(#[from] serde_json::Error),
+
+    #[error("request failed after {attempts} attempts: {last_error}")]
+    RetryExhausted {
+        attempts: u32,
+        #[source]
+        last_error: Box<TridentError>,
+    },
 }

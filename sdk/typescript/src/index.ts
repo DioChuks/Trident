@@ -1,11 +1,23 @@
 import { z } from "zod";
 import { parseApiError, TridentApiError, TridentError } from "./errors.js";
 import { createSubscription } from "./subscription.js";
-import { redactKey, resolveApiKey, resolveApiUrl } from "./config.js";
+import { iterEvents as iterEventsImpl } from "./iterator.js";
+import type { IterEventsOptions } from "./iterator.js";
+import {
+  computeBackoffMs,
+  isRetryableStatus,
+  parseRetryAfterMs,
+  resolveRetryConfig,
+  sleep,
+} from "./retry.js";
+import type { RetryConfig } from "./retry.js";
 
 export { TridentError, TridentApiError } from "./errors.js";
 export type { TridentErrorCode } from "./errors.js";
-export { ENV_API_KEY, ENV_BASE_URL } from "./config.js";
+export { iterEvents, DEFAULT_MAX_PAGES } from "./iterator.js";
+export type { IterEventsOptions, QueryEventsFn } from "./iterator.js";
+export { DEFAULT_RETRY_CONFIG } from "./retry.js";
+export type { RetryConfig } from "./retry.js";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -22,6 +34,19 @@ export interface TridentClientConfig {
   network: Network;
   webSocketImpl?: any;
   transport?: TransportType;
+  /**
+   * Retry policy applied to idempotent (GET) REST requests. Honours
+   * `Retry-After` on 429/503 responses, falling back to exponential backoff
+   * with jitter otherwise. Pass `false` to disable retries for this client.
+   * Defaults to {@link DEFAULT_RETRY_CONFIG}.
+   */
+  retry?: RetryConfig | false;
+}
+
+/** Per-call options accepted by {@link TridentClient.queryEvents} and {@link TridentClient.getEventById}. */
+export interface RequestOptions {
+  /** Overrides the client-level `retry` config for this call only. */
+  retry?: RetryConfig | false;
 }
 
 // ---------------------------------------------------------------------------
@@ -165,24 +190,58 @@ export class TridentClient {
   private async fetchJSON<T>(
     url: string,
     schema: z.ZodType<T>,
+    retryOverride?: RetryConfig | false,
   ): Promise<T> {
-    let res: Response;
-    try {
-      res = await fetch(url, { headers: this.headers });
-    } catch (cause) {
-      throw new TridentError("INTERNAL", "Network request failed", cause);
+    const retryCfg = resolveRetryConfig(retryOverride, this.config.retry);
+    const maxAttempts = retryCfg ? retryCfg.maxAttempts : 1;
+    let totalWaitedMs = 0;
+
+    for (let attempt = 1; ; attempt++) {
+      let res: Response;
+      try {
+        res = await fetch(url, { headers: this.headers });
+      } catch (cause) {
+        if (retryCfg && attempt < maxAttempts) {
+          const waitMs = computeBackoffMs(attempt, retryCfg);
+          if (totalWaitedMs + waitMs <= retryCfg.maxTotalWaitMs) {
+            totalWaitedMs += waitMs;
+            await sleep(waitMs);
+            continue;
+          }
+        }
+        const err = new TridentError(
+          attempt > 1 ? "RETRY_EXHAUSTED" : "INTERNAL",
+          attempt > 1
+            ? `Network request failed after ${attempt} attempts`
+            : "Network request failed",
+          cause,
+        );
+        err.attempts = attempt;
+        throw err;
+      }
+
+      if (!res.ok) {
+        if (retryCfg && isRetryableStatus(res.status) && attempt < maxAttempts) {
+          const retryAfterMs = parseRetryAfterMs(res.headers?.get?.("retry-after"));
+          const waitMs = retryAfterMs ?? computeBackoffMs(attempt, retryCfg);
+          if (totalWaitedMs + waitMs <= retryCfg.maxTotalWaitMs) {
+            totalWaitedMs += waitMs;
+            await sleep(waitMs);
+            continue;
+          }
+        }
+        const body = await res.text().catch(() => "");
+        const apiError = parseApiError(res.status, body);
+        apiError.attempts = attempt;
+        throw apiError;
+      }
+
+      const json: unknown = await res.json().catch((cause: unknown) => {
+        throw new TridentError("INTERNAL", "Failed to parse response JSON", cause);
+      });
+
+      return schema.parse(json);
     }
-
-    if (!res.ok) {
-      const body = await res.text().catch(() => "");
-      throw parseApiError(res.status, body);
-    }
-
-    const json: unknown = await res.json().catch((cause: unknown) => {
-      throw new TridentError("INTERNAL", "Failed to parse response JSON", cause);
-    });
-
-    return schema.parse(json);
   }
 
   private async getGraphQLTransport() {
@@ -201,7 +260,10 @@ export class TridentClient {
    * Results are cursor-paginated — pass the returned `cursor` as `after` on
    * the next call to fetch the next page.
    */
-  async queryEvents(params: QueryEventsParams): Promise<PaginatedEvents> {
+  async queryEvents(
+    params: QueryEventsParams,
+    options?: RequestOptions,
+  ): Promise<PaginatedEvents> {
     if (this.transport === "graphql") {
       const transport = await this.getGraphQLTransport();
       return transport.queryEvents(
@@ -228,8 +290,8 @@ export class TridentClient {
     if (params.limit !== undefined) qs.set("limit", String(params.limit));
     if (params.eventType) qs.set("event_type", params.eventType);
 
-    const url = `${this.apiUrl}/v1/events?${qs.toString()}`;
-    const resp = await this.fetchJSON(url, ApiListEventsResponseSchema);
+    const url = `${this.config.apiUrl}/v1/events?${qs.toString()}`;
+    const resp = await this.fetchJSON(url, ApiListEventsResponseSchema, options?.retry);
 
     return {
       events: resp.events.map(apiEventToSorobanEvent),
@@ -239,19 +301,46 @@ export class TridentClient {
   }
 
   /**
+   * Auto-paginating async iterator over {@link queryEvents}.
+   *
+   * Yields every matching event across every page, following the server's
+   * cursor automatically until there are no more results — so callers can just
+   * write `for await (const event of client.iterEvents(params))` instead of
+   * hand-rolling a `hasMore`/`cursor` loop.
+   *
+   * Stops when the server reports `has_more === false`. Fetches at most
+   * `options.maxPages` pages (default 100); if that limit is reached while more
+   * results remain, throws `TridentError` with code `ITERATION_LIMIT`. Any
+   * `TridentError` from an underlying page request propagates transparently.
+   */
+  iterEvents(
+    params: QueryEventsParams,
+    options?: IterEventsOptions,
+  ): AsyncIterable<SorobanEvent> {
+    return iterEventsImpl(
+      (p: QueryEventsParams) => this.queryEvents(p),
+      params,
+      options,
+    );
+  }
+
+  /**
    * Fetch a single event by its UUID.
    *
    * Throws `TridentError` with code `NOT_FOUND` if no event exists.
    */
-  async getEventById(params: GetEventByIdParams): Promise<SorobanEvent> {
+  async getEventById(
+    params: GetEventByIdParams,
+    options?: RequestOptions,
+  ): Promise<SorobanEvent> {
     if (this.transport === "graphql") {
       const transport = await this.getGraphQLTransport();
       return transport.getEventById(params.id);
     }
 
     // REST transport (default)
-    const url = `${this.apiUrl}/v1/events/${encodeURIComponent(params.id)}`;
-    const apiEvent = await this.fetchJSON(url, ApiEventSchema);
+    const url = `${this.config.apiUrl}/v1/events/${encodeURIComponent(params.id)}`;
+    const apiEvent = await this.fetchJSON(url, ApiEventSchema, options?.retry);
     return apiEventToSorobanEvent(apiEvent);
   }
 

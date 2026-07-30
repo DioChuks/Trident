@@ -107,7 +107,7 @@ func NewDBAuth(cfg DBAuthConfig) func(http.Handler) http.Handler {
 
 			key := r.Header.Get("X-API-Key")
 			if key == "" {
-				httputil.WriteError(w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "Unauthorized")
+				httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "Unauthorized")
 				return
 			}
 
@@ -155,7 +155,7 @@ func NewDBAuth(cfg DBAuthConfig) func(http.Handler) http.Handler {
 				}
 			}
 
-			httputil.WriteError(w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "Unauthorized")
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "Unauthorized")
 		})
 	}
 }
@@ -193,12 +193,12 @@ func Auth(validHashes map[string]struct{}, next http.Handler) http.Handler {
 
 		key := r.Header.Get("X-API-Key")
 		if key == "" {
-			httputil.WriteError(w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "Unauthorized")
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "Unauthorized")
 			return
 		}
 
 		if _, ok := validHashes[hmacKeyHash(key)]; !ok {
-			httputil.WriteError(w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "Unauthorized")
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "Unauthorized")
 			return
 		}
 

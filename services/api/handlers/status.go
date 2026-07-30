@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"crypto/subtle"
 	"net/http"
 	"os"
 	"sync"
@@ -16,12 +17,12 @@ var processStartTime = time.Now()
 
 // StatusResponse is the JSON response for GET /internal/status.
 type StatusResponse struct {
-	IndexerLagLedgers  int64 `json:"indexer_lag_ledgers"`
-	ActiveWSClients    int   `json:"active_ws_clients"`
-	RedisStreamDepth   int64 `json:"redis_stream_depth"`
-	DBPoolOpenConns    int32 `json:"db_pool_open_conns"`
-	ParseErrors24h     int64 `json:"parse_errors_24h"`
-	UptimeSeconds      int64 `json:"uptime_seconds"`
+	IndexerLagLedgers int64 `json:"indexer_lag_ledgers"`
+	ActiveWSClients   int   `json:"active_ws_clients"`
+	RedisStreamDepth  int64 `json:"redis_stream_depth"`
+	DBPoolOpenConns   int32 `json:"db_pool_open_conns"`
+	ParseErrors24h    int64 `json:"parse_errors_24h"`
+	UptimeSeconds     int64 `json:"uptime_seconds"`
 }
 
 // internalStatusDeps wraps dependencies for the status handler.
@@ -51,17 +52,29 @@ func SetInternalStatusDeps(db *pgxpool.Pool, redis *redis.Client, hub HubConn) {
 // InternalStatus handles GET /internal/status.
 // Requires X-Internal-Key header matching INTERNAL_API_KEY env var.
 // Returns 401 if missing or wrong, 200 with diagnostics on success.
+//
+// This endpoint is internal-only: it must never be reachable from outside the
+// cluster/VPC. Defense in depth is layered on top of this handler's own auth
+// check — see docker/nginx/nginx.conf and helm/trident/templates/ingress.yaml,
+// which both explicitly deny /internal/ before it ever reaches this handler.
 func InternalStatus() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Check X-Internal-Key header.
+		// Fail closed: an unset/empty INTERNAL_API_KEY must reject every
+		// request, never be treated as "auth disabled". Do not change this
+		// to skip the check when the env var is empty.
 		expectedKey := os.Getenv("INTERNAL_API_KEY")
 		if expectedKey == "" {
-			httputil.WriteError(w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "INTERNAL_API_KEY not configured")
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "INTERNAL_API_KEY not configured")
 			return
 		}
 		providedKey := r.Header.Get("X-Internal-Key")
-		if providedKey != expectedKey {
-			httputil.WriteError(w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "invalid X-Internal-Key")
+		// Constant-time comparison so response timing can't be used to learn
+		// the key byte-by-byte. ConstantTimeCompare requires equal-length
+		// inputs to be meaningful; a length mismatch is itself decisive (and
+		// not secret), so short-circuit it before the constant-time check.
+		if len(providedKey) != len(expectedKey) ||
+			subtle.ConstantTimeCompare([]byte(providedKey), []byte(expectedKey)) != 1 {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "invalid X-Internal-Key")
 			return
 		}
 

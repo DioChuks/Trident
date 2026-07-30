@@ -1,9 +1,18 @@
-use std::time::Instant;
+pub mod endpoints;
+pub mod health;
+
+use std::sync::Arc;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use trident_common::TridentError;
 
+pub mod filters;
+
+pub use filters::{EventFilter, FilterPlan};
+
 use crate::metrics;
+use health::RpcHealthScorer;
 
 /// A single raw event as returned by the Stellar RPC `getEvents` method.
 /// Topics and data are base64-encoded XDR strings; the parser decodes them.
@@ -83,10 +92,12 @@ struct LedgerSummary {
 }
 
 #[derive(Serialize)]
-struct GetEventsParams {
+struct GetEventsParams<'a> {
     #[serde(rename = "startLedger", skip_serializing_if = "Option::is_none")]
     start_ledger: Option<u64>,
-    filters: Vec<serde_json::Value>,
+    /// Server-side narrowing (issue #203). Always serialised — an empty array is
+    /// the RPC's "no filter" form and is what index-all mode sends.
+    filters: &'a [EventFilter],
     pagination: Pagination,
 }
 
@@ -104,70 +115,296 @@ struct GetEventsResult {
     latest_ledger: u64,
 }
 
+#[derive(Serialize)]
+struct GetTransactionParams<'a> {
+    hash: &'a str,
+}
+
+#[derive(Serialize)]
+struct GetLedgerEntriesParams<'a> {
+    keys: &'a [String],
+}
+
+#[derive(Deserialize)]
+struct GetLedgerEntriesResult {
+    entries: Option<Vec<LedgerEntryResult>>,
+}
+
+/// One entry returned by `getLedgerEntries` (issue #260 / #270). `key` and
+/// `xdr` are base64-encoded `LedgerKey` / `LedgerEntryData` XDR respectively;
+/// decoding them is owned by the caller (`crate::spec`, `crate::storage`).
+#[derive(Debug, Deserialize)]
+pub struct LedgerEntryResult {
+    pub key: String,
+    pub xdr: String,
+}
+
+/// Result of the Soroban RPC `getTransaction` call (issue #266).
+///
+/// `envelope_xdr` / `result_xdr` are only present when `status` is not
+/// `"NOT_FOUND"`. Decoding them is owned by
+/// `crate::parser::invocation_metrics`, not this transport layer.
+#[derive(Debug, Deserialize)]
+pub struct GetTransactionResult {
+    pub status: String,
+    #[serde(rename = "envelopeXdr")]
+    pub envelope_xdr: Option<String>,
+    #[serde(rename = "resultXdr")]
+    pub result_xdr: Option<String>,
+}
+
+#[derive(Serialize)]
+struct SimulateTransactionParams<'a> {
+    transaction: &'a str,
+}
+
+/// One entry of `simulateTransaction`'s `results` array — the base64 XDR
+/// `ScVal` a read-only host function call returned.
+#[derive(Debug, Deserialize)]
+pub struct SimulateHostFunctionResult {
+    pub xdr: String,
+}
+
+/// Result of the Soroban RPC `simulateTransaction` call (issue #263).
+///
+/// `error` is set (and `results` empty) when the simulated invocation failed,
+/// e.g. the contract has no function by that name — the caller treats that as
+/// "not a token" rather than a transport failure. Decoding `results[].xdr` is
+/// owned by `crate::token_metadata`.
+#[derive(Debug, Deserialize)]
+pub struct SimulateTransactionResult {
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub results: Vec<SimulateHostFunctionResult>,
+}
+
 // ---------------------------------------------------------------------------
 // RPC client
 // ---------------------------------------------------------------------------
 
+/// HTTP transport settings for the RPC client (issue #214).
+///
+/// A default `reqwest::Client` has no request timeout at all, so a stalled
+/// response blocks the poll loop forever — the retry wrapper only sees returned
+/// errors, never a call that never returns. Every field here is derived from
+/// `Config` so operators can tune it per environment.
+#[derive(Debug, Clone)]
+pub struct RpcHttpSettings {
+    pub connect_timeout: Duration,
+    pub request_timeout: Duration,
+    pub pool_idle_timeout: Duration,
+    pub pool_max_idle_per_host: usize,
+    pub tcp_keepalive: Duration,
+}
+
+impl Default for RpcHttpSettings {
+    fn default() -> Self {
+        Self {
+            connect_timeout: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(30),
+            pool_idle_timeout: Duration::from_secs(90),
+            pool_max_idle_per_host: 8,
+            tcp_keepalive: Duration::from_secs(60),
+        }
+    }
+}
+
+impl RpcHttpSettings {
+    /// Build the shared `reqwest::Client`: bounded connect/request timeouts plus
+    /// keep-alive and idle-pool tuning so successive polls reuse connections
+    /// instead of paying a fresh TCP + TLS handshake each time.
+    fn build_client(&self) -> Result<reqwest::Client, TridentError> {
+        reqwest::Client::builder()
+            .connect_timeout(self.connect_timeout)
+            .timeout(self.request_timeout)
+            .pool_idle_timeout(self.pool_idle_timeout)
+            .pool_max_idle_per_host(self.pool_max_idle_per_host)
+            .tcp_keepalive(self.tcp_keepalive)
+            .build()
+            .map_err(|e| {
+                TridentError::config(
+                    anyhow::Error::new(e).context("failed to build RPC HTTP client"),
+                )
+            })
+    }
+}
+
+/// Convert a `reqwest` transport failure into a retryable [`TridentError`],
+/// tagging timeouts explicitly so they are visible in logs and metrics.
+///
+/// `RpcError` is already classified `Severity::Retryable`, which is what makes
+/// the backoff wrapper and the poll loop treat a timeout as a transient failure
+/// rather than a poison input (issue #214).
+fn rpc_transport_error(err: reqwest::Error, context: &'static str) -> TridentError {
+    if err.is_timeout() {
+        metrics::record_rpc_timeout();
+        return TridentError::rpc(anyhow::Error::new(err).context(format!("{context} timed out")));
+    }
+    TridentError::rpc(anyhow::Error::new(err).context(context))
+}
+
 pub struct RpcClient {
     http: reqwest::Client,
-    url: String,
+    /// Health scorer for multi-RPC failover with dynamic scoring.
+    scorer: Arc<RpcHealthScorer>,
 }
 
 impl RpcClient {
-    pub fn new(url: String) -> Self {
-        Self {
-            http: reqwest::Client::new(),
-            url,
+    /// Build a single-endpoint client whose transport honours the configured
+    /// timeouts and connection-pool settings (issue #214).
+    #[cfg(test)]
+    pub fn with_settings(url: String, settings: &RpcHttpSettings) -> Result<Self, TridentError> {
+        Self::with_endpoints(vec![url], settings)
+    }
+
+    /// Build a client over a prioritised endpoint list with health-based
+    /// failover using dynamic scoring (multi-RPC failover).
+    pub fn with_endpoints(
+        urls: Vec<String>,
+        settings: &RpcHttpSettings,
+    ) -> Result<Self, TridentError> {
+        let scorer = Arc::new(RpcHealthScorer::new(urls)?);
+
+        Ok(Self {
+            http: settings.build_client()?,
+            scorer,
+        })
+    }
+
+    /// Get the health scorer for testing and monitoring purposes.
+    pub fn health_scorer(&self) -> &Arc<RpcHealthScorer> {
+        &self.scorer
+    }
+
+    /// Select the healthiest endpoint for the next request.
+    fn select_endpoint(&self) -> String {
+        self.scorer.select_best_endpoint()
+    }
+
+    /// Record a successful response from the given endpoint.
+    fn record_success(&self, url: &str, ledger: Option<u64>) {
+        self.scorer.record_success(url, ledger);
+    }
+
+    /// Record a timeout error from the given endpoint.
+    fn record_timeout(&self, url: &str) {
+        self.scorer.record_timeout(url);
+    }
+
+    /// Record a non-200 HTTP response from the given endpoint.
+    fn record_non_200(&self, url: &str) {
+        self.scorer.record_non_200(url);
+    }
+
+    /// Record a JSON-RPC error from the given endpoint.
+    fn record_rpc_error(&self, url: &str) {
+        self.scorer.record_rpc_error(url);
+    }
+
+    /// Run one JSON-RPC call against the active endpoint, updating endpoint
+    /// health from the outcome.
+    async fn call<P, R>(
+        &self,
+        method: &str,
+        id: u64,
+        params: P,
+        context: &'static str,
+    ) -> Result<R, TridentError>
+    where
+        P: Serialize,
+        R: serde::de::DeserializeOwned,
+    {
+        let url = self.select_endpoint();
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0",
+            id,
+            method,
+            params,
+        };
+
+        let result = self.execute(&url, &req, context).await;
+        match &result {
+            Ok(_) => self.record_success(&url, None),
+            Err(e) => self.record_error(&url, e),
         }
+        result
+    }
+
+    /// Record an error based on its type.
+    fn record_error(&self, url: &str, error: &TridentError) {
+        let error_str = error.to_string();
+        if error_str.contains("timed out") {
+            self.record_timeout(url);
+        } else if error_str.contains("HTTP 4") || error_str.contains("HTTP 5") {
+            self.record_non_200(url);
+        } else if error_str.contains("RPC error") {
+            self.record_rpc_error(url);
+        } else if error_str.contains("connection refused") {
+            self.record_connection_refused(url);
+        }
+    }
+
+    /// Record a connection refused error from the given endpoint.
+    fn record_connection_refused(&self, url: &str) {
+        self.scorer.record_connection_refused(url);
+    }
+
+    async fn execute<P, R>(
+        &self,
+        url: &str,
+        req: &JsonRpcRequest<'_, P>,
+        context: &'static str,
+    ) -> Result<R, TridentError>
+    where
+        P: Serialize,
+        R: serde::de::DeserializeOwned,
+    {
+        let resp = self
+            .http
+            .post(url)
+            .json(req)
+            .send()
+            .await
+            .map_err(|e| rpc_transport_error(e, context))?;
+
+        // A non-2xx response (rate limit, 5xx) is an endpoint failure, not a
+        // decode failure — surface it as such so failover can react.
+        if !resp.status().is_success() {
+            return Err(TridentError::rpc(anyhow::anyhow!(
+                "{context}: endpoint {url} returned HTTP {}",
+                resp.status()
+            )));
+        }
+
+        let body: JsonRpcResponse<R> = resp
+            .json()
+            .await
+            .map_err(|e| rpc_transport_error(e, context))?;
+
+        if let Some(err) = body.error {
+            return Err(TridentError::rpc(anyhow::anyhow!(
+                "{context}: RPC error {}: {}",
+                err.code,
+                err.message
+            )));
+        }
+
+        body.result
+            .ok_or_else(|| TridentError::rpc(anyhow::anyhow!("{context}: empty result")))
     }
 
     /// Fetch the ledger hash for a given sequence number via `getLedgers`.
     /// Returns `None` if the RPC does not know about that ledger yet.
     pub async fn get_ledger(&self, sequence: u64) -> Result<Option<String>, TridentError> {
-        let start = Instant::now();
-        let result = self.get_ledger_inner(sequence).await;
-        metrics::record_rpc_call("getLedgers", start.elapsed().as_secs_f64(), result.is_err());
-        result
-    }
-
-    async fn get_ledger_inner(&self, sequence: u64) -> Result<Option<String>, TridentError> {
         let params = GetLedgersParams {
             start_ledger: sequence,
             pagination: LedgerPagination { limit: 1 },
         };
-        let req = JsonRpcRequest {
-            jsonrpc: "2.0",
-            id: 2,
-            method: "getLedgers",
-            params,
-        };
 
-        let resp = self
-            .http
-            .post(&self.url)
-            .json(&req)
-            .send()
-            .await
-            .map_err(|e| TridentError::RpcError(format!("getLedgers HTTP failed: {e}")))?;
+        let result: GetLedgersResult = self.call("getLedgers", 2, params, "getLedgers").await?;
 
-        let body: JsonRpcResponse<GetLedgersResult> = resp
-            .json()
-            .await
-            .map_err(|e| TridentError::RpcError(format!("getLedgers decode failed: {e}")))?;
-
-        if let Some(err) = body.error {
-            return Err(TridentError::RpcError(format!(
-                "getLedgers RPC error {}: {}",
-                err.code, err.message
-            )));
-        }
-
-        let hash = body
-            .result
-            .and_then(|r| r.ledgers.into_iter().next())
-            .map(|l| l.hash);
-
-        Ok(hash)
+        Ok(result.ledgers.into_iter().next().map(|l| l.hash))
     }
 
     /// Fetch a page of events from the Stellar RPC node.
@@ -178,27 +415,20 @@ impl RpcClient {
     /// set at a time — the RPC rejects requests that supply both.
     ///
     /// `limit` controls the page size; callers should pass `config.max_events_per_poll`.
+    ///
+    /// `filters` narrows the result set server-side (issue #203). Pass an empty
+    /// slice to index every contract.
     pub async fn get_events(
         &self,
         start_ledger: Option<u64>,
         cursor: Option<String>,
         limit: u32,
+        filters: &[EventFilter],
     ) -> Result<EventsPage, TridentError> {
-        let start = Instant::now();
-        let result = self.get_events_inner(start_ledger, cursor, limit).await;
-        metrics::record_rpc_call("getEvents", start.elapsed().as_secs_f64(), result.is_err());
-        result
-    }
-
-    async fn get_events_inner(
-        &self,
-        start_ledger: Option<u64>,
-        cursor: Option<String>,
-        limit: u32,
-    ) -> Result<EventsPage, TridentError> {
+        let url = self.select_endpoint();
         let params = GetEventsParams {
             start_ledger,
-            filters: vec![],
+            filters,
             pagination: Pagination { limit, cursor },
         };
 
@@ -206,36 +436,272 @@ impl RpcClient {
             jsonrpc: "2.0",
             id: 1,
             method: "getEvents",
-            params,
+            params: &params,
         };
 
-        let resp = self
-            .http
-            .post(&self.url)
-            .json(&req)
-            .send()
-            .await
-            .map_err(|e| TridentError::RpcError(format!("HTTP request failed: {e}")))?;
-
-        let body: JsonRpcResponse<GetEventsResult> = resp
-            .json()
-            .await
-            .map_err(|e| TridentError::RpcError(format!("Failed to decode RPC response: {e}")))?;
-
-        if let Some(err) = body.error {
-            return Err(TridentError::RpcError(format!(
-                "RPC error {}: {}",
-                err.code, err.message
-            )));
+        let result: Result<GetEventsResult, TridentError> = self.execute(&url, &req, "getEvents").await;
+        match &result {
+            Ok(r) => {
+                self.record_success(&url, Some(r.latest_ledger));
+                // Check for stale ledger
+                self.scorer.check_and_record_stale(&url);
+            }
+            Err(e) => self.record_error(&url, e),
         }
 
-        let result = body
-            .result
-            .ok_or_else(|| TridentError::RpcError("Empty result in RPC response".into()))?;
-
+        let result = result?;
         Ok(EventsPage {
             events: result.events,
             latest_ledger: result.latest_ledger,
         })
+    }
+
+    /// Fetch a single transaction's envelope + result XDR via `getTransaction`
+    /// (issue #266). Used to derive per-invocation fee and declared resource
+    /// metering for tracked contracts — see
+    /// `crate::parser::invocation_metrics`.
+    pub async fn get_transaction(&self, hash: &str) -> Result<GetTransactionResult, TridentError> {
+        let params = GetTransactionParams { hash };
+        self.call("getTransaction", 3, params, "getTransaction")
+            .await
+    }
+
+    /// Fetch a batch of ledger entries (contract instance, contract code, or
+    /// contract data) via `getLedgerEntries` (issues #260, #270). Keys not
+    /// present on-chain (e.g. never written, or archived) are simply absent
+    /// from the returned list rather than erroring.
+    pub async fn get_ledger_entries(
+        &self,
+        keys: &[String],
+    ) -> Result<Vec<LedgerEntryResult>, TridentError> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let params = GetLedgerEntriesParams { keys };
+        let result: GetLedgerEntriesResult = self
+            .call("getLedgerEntries", 5, params, "getLedgerEntries")
+            .await?;
+        Ok(result.entries.unwrap_or_default())
+    }
+
+    /// Simulate a Soroban transaction via `simulateTransaction` (issue #263).
+    ///
+    /// Used for read-only host function calls (e.g., token name/symbol/decimals).
+    pub async fn simulate_transaction(
+        &self,
+        transaction: &str,
+    ) -> Result<SimulateTransactionResult, TridentError> {
+        let params = SimulateTransactionParams { transaction };
+        self.call("simulateTransaction", 4, params, "simulateTransaction")
+            .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+    use trident_common::Severity;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn fast_timeout_settings() -> RpcHttpSettings {
+        RpcHttpSettings {
+            connect_timeout: Duration::from_millis(300),
+            request_timeout: Duration::from_millis(300),
+            ..RpcHttpSettings::default()
+        }
+    }
+
+    /// A deliberately slow endpoint must abort within the configured request
+    /// timeout instead of hanging the caller (issue #214).
+    #[tokio::test]
+    async fn slow_endpoint_aborts_within_request_timeout() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(10))
+                    .set_body_string("{}"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = RpcClient::with_settings(server.uri(), &fast_timeout_settings()).unwrap();
+
+        let started = Instant::now();
+        let err = client
+            .get_events(Some(1), None, 10, &[])
+            .await
+            .expect_err("slow endpoint must not succeed");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "call should abort at the timeout, took {elapsed:?}"
+        );
+        assert!(
+            err.to_string().contains("timed out"),
+            "timeout should be reported as such, got: {err}"
+        );
+    }
+
+    /// A timeout must stay classified as retryable so the backoff wrapper and
+    /// the circuit breaker engage rather than the poll cycle being skipped.
+    #[tokio::test]
+    async fn timeout_is_classified_retryable() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(10))
+                    .set_body_string("{}"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = RpcClient::with_settings(server.uri(), &fast_timeout_settings()).unwrap();
+        let err = client.get_ledger(42).await.expect_err("must time out");
+
+        assert_eq!(err.severity(), Severity::Retryable);
+        assert!(err.retryable());
+    }
+
+    /// The settings are applied to a real client build — a bad combination is a
+    /// config error surfaced at startup, not a silent default.
+    #[test]
+    fn settings_build_a_client() {
+        assert!(RpcHttpSettings::default().build_client().is_ok());
+    }
+
+    /// Mount an endpoint that always answers `getEvents` with an empty page.
+    async fn mount_healthy(server: &MockServer) {
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "events": [], "latestLedger": 100 }
+            })))
+            .mount(server)
+            .await;
+    }
+
+    /// A primary that starts failing must hand traffic to the secondary, and
+    /// the pool must return to the primary once its cooldown elapses (#213).
+    #[tokio::test]
+    async fn failover_moves_to_secondary_then_recovers_to_primary() {
+        let primary = MockServer::start().await;
+        let secondary = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&primary)
+            .await;
+        mount_healthy(&secondary).await;
+
+        let client = RpcClient::with_endpoints(
+            vec![primary.uri(), secondary.uri()],
+            &fast_timeout_settings(),
+        )
+        .unwrap();
+
+        // Two failures on the primary should cause it to be scored lower.
+        assert!(client.get_events(Some(1), None, 10, &[]).await.is_err());
+        assert!(client.get_events(Some(1), None, 10, &[]).await.is_err());
+
+        // The health scorer should now prefer the secondary endpoint.
+        let best_endpoint = client.health_scorer().select_best_endpoint();
+        assert_eq!(best_endpoint, secondary.uri());
+
+        // The secondary now serves traffic successfully.
+        let page = client
+            .get_events(Some(1), None, 10, &[])
+            .await
+            .expect("secondary must serve the request");
+        assert_eq!(page.latest_ledger, 100);
+    }
+
+    /// A single healthy endpoint never fails over, and non-2xx responses from
+    /// it are surfaced as retryable RPC errors.
+    #[tokio::test]
+    async fn non_success_status_is_a_retryable_rpc_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429))
+            .mount(&server)
+            .await;
+
+        let client = RpcClient::with_settings(server.uri(), &fast_timeout_settings()).unwrap();
+        let err = client.get_events(Some(1), None, 10, &[]).await.unwrap_err();
+
+        assert!(err.to_string().contains("429"), "got: {err}");
+        assert_eq!(err.severity(), Severity::Retryable);
+    }
+
+    /// Requests are served by the primary while it is healthy.
+    #[tokio::test]
+    async fn healthy_primary_keeps_serving() {
+        let primary = MockServer::start().await;
+        let secondary = MockServer::start().await;
+        mount_healthy(&primary).await;
+        mount_healthy(&secondary).await;
+
+        let client = RpcClient::with_endpoints(
+            vec![primary.uri(), secondary.uri()],
+            &fast_timeout_settings(),
+        )
+        .unwrap();
+
+        for _ in 0..3 {
+            client.get_events(Some(1), None, 10, &[]).await.unwrap();
+        }
+        // Primary should still be preferred (both at 100, primary was first)
+        let best_endpoint = client.health_scorer().select_best_endpoint();
+        assert_eq!(best_endpoint, primary.uri());
+        assert_eq!(secondary.received_requests().await.unwrap().len(), 0);
+    }
+
+    /// A read-only `simulateTransaction` call decodes the result envelope's
+    /// XDR return value (issue #263).
+    #[tokio::test]
+    async fn simulate_transaction_returns_decoded_result() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "result": { "results": [{ "xdr": "AAAAAwAAAAo=" }] }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = RpcClient::with_settings(server.uri(), &fast_timeout_settings()).unwrap();
+        let result = client.simulate_transaction("deadbeef").await.unwrap();
+
+        assert!(result.error.is_none());
+        assert_eq!(result.results.len(), 1);
+        assert_eq!(result.results[0].xdr, "AAAAAwAAAAo=");
+    }
+
+    /// A simulation error (e.g. the contract has no such function) is
+    /// surfaced on the result rather than as a transport error, so the
+    /// caller can treat it as "not a token" (issue #263).
+    #[tokio::test]
+    async fn simulate_transaction_surfaces_simulation_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "result": { "error": "HostError: Error(Value, MissingValue)", "results": [] }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = RpcClient::with_settings(server.uri(), &fast_timeout_settings()).unwrap();
+        let result = client.simulate_transaction("deadbeef").await.unwrap();
+
+        assert!(result.error.is_some());
+        assert!(result.results.is_empty());
     }
 }

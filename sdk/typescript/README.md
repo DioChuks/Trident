@@ -46,6 +46,25 @@ if (page1.hasMore && page1.cursor) {
   console.log("Page 2:", page2.events);
 }
 
+// Or drain every page automatically with the async iterator — no manual
+// cursor/hasMore bookkeeping. Stops when the server has no more results.
+for await (const event of client.iterEvents({
+  contractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+  topic0: "transfer",
+})) {
+  console.log(event.id, event.transactionHash);
+}
+
+// A safety valve caps the number of pages fetched (default 100). If the limit
+// is hit while more results remain, a TridentError(code: "ITERATION_LIMIT")
+// is thrown; raise it for very large backfills:
+for await (const event of client.iterEvents(
+  { contractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM" },
+  { maxPages: 1000 },
+)) {
+  // ...process event
+}
+
 // 2. Fetch a single event by UUID
 const event = await client.getEventById({
   id: "550e8400-e29b-41d4-a716-446655440000",
@@ -228,6 +247,13 @@ import type {
   TridentErrorCode,
 } from "@trident-indexer/sdk";
 ```
+
+The client also exposes `iterEvents(params, options?)`, an auto-paginating
+`AsyncIterable<SorobanEvent>` that follows the server cursor until
+`hasMore === false`. It fetches at most `options.maxPages` pages (default `100`),
+throwing `TridentError(code: "ITERATION_LIMIT")` if exceeded; `TridentError`s
+from page requests propagate out of the `for await` loop unchanged. Also
+exported standalone as `iterEvents(queryEvents, params, options?)`.
 
 ### `SorobanEvent`
 

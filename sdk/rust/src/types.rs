@@ -2,20 +2,26 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::time::Duration;
 
-/// Environment variable consulted for the API key when
-/// [`TridentConfig::api_key`] is left empty.
-pub const ENV_API_KEY: &str = "TRIDENT_API_KEY";
-/// Environment variable consulted for the base URL when
-/// [`TridentConfig::api_url`] is left empty.
-pub const ENV_BASE_URL: &str = "TRIDENT_BASE_URL";
+use crate::retry::RetryConfig;
 
 /// Stellar network selection.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Network {
     Mainnet,
     #[default]
     Testnet,
     Futurenet,
+}
+
+impl Network {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Network::Mainnet => "mainnet",
+            Network::Testnet => "testnet",
+            Network::Futurenet => "futurenet",
+        }
+    }
 }
 
 /// Configuration for [`TridentClient`](crate::TridentClient).
@@ -34,6 +40,10 @@ pub struct TridentConfig {
     pub network: Network,
     /// Per-request timeout. Defaults to 30 seconds.
     pub timeout: Duration,
+    /// Retry policy applied to idempotent (GET) requests, honouring
+    /// `Retry-After` on 429/503 responses. `None` disables retries — the
+    /// default. Overridden per-call by the `*_with_retry` client methods.
+    pub retry: Option<RetryConfig>,
 }
 
 impl Default for TridentConfig {
@@ -43,6 +53,7 @@ impl Default for TridentConfig {
             api_key: String::new(),
             network: Network::Testnet,
             timeout: Duration::from_secs(30),
+            retry: None,
         }
     }
 }

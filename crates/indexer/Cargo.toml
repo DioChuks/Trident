@@ -3,8 +3,16 @@ name = "trident-indexer"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Opt-in async task profiling via tokio-console. Compiled out by default; even
+# when compiled in it stays off at runtime unless TOKIO_CONSOLE_ENABLED=true.
+# Full task instrumentation additionally requires building tokio with
+# `RUSTFLAGS="--cfg tokio_unstable"`. See docs/observability/profiling.md.
+tokio-console = ["dep:console-subscriber"]
+
 [dependencies]
 trident-common = { path = "../common" }
+anyhow = "1"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -12,6 +20,9 @@ tokio = { version = "1", features = ["full"] }
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
+
+# Optional async profiling (tokio-console). Behind the `tokio-console` feature.
+console-subscriber = { version = "0.4", optional = true }
 
 # HTTP client for Stellar RPC JSON-RPC calls
 reqwest = { version = "0.11", features = ["json"] }
@@ -45,11 +56,17 @@ chrono = { version = "0.4", features = ["serde"] }
 # Hex encoding for bytes values
 hex = "0.4"
 
+# SHA-256 for SAC contract id derivation (issue #262)
+sha2 = "0.10"
+
 # Retry logic with exponential backoff
 tokio-retry = "0.3"
 
 # CancellationToken for graceful shutdown
 tokio-util = "0.7"
+
+# Async trait support for pluggable alert sinks
+async-trait = "0.1"
 
 # Prometheus /metrics endpoint
 metrics = "0.24"

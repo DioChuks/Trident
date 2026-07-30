@@ -18,11 +18,23 @@ pub const PARSE_ERRORS_TOTAL: &str = "trident_indexer_parse_errors_total";
 pub const POLL_DURATION_SECONDS: &str = "trident_indexer_poll_duration_seconds";
 pub const POLL_ERRORS_TOTAL: &str = "trident_indexer_poll_errors_total";
 pub const RPC_RETRIES_TOTAL: &str = "trident_indexer_rpc_retries_total";
-pub const RPC_REQUEST_DURATION_SECONDS: &str = "trident_indexer_rpc_request_duration_seconds";
-pub const RPC_ERRORS_TOTAL: &str = "trident_indexer_rpc_errors_total";
-pub const HEARTBEAT_TIMESTAMP_SECONDS: &str = "trident_indexer_heartbeat_timestamp_seconds";
-pub const DB_POOL_SIZE: &str = "trident_indexer_db_pool_size";
-pub const DB_POOL_IDLE_CONNECTIONS: &str = "trident_indexer_db_pool_idle_connections";
+pub const EFFECTIVE_POLL_INTERVAL_MS: &str = "trident_indexer_effective_poll_interval_ms";
+pub const RPC_TIMEOUTS_TOTAL: &str = "trident_indexer_rpc_timeouts_total";
+pub const RPC_ACTIVE_ENDPOINT: &str = "trident_indexer_rpc_active_endpoint";
+pub const RPC_FAILOVERS_TOTAL: &str = "trident_indexer_rpc_failovers_total";
+pub const OUTBOX_BACKLOG: &str = "trident_indexer_outbox_backlog";
+pub const OUTBOX_PUBLISHED_TOTAL: &str = "trident_indexer_outbox_published_total";
+pub const OUTBOX_PUBLISH_FAILURES_TOTAL: &str = "trident_indexer_outbox_publish_failures_total";
+/// Unix timestamp (seconds) of the most recent completed poll cycle. Use
+/// `time() - trident_indexer_last_poll_timestamp_seconds > N` as a
+/// dead-man's-switch alert for a stalled indexer (#218).
+pub const HEARTBEAT_TIMESTAMP: &str = "trident_indexer_last_poll_timestamp_seconds";
+/// Bounded per-contract event counter. Labels: `contract` (allowlisted contract ID or `"other"`).
+/// Cardinality: |allowlist| + 1. In index-all mode (no allowlist) all events land in `"other"`.
+pub const EVENTS_BY_CONTRACT_TOTAL: &str = "trident_indexer_events_by_contract_total";
+pub const EVENT_DECODE_DURATION_SECONDS: &str = "trident_indexer_event_decode_duration_seconds";
+/// Health score (0-100) for each RPC endpoint. Label: `endpoint` (URL).
+pub const RPC_HEALTH_SCORE: &str = "trident_rpc_health_score";
 
 /// Install the global Prometheus recorder and start serving `/metrics` on
 /// `port`. Must be called once, before the streamer starts recording.
@@ -32,7 +44,9 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     PrometheusBuilder::new()
         .with_http_listener(addr)
         .install()
-        .map_err(|e| TridentError::ConfigError(format!("failed to start metrics exporter: {e}")))?;
+        .map_err(|e| {
+            TridentError::config(anyhow::Error::new(e).context("failed to start metrics exporter"))
+        })?;
 
     describe_gauge!(
         LEDGER_LAG,
@@ -53,25 +67,49 @@ pub fn install(port: u16) -> Result<(), TridentError> {
         RPC_RETRIES_TOTAL,
         "Total RPC retries triggered by transient failures"
     );
-    describe_histogram!(
-        RPC_REQUEST_DURATION_SECONDS,
-        "Stellar RPC call latency in seconds, labeled by method"
+    describe_gauge!(
+        EFFECTIVE_POLL_INTERVAL_MS,
+        "Current adaptive poll interval in milliseconds (issue #198)"
     );
     describe_counter!(
-        RPC_ERRORS_TOTAL,
-        "Total Stellar RPC calls that returned an error, labeled by method"
+        RPC_TIMEOUTS_TOTAL,
+        "RPC calls aborted by the connect or request timeout (issue #214)"
     );
     describe_gauge!(
-        HEARTBEAT_TIMESTAMP_SECONDS,
-        "Unix timestamp of the last completed poll-loop iteration (dead-man's-switch)"
+        RPC_ACTIVE_ENDPOINT,
+        "Index of the RPC endpoint currently in use, 0 = primary (issue #213)"
+    );
+    describe_counter!(
+        RPC_FAILOVERS_TOTAL,
+        "Times the indexer failed over to another RPC endpoint (issue #213)"
     );
     describe_gauge!(
-        DB_POOL_SIZE,
-        "Current number of connections in the indexer's Postgres pool"
+        OUTBOX_BACKLOG,
+        "Committed events not yet published to the Redis stream (issue #200)"
+    );
+    describe_counter!(
+        OUTBOX_PUBLISHED_TOTAL,
+        "Events published to the Redis stream by the outbox relay (issue #200)"
+    );
+    describe_counter!(
+        OUTBOX_PUBLISH_FAILURES_TOTAL,
+        "Outbox publish attempts that failed (issue #200)"
     );
     describe_gauge!(
-        DB_POOL_IDLE_CONNECTIONS,
-        "Current number of idle connections in the indexer's Postgres pool"
+        HEARTBEAT_TIMESTAMP,
+        "Unix timestamp (seconds) of the most recent completed poll cycle (#218)"
+    );
+    describe_counter!(
+        EVENTS_BY_CONTRACT_TOTAL,
+        "Events processed per contract (bounded: allowlisted contract IDs + 'other' bucket)"
+    );
+    describe_histogram!(
+        EVENT_DECODE_DURATION_SECONDS,
+        "Time to XDR-decode a single event, in seconds (per-event parse latency)"
+    );
+    describe_gauge!(
+        RPC_HEALTH_SCORE,
+        "Health score (0-100) for each RPC endpoint (multi-RPC failover)"
     );
 
     // Counters only render in the scrape output once touched at least once;
@@ -81,8 +119,15 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     counter!(PARSE_ERRORS_TOTAL).increment(0);
     counter!(POLL_ERRORS_TOTAL).increment(0);
     counter!(RPC_RETRIES_TOTAL).increment(0);
+    counter!(RPC_TIMEOUTS_TOTAL).increment(0);
+    counter!(RPC_FAILOVERS_TOTAL).increment(0);
+    counter!(OUTBOX_PUBLISHED_TOTAL).increment(0);
+    counter!(OUTBOX_PUBLISH_FAILURES_TOTAL).increment(0);
+    gauge!(RPC_ACTIVE_ENDPOINT).set(0.0);
+    gauge!(OUTBOX_BACKLOG).set(0.0);
     gauge!(LEDGER_LAG).set(0.0);
-    record_heartbeat();
+    gauge!(EFFECTIVE_POLL_INTERVAL_MS).set(0.0);
+    gauge!(HEARTBEAT_TIMESTAMP).set(0.0);
 
     tracing::info!(port, "Metrics endpoint listening");
     Ok(())
@@ -90,6 +135,17 @@ pub fn install(port: u16) -> Result<(), TridentError> {
 
 pub fn set_ledger_lag(lag: i64) {
     gauge!(LEDGER_LAG).set(lag as f64);
+}
+
+pub fn set_effective_poll_interval(ms: u64) {
+    gauge!(EFFECTIVE_POLL_INTERVAL_MS).set(ms as f64);
+}
+
+/// Stamp the heartbeat to the current Unix time. Called at the end of every
+/// poll cycle (success or failure) so a dead-man's switch alert can detect a
+/// stalled-but-not-crashed indexer (#218).
+pub fn set_heartbeat_timestamp(secs: f64) {
+    gauge!(HEARTBEAT_TIMESTAMP).set(secs);
 }
 
 pub fn record_events_processed(count: u64) {
@@ -120,29 +176,54 @@ pub fn record_rpc_retry() {
     counter!(RPC_RETRIES_TOTAL).increment(1);
 }
 
-/// Record the latency and outcome of a single Stellar RPC call.
-/// `method` is a low-cardinality label (e.g. "getEvents", "getLedgers").
-pub fn record_rpc_call(method: &'static str, duration_secs: f64, is_error: bool) {
-    histogram!(RPC_REQUEST_DURATION_SECONDS, "method" => method).record(duration_secs);
-    if is_error {
-        counter!(RPC_ERRORS_TOTAL, "method" => method).increment(1);
+/// Count an RPC call that hit the connect or overall request timeout (issue #214).
+pub fn record_rpc_timeout() {
+    counter!(RPC_TIMEOUTS_TOTAL).increment(1);
+}
+
+/// Publish which endpoint of the configured pool is currently serving traffic
+/// (0 = primary), so a silent, sustained failover is visible (issue #213).
+pub fn set_rpc_active_endpoint(index: usize) {
+    gauge!(RPC_ACTIVE_ENDPOINT).set(index as f64);
+}
+
+/// Count a switch to a different RPC endpoint (issue #213).
+pub fn record_rpc_failover() {
+    counter!(RPC_FAILOVERS_TOTAL).increment(1);
+}
+
+/// Publish the number of committed-but-unpublished events. A backlog that keeps
+/// climbing means live subscribers are missing data (issue #200).
+pub fn set_outbox_backlog(backlog: i64) {
+    gauge!(OUTBOX_BACKLOG).set(backlog as f64);
+}
+
+/// Count an event delivered to the Redis stream by the relay (issue #200).
+pub fn record_outbox_published() {
+    counter!(OUTBOX_PUBLISHED_TOTAL).increment(1);
+}
+
+/// Count a failed relay publish attempt (issue #200).
+pub fn record_outbox_publish_failure() {
+    counter!(OUTBOX_PUBLISH_FAILURES_TOTAL).increment(1);
+}
+
+/// Increment the per-contract event counter. `contract_id` must be either an
+/// allowlisted contract ID or the sentinel `"other"` — never an unbounded value.
+pub fn record_events_by_contract(contract_id: &str, count: u64) {
+    if count > 0 {
+        counter!(EVENTS_BY_CONTRACT_TOTAL, "contract" => contract_id.to_string()).increment(count);
     }
 }
 
-/// Update the dead-man's-switch heartbeat gauge to the current unix time.
-/// Called once per poll-loop iteration regardless of outcome — Prometheus
-/// alerts on this going stale, which flags a hung or crashed indexer even
-/// when lag itself looks fine.
-pub fn record_heartbeat() {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0);
-    gauge!(HEARTBEAT_TIMESTAMP_SECONDS).set(now);
+pub fn record_decode_duration(seconds: f64) {
+    histogram!(EVENT_DECODE_DURATION_SECONDS).record(seconds);
 }
 
-/// Record the indexer's own Postgres pool utilisation.
-pub fn set_db_pool_stats(size: u32, idle: u32) {
-    gauge!(DB_POOL_SIZE).set(size as f64);
-    gauge!(DB_POOL_IDLE_CONNECTIONS).set(idle as f64);
+/// Set the health score for a specific RPC endpoint.
+///
+/// Called by the health scorer after each score update so operators can see
+/// which endpoints are degraded and whether failover is working.
+pub fn set_rpc_health_score(endpoint: &str, score: u8) {
+    gauge!(RPC_HEALTH_SCORE, "endpoint" => endpoint.to_string()).set(score as f64);
 }

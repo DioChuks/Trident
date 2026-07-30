@@ -165,8 +165,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                         Err(err) => {
-                            if let trident_common::TridentError::RpcError(s) = err {
-                                tracing::warn!(error = %s, "RPC error");
+                            if let trident_common::TridentError::RpcError { source, .. } = &err {
+                                tracing::warn!(error = %source, "RPC error");
                             } else {
                                 tracing::warn!(error = %err, "RPC error");
                             }

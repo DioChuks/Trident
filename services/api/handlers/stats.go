@@ -13,9 +13,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	apigrpc "github.com/Depo-dev/trident/services/api/grpc"
 	"github.com/Depo-dev/trident/services/api/internal/httputil"
 	"github.com/Depo-dev/trident/services/api/middleware"
 	"github.com/Depo-dev/trident/services/api/validation"
+	"github.com/Depo-dev/trident/services/api/ws"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
@@ -41,6 +43,19 @@ var (
 	metricLagLedgers        atomicGauge
 	metricLastPollTimestamp atomicGauge
 	metricEventsTotal       atomicGauge
+
+	// Webhook delivery counters (#241).
+	metricWebhookSuccess    atomic.Int64
+	metricWebhookFailed     atomic.Int64
+	metricWebhookDeadLetter atomic.Int64
+	metricWebhookDurationMs atomic.Int64
+	metricWebhookTotal      atomic.Int64
+
+	// SSE slow-consumer disconnects (#224). SSE has no shared per-message
+	// drop path like the WS hub — a stalled SSE client is detected by the
+	// write deadline in Stream() failing, which always means "disconnect",
+	// so there is no separate drop counter to pair this with.
+	metricSSESlowConsumerDisconnects atomic.Int64
 )
 
 // MetricsHandler exposes the Go API's Prometheus metrics in text format:
@@ -238,7 +253,7 @@ type IndexerStatsResponse struct {
 func IndexerStats(db DBPool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if db == nil {
-			httputil.WriteError(w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "database unavailable")
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "database unavailable")
 			return
 		}
 
@@ -248,7 +263,7 @@ func IndexerStats(db DBPool) http.HandlerFunc {
 		stats, err := queryIndexerStats(ctx, db)
 		if err != nil {
 			slog.Error("stats: DB query failed", "err", err)
-			httputil.WriteError(w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "database query failed")
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "database query failed")
 			return
 		}
 
@@ -299,7 +314,6 @@ func IndexerStats(db DBPool) http.HandlerFunc {
 	}
 }
 
-
 // ---------------------------------------------------------------------------
 // Contract Analytics Endpoint
 // ---------------------------------------------------------------------------
@@ -310,15 +324,26 @@ type ContractStats struct {
 	EventCount     int64  `json:"event_count"`
 	LastSeenLedger int64  `json:"last_seen_ledger"`
 	LastSeenAt     string `json:"last_seen_at"`
+
+	// Per-invocation fee + declared-resource metering (issue #266), sourced
+	// from contract_invocation_metrics. Null when the contract has no metered
+	// invocations in range — either it isn't on the tracked-contract
+	// allowlist, or it has not yet been invoked since metering was added.
+	InvocationCount    *int64   `json:"invocation_count"`
+	TotalFeeCharged    *int64   `json:"total_fee_charged"`
+	AvgFeeCharged      *float64 `json:"avg_fee_charged"`
+	AvgCpuInstructions *float64 `json:"avg_cpu_instructions"`
+	AvgReadBytes       *float64 `json:"avg_read_bytes"`
+	AvgWriteBytes      *float64 `json:"avg_write_bytes"`
 }
 
 // ContractsStatsResponse is the JSON response for GET /v1/stats/contracts
 type ContractsStatsResponse struct {
-	Contracts  []*ContractStats `json:"contracts"`
-	FromLedger int64            `json:"from_ledger"`
-	ToLedger   int64            `json:"to_ledger"`
-	Network    string           `json:"network"`
-	GeneratedAt string          `json:"generated_at"`
+	Contracts   []*ContractStats `json:"contracts"`
+	FromLedger  int64            `json:"from_ledger"`
+	ToLedger    int64            `json:"to_ledger"`
+	Network     string           `json:"network"`
+	GeneratedAt string           `json:"generated_at"`
 }
 
 // ContractsStats handles GET /v1/stats/contracts (analytics endpoint).
@@ -336,11 +361,17 @@ type ContractsStatsResponse struct {
 func ContractsStats(db DBPool, rdb *redis.Client) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if db == nil {
-			httputil.WriteError(w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "database unavailable")
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "database unavailable")
 			return
 		}
 
 		q := r.URL.Query()
+		if verr := validation.RejectUnknownParams(
+			q, "from_ledger", "to_ledger", "network", "limit",
+		); verr != nil {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
+			return
+		}
 
 		// Validate and parse query parameters
 		params, verr := validation.ValidateQueryStats(
@@ -350,7 +381,7 @@ func ContractsStats(db DBPool, rdb *redis.Client) http.HandlerFunc {
 			q.Get("limit"),
 		)
 		if verr != nil {
-			httputil.WriteError(w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
 			return
 		}
 
@@ -373,11 +404,29 @@ func ContractsStats(db DBPool, rdb *redis.Client) http.HandlerFunc {
 		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 		defer cancel()
 
-		stats, err := queryContractStats(ctx, db, params)
-		if err != nil {
-			slog.ErrorContext(r.Context(), "database query failed", "err", err)
-			httputil.WriteError(w, http.StatusInternalServerError, httputil.INTERNAL, "failed to fetch statistics")
-			return
+		// The maintained rollup (issue #257) only represents the full,
+		// unfiltered event history per contract, so it can only answer the
+		// default "all time" query. Any explicit ledger-range filter falls
+		// back to the live aggregate below, which the rollup cannot cover.
+		isDefaultRange := q.Get("from_ledger") == "" && q.Get("to_ledger") == ""
+
+		var stats []*ContractStats
+		var err error
+		usedRollup := false
+		if isDefaultRange {
+			stats, usedRollup, err = queryContractStatsFromRollup(ctx, db, params)
+			if err != nil {
+				slog.ErrorContext(r.Context(), "rollup query failed; falling back to live aggregation", "err", err)
+				usedRollup = false
+			}
+		}
+		if !usedRollup {
+			stats, err = queryContractStats(ctx, db, params)
+			if err != nil {
+				slog.ErrorContext(r.Context(), "database query failed", "err", err)
+				httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "failed to fetch statistics")
+				return
+			}
 		}
 
 		// Get the latest ledger for the response metadata if to_ledger was not explicitly set
@@ -404,7 +453,7 @@ func ContractsStats(db DBPool, rdb *redis.Client) http.HandlerFunc {
 		body, err := json.Marshal(response)
 		if err != nil {
 			slog.ErrorContext(r.Context(), "json marshal failed", "err", err)
-			httputil.WriteError(w, http.StatusInternalServerError, httputil.INTERNAL, "internal error")
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "internal error")
 			return
 		}
 
@@ -420,24 +469,66 @@ func ContractsStats(db DBPool, rdb *redis.Client) http.HandlerFunc {
 
 // queryContractStats executes the aggregation query against the database.
 // Requires compound index (contract_id, ledger_sequence DESC) from #61.
+//
+// Invocation fee/resource metering (issue #266) is joined in from
+// contract_invocation_metrics via a pre-aggregated subquery rather than a
+// row-level join against soroban_events: the two tables share no per-row key
+// (metering is one row per transaction, events are one row per emitted
+// event), so the join key is contract_id + the same ledger range.
+//
+// Index usage: the WHERE clause on (network, ledger_sequence) uses
+// idx_soroban_events_network_contract (migration 0004) for partition pruning
+// when a ledger range is supplied; the GROUP BY + ORDER BY event_count DESC is
+// a computed aggregate and is not index-backed — this is expected for an
+// aggregation query. The LIMIT cap prevents runaway result sets (#255).
 func queryContractStats(ctx context.Context, db DBPool, params *validation.QueryStatsParams) ([]*ContractStats, error) {
+	// Belt-and-suspenders: clamp limit even if the caller skips ValidateQueryStats.
+	limit := params.Limit
+	if limit <= 0 || limit > validation.StatsLimitMax {
+		limit = validation.StatsLimitDefault
+	}
+
 	query := `
 	SELECT
-		contract_id,
+		e.contract_id,
 		COUNT(*) AS event_count,
-		MAX(ledger_sequence) AS last_seen_ledger,
-		MAX(ledger_timestamp) AS last_seen_at
-	FROM soroban_events
+		MAX(e.ledger_sequence) AS last_seen_ledger,
+		MAX(e.ledger_timestamp) AS last_seen_at,
+		m.invocation_count,
+		m.total_fee_charged,
+		m.avg_fee_charged,
+		m.avg_cpu_instructions,
+		m.avg_read_bytes,
+		m.avg_write_bytes
+	FROM soroban_events e
+	LEFT JOIN (
+		SELECT
+			contract_id,
+			COUNT(*) AS invocation_count,
+			SUM(fee_charged) AS total_fee_charged,
+			AVG(fee_charged) AS avg_fee_charged,
+			AVG(cpu_instructions) AS avg_cpu_instructions,
+			AVG(read_bytes) AS avg_read_bytes,
+			AVG(write_bytes) AS avg_write_bytes
+		FROM contract_invocation_metrics
+		WHERE
+			network = $1
+			AND ($2::BIGINT IS NULL OR ledger_sequence >= $2)
+			AND ($3::BIGINT IS NULL OR ledger_sequence <= $3)
+		GROUP BY contract_id
+	) m ON m.contract_id = e.contract_id
 	WHERE
-		network = $1
-		AND ($2::BIGINT IS NULL OR ledger_sequence >= $2)
-		AND ($3::BIGINT IS NULL OR ledger_sequence <= $3)
-	GROUP BY contract_id
+		e.network = $1
+		AND ($2::BIGINT IS NULL OR e.ledger_sequence >= $2)
+		AND ($3::BIGINT IS NULL OR e.ledger_sequence <= $3)
+	GROUP BY
+		e.contract_id, m.invocation_count, m.total_fee_charged,
+		m.avg_fee_charged, m.avg_cpu_instructions, m.avg_read_bytes, m.avg_write_bytes
 	ORDER BY event_count DESC
 	LIMIT $4
 	`
 
-	rows, err := db.Query(ctx, query, params.Network, params.FromLedgerPtr, params.ToLedgerPtr, params.Limit)
+	rows, err := db.Query(ctx, query, params.Network, params.FromLedgerPtr, params.ToLedgerPtr, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -453,6 +544,12 @@ func queryContractStats(ctx context.Context, db DBPool, params *validation.Query
 			&cs.EventCount,
 			&cs.LastSeenLedger,
 			&lastSeenAt,
+			&cs.InvocationCount,
+			&cs.TotalFeeCharged,
+			&cs.AvgFeeCharged,
+			&cs.AvgCpuInstructions,
+			&cs.AvgReadBytes,
+			&cs.AvgWriteBytes,
 		)
 		if err != nil {
 			return nil, err
@@ -467,6 +564,144 @@ func queryContractStats(ctx context.Context, db DBPool, params *validation.Query
 	}
 
 	return stats, nil
+}
+
+// queryContractStatsFromRollup serves the default "all time" contract stats
+// query from the maintained contract_stats_rollup table (issue #257) instead
+// of aggregating soroban_events live. Invocation metering (issue #266) is
+// still joined live from contract_invocation_metrics — that table is small
+// and indexed by contract_id, so joining it against at most `limit` rollup
+// rows stays cheap.
+//
+// The second return value is false when the rollup has not been populated
+// for this network yet (e.g. before the first periodic refresh completes),
+// signalling the caller to fall back to queryContractStats.
+func queryContractStatsFromRollup(ctx context.Context, db DBPool, params *validation.QueryStatsParams) ([]*ContractStats, bool, error) {
+	query := `
+	SELECT
+		r.contract_id,
+		r.event_count,
+		r.last_seen_ledger,
+		r.last_seen_at,
+		m.invocation_count,
+		m.total_fee_charged,
+		m.avg_fee_charged,
+		m.avg_cpu_instructions,
+		m.avg_read_bytes,
+		m.avg_write_bytes
+	FROM contract_stats_rollup r
+	LEFT JOIN (
+		SELECT
+			contract_id,
+			COUNT(*) AS invocation_count,
+			SUM(fee_charged) AS total_fee_charged,
+			AVG(fee_charged) AS avg_fee_charged,
+			AVG(cpu_instructions) AS avg_cpu_instructions,
+			AVG(read_bytes) AS avg_read_bytes,
+			AVG(write_bytes) AS avg_write_bytes
+		FROM contract_invocation_metrics
+		WHERE network = $1
+		GROUP BY contract_id
+	) m ON m.contract_id = r.contract_id
+	WHERE r.network = $1
+	ORDER BY r.event_count DESC
+	LIMIT $2
+	`
+
+	rows, err := db.Query(ctx, query, params.Network, params.Limit)
+	if err != nil {
+		return nil, false, err
+	}
+	defer rows.Close()
+
+	var stats []*ContractStats
+	for rows.Next() {
+		var cs ContractStats
+		var lastSeenAt time.Time
+
+		err := rows.Scan(
+			&cs.ContractID,
+			&cs.EventCount,
+			&cs.LastSeenLedger,
+			&lastSeenAt,
+			&cs.InvocationCount,
+			&cs.TotalFeeCharged,
+			&cs.AvgFeeCharged,
+			&cs.AvgCpuInstructions,
+			&cs.AvgReadBytes,
+			&cs.AvgWriteBytes,
+		)
+		if err != nil {
+			return nil, false, err
+		}
+
+		cs.LastSeenAt = lastSeenAt.UTC().Format(time.RFC3339)
+		stats = append(stats, &cs)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, false, err
+	}
+
+	if len(stats) > 0 {
+		return stats, true, nil
+	}
+
+	// Empty result: indistinguishable between "no activity on this network"
+	// and "the rollup has not been refreshed yet". Check whether the rollup
+	// has ever been populated for this network at all; if not, tell the
+	// caller to fall back to the live aggregate rather than serve a
+	// possibly-wrong empty response.
+	var populated bool
+	if err := db.QueryRow(ctx,
+		"SELECT EXISTS(SELECT 1 FROM contract_stats_rollup WHERE network = $1)",
+		params.Network,
+	).Scan(&populated); err != nil {
+		return nil, false, err
+	}
+
+	return stats, populated, nil
+}
+
+// contractStatsRollupRefreshSQL recomputes contract_stats_rollup in full from
+// soroban_events (issue #257). Run periodically rather than incrementally on
+// ingest, so the rollup stays independent of the Rust indexer's write path —
+// see the ticker started in main.go and the freshness note in
+// database/migrations/0019_contract_stats_rollup.sql.
+const contractStatsRollupRefreshSQL = `
+	INSERT INTO contract_stats_rollup (
+		contract_id, network, event_count, contract_event_count, system_event_count,
+		diagnostic_event_count, first_seen_ledger, last_seen_ledger, last_seen_at, refreshed_at
+	)
+	SELECT
+		contract_id,
+		network,
+		COUNT(*),
+		COUNT(*) FILTER (WHERE event_type = 'contract'),
+		COUNT(*) FILTER (WHERE event_type = 'system'),
+		COUNT(*) FILTER (WHERE event_type = 'diagnostic'),
+		MIN(ledger_sequence),
+		MAX(ledger_sequence),
+		MAX(ledger_timestamp),
+		NOW()
+	FROM soroban_events
+	GROUP BY contract_id, network
+	ON CONFLICT (contract_id, network) DO UPDATE SET
+		event_count            = EXCLUDED.event_count,
+		contract_event_count   = EXCLUDED.contract_event_count,
+		system_event_count     = EXCLUDED.system_event_count,
+		diagnostic_event_count = EXCLUDED.diagnostic_event_count,
+		first_seen_ledger      = EXCLUDED.first_seen_ledger,
+		last_seen_ledger       = EXCLUDED.last_seen_ledger,
+		last_seen_at           = EXCLUDED.last_seen_at,
+		refreshed_at           = EXCLUDED.refreshed_at
+`
+
+// RefreshContractStatsRollup recomputes contract_stats_rollup from
+// soroban_events (issue #257). Exported so main.go's periodic ticker and
+// tests can both call it.
+func RefreshContractStatsRollup(ctx context.Context, db SchemaRegistryDB) error {
+	_, err := db.Exec(ctx, contractStatsRollupRefreshSQL)
+	return err
 }
 
 // getLatestIndexedLedger queries the database for the highest indexed ledger sequence.

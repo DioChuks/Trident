@@ -1,6 +1,7 @@
 package httputil
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 
@@ -18,13 +19,21 @@ const (
 	INVALID_ARGUMENT ErrorCode = "INVALID_ARGUMENT"
 	UNAVAILABLE      ErrorCode = "UNAVAILABLE"
 	INTERNAL         ErrorCode = "INTERNAL"
+	// PAYLOAD_TOO_LARGE is returned when a request body exceeds the
+	// configured http.MaxBytesReader limit (issue #317).
+	PAYLOAD_TOO_LARGE ErrorCode = "PAYLOAD_TOO_LARGE"
+	// FORBIDDEN is returned when abuse-protection middleware rejects a
+	// request outright (e.g. the global concurrency cap shedding load,
+	// issue #318) rather than for a normal auth failure.
+	FORBIDDEN ErrorCode = "FORBIDDEN"
 )
 
 // ErrorDetail is the nested error object required by the OpenAPI ErrorResponse
 // schema and parsed by the client SDKs.
 type ErrorDetail struct {
-	Code    ErrorCode `json:"code"`
-	Message string    `json:"message"`
+	Code      ErrorCode `json:"code"`
+	Message   string    `json:"message"`
+	RequestID string    `json:"request_id,omitempty"`
 }
 
 // ErrorResponse is the standardized JSON error body: {"error":{"code","message"}}.
@@ -33,12 +42,25 @@ type ErrorResponse struct {
 }
 
 // WriteError writes a standardized JSON error response matching the OpenAPI
-// ErrorResponse schema ({"error":{"code","message"}}).
+// ErrorResponse schema ({"error":{"code","message"}}). It carries no request
+// id; prefer WriteErrorCtx from a request-scoped handler so the error envelope
+// includes error.request_id.
 func WriteError(w http.ResponseWriter, statusCode int, code ErrorCode, message string) {
+	writeError(w, statusCode, code, message, "")
+}
+
+// WriteErrorCtx writes a standardized JSON error response and populates
+// error.request_id from the request id attached to ctx by the RequestID
+// middleware, so a client failure can be correlated to server logs and traces.
+func WriteErrorCtx(ctx context.Context, w http.ResponseWriter, statusCode int, code ErrorCode, message string) {
+	writeError(w, statusCode, code, message, RequestIDFromContext(ctx))
+}
+
+func writeError(w http.ResponseWriter, statusCode int, code ErrorCode, message, requestID string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
 	_ = json.NewEncoder(w).Encode(ErrorResponse{
-		Error: ErrorDetail{Code: code, Message: message},
+		Error: ErrorDetail{Code: code, Message: message, RequestID: requestID},
 	})
 }
 
@@ -62,6 +84,10 @@ func GRPCToHTTP(err error) (int, ErrorCode) {
 		return http.StatusUnauthorized, UNAUTHORIZED
 	case codes.ResourceExhausted:
 		return http.StatusTooManyRequests, RATE_LIMITED
+	case codes.DeadlineExceeded:
+		// The backend did not answer within the call deadline: a gateway
+		// timeout, not an internal fault — clients may retry (issue #227).
+		return http.StatusGatewayTimeout, UNAVAILABLE
 	default:
 		return http.StatusInternalServerError, INTERNAL
 	}

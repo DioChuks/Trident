@@ -10,6 +10,9 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/Depo-dev/trident/services/api/internal/httputil"
+	"github.com/Depo-dev/trident/services/api/middleware"
+	"github.com/Depo-dev/trident/services/api/validation"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
@@ -21,6 +24,10 @@ type APIKeyConfig struct {
 	DB       *pgxpool.Pool
 	// Redis is used for cache invalidation on key revocation.
 	Redis *redis.Client
+	// InvalidateTier evicts a key's cached rate-limit tier (by key hash) after
+	// an admin tier change so the new limit applies promptly instead of after
+	// the tier-cache TTL. Wired to middleware.TierCache.Invalidate; nil-safe.
+	InvalidateTier func(keyHash string)
 }
 
 // APIKeyResponse is returned for list/create operations.
@@ -55,15 +62,15 @@ type updateKeyRequest struct {
 // error response and returning false when the handler should abort.
 func requireAdmin(cfg APIKeyConfig, w http.ResponseWriter, r *http.Request) bool {
 	if cfg.AdminKey == "" {
-		writeJSON(w, http.StatusForbidden, errorBody("admin API key is not configured"))
+		httputil.WriteErrorCtx(r.Context(), w, http.StatusForbidden, httputil.UNAUTHORIZED, "admin API key is not configured")
 		return false
 	}
 	if !validAdminKey(cfg.AdminKey, r.Header.Get("X-Admin-Key")) {
-		writeJSON(w, http.StatusUnauthorized, errorBody("invalid or missing admin key"))
+		httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "invalid or missing admin key")
 		return false
 	}
 	if cfg.DB == nil {
-		writeJSON(w, http.StatusServiceUnavailable, errorBody("database unavailable"))
+		httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "database unavailable")
 		return false
 	}
 	return true
@@ -81,7 +88,11 @@ func CreateAPIKey(cfg APIKeyConfig) http.HandlerFunc {
 
 		var req createKeyRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeJSON(w, http.StatusBadRequest, errorBody("invalid JSON body"))
+			if middleware.IsBodyTooLarge(err) {
+				middleware.WriteBodyTooLarge(w, r)
+				return
+			}
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, "invalid JSON body")
 			return
 		}
 		if req.Network == "" {
@@ -93,7 +104,7 @@ func CreateAPIKey(cfg APIKeyConfig) http.HandlerFunc {
 
 		raw := make([]byte, 32)
 		if _, err := rand.Read(raw); err != nil {
-			writeJSON(w, http.StatusInternalServerError, errorBody("failed to generate key"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "failed to generate key")
 			return
 		}
 		plaintext := "trident_" + hex.EncodeToString(raw)
@@ -114,7 +125,7 @@ func CreateAPIKey(cfg APIKeyConfig) http.HandlerFunc {
 			hash, prefix, req.Label, req.Network, req.RateLimitTier, createdBy,
 		).Scan(&id, &createdAt)
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, errorBody("failed to create api key"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "failed to create api key")
 			return
 		}
 
@@ -149,7 +160,7 @@ func ListAPIKeys(cfg APIKeyConfig) http.HandlerFunc {
 			 ORDER BY created_at DESC`,
 		)
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, errorBody("failed to list api keys"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "failed to list api keys")
 			return
 		}
 		defer rows.Close()
@@ -162,7 +173,7 @@ func ListAPIKeys(cfg APIKeyConfig) http.HandlerFunc {
 			if err := rows.Scan(&k.ID, &k.KeyPrefix, &k.Label, &k.Network,
 				&k.RateLimitTier, &k.CreatedBy, &lastUsedAt, &k.RequestCount,
 				&revokedAt, &createdAt); err != nil {
-				writeJSON(w, http.StatusInternalServerError, errorBody("scan error"))
+				httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "scan error")
 				return
 			}
 			k.CreatedAt = createdAt.UTC().Format(time.RFC3339)
@@ -177,7 +188,7 @@ func ListAPIKeys(cfg APIKeyConfig) http.HandlerFunc {
 			keys = append(keys, k)
 		}
 		if rows.Err() != nil {
-			writeJSON(w, http.StatusInternalServerError, errorBody("query error"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "query error")
 			return
 		}
 
@@ -194,42 +205,55 @@ func UpdateAPIKey(cfg APIKeyConfig) http.HandlerFunc {
 			return
 		}
 
+		// Path ids go through the shared UUID validator so a malformed id is a
+		// clear INVALID_ARGUMENT instead of a database-shaped failure (#222).
 		id := r.PathValue("id")
-		if id == "" {
-			writeJSON(w, http.StatusBadRequest, errorBody("missing api key id"))
+		if verr := validation.ValidateUUID("id", id); verr != nil {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
 			return
 		}
 
 		var req updateKeyRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeJSON(w, http.StatusBadRequest, errorBody("invalid JSON body"))
+			if middleware.IsBodyTooLarge(err) {
+				middleware.WriteBodyTooLarge(w, r)
+				return
+			}
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, "invalid JSON body")
 			return
 		}
 		if req.Label == nil && req.RateLimitTier == nil {
-			writeJSON(w, http.StatusBadRequest, errorBody("at least one of label or rate_limit_tier is required"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, "at least one of label or rate_limit_tier is required")
 			return
 		}
 
 		var k APIKeyResponse
 		var lastUsedAt *time.Time
 		var createdAt time.Time
+		var keyHash string
 		err := cfg.DB.QueryRow(r.Context(),
 			`UPDATE api_keys
 			 SET label           = COALESCE($2, label),
 			     rate_limit_tier = COALESCE($3, rate_limit_tier)
 			 WHERE id = $1 AND revoked_at IS NULL
 			 RETURNING id, key_prefix, label, network, rate_limit_tier,
-			           last_used_at, request_count, created_at`,
+			           last_used_at, request_count, created_at, key_hash`,
 			id, req.Label, req.RateLimitTier,
 		).Scan(&k.ID, &k.KeyPrefix, &k.Label, &k.Network, &k.RateLimitTier,
-			&lastUsedAt, &k.RequestCount, &createdAt)
+			&lastUsedAt, &k.RequestCount, &createdAt, &keyHash)
 		if err == pgx.ErrNoRows {
-			writeJSON(w, http.StatusNotFound, errorBody("api key not found"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusNotFound, httputil.NOT_FOUND, "api key not found")
 			return
 		}
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, errorBody("failed to update api key"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "failed to update api key")
 			return
+		}
+
+		// A tier change must evict the cached tier so the new limit applies on
+		// the next request rather than after the tier-cache TTL (issue #229).
+		if req.RateLimitTier != nil && cfg.InvalidateTier != nil {
+			cfg.InvalidateTier(keyHash)
 		}
 
 		k.CreatedAt = createdAt.UTC().Format(time.RFC3339)
@@ -252,9 +276,11 @@ func DeleteAPIKey(cfg APIKeyConfig) http.HandlerFunc {
 			return
 		}
 
+		// Path ids go through the shared UUID validator so a malformed id is a
+		// clear INVALID_ARGUMENT instead of a database-shaped failure (#222).
 		id := r.PathValue("id")
-		if id == "" {
-			writeJSON(w, http.StatusBadRequest, errorBody("missing api key id"))
+		if verr := validation.ValidateUUID("id", id); verr != nil {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
 			return
 		}
 
@@ -267,11 +293,11 @@ func DeleteAPIKey(cfg APIKeyConfig) http.HandlerFunc {
 			id,
 		).Scan(&keyHash)
 		if err == pgx.ErrNoRows {
-			writeJSON(w, http.StatusNotFound, errorBody("api key not found"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusNotFound, httputil.NOT_FOUND, "api key not found")
 			return
 		}
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, errorBody("failed to revoke api key"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "failed to revoke api key")
 			return
 		}
 

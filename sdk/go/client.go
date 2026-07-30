@@ -36,11 +36,7 @@ func NewClient(config TridentClientConfig) *Client {
 }
 
 // QueryEvents fetches a page of historical events matching the filter.
-func (c *Client) QueryEvents(ctx context.Context, params QueryEventsParams) (*PaginatedEvents, error) {
-	if err := c.config.requireAPIKey(); err != nil {
-		return nil, err
-	}
-
+func (c *Client) QueryEvents(ctx context.Context, params QueryEventsParams, opts ...RequestOption) (*PaginatedEvents, error) {
 	reqURL, err := url.Parse(c.config.BaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid BaseURL: %w", err)
@@ -73,28 +69,13 @@ func (c *Client) QueryEvents(ctx context.Context, params QueryEventsParams) (*Pa
 
 	reqURL.RawQuery = q.Encode()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL.String(), nil)
+	bodyBytes, err := c.doGet(ctx, reqURL.String(), opts)
 	if err != nil {
-		return nil, fmt.Errorf("create query request: %w", err)
-	}
-
-	if c.config.APIKey != "" {
-		req.Header.Set("X-API-Key", c.config.APIKey)
-	}
-
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("execute query request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("query events failed with status %d: %s", resp.StatusCode, string(bodyBytes))
+		return nil, err
 	}
 
 	var res PaginatedEvents
-	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+	if err := json.Unmarshal(bodyBytes, &res); err != nil {
 		return nil, fmt.Errorf("decode query response: %w", err)
 	}
 
@@ -102,11 +83,7 @@ func (c *Client) QueryEvents(ctx context.Context, params QueryEventsParams) (*Pa
 }
 
 // GetEventByID fetches a single event by its UUID ID.
-func (c *Client) GetEventByID(ctx context.Context, id string) (*SorobanEvent, error) {
-	if err := c.config.requireAPIKey(); err != nil {
-		return nil, err
-	}
-
+func (c *Client) GetEventByID(ctx context.Context, id string, opts ...RequestOption) (*SorobanEvent, error) {
 	reqURL, err := url.Parse(c.config.BaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid BaseURL: %w", err)
@@ -114,30 +91,15 @@ func (c *Client) GetEventByID(ctx context.Context, id string) (*SorobanEvent, er
 
 	reqURL.Path = "/v1/events/" + id
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL.String(), nil)
+	bodyBytes, err := c.doGet(ctx, reqURL.String(), opts)
 	if err != nil {
-		return nil, fmt.Errorf("create get request: %w", err)
-	}
-
-	if c.config.APIKey != "" {
-		req.Header.Set("X-API-Key", c.config.APIKey)
-	}
-
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("execute get request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("get event failed with status %d: %s", resp.StatusCode, string(bodyBytes))
+		return nil, err
 	}
 
 	var wrapper struct {
 		Event *SorobanEvent `json:"event"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&wrapper); err != nil {
+	if err := json.Unmarshal(bodyBytes, &wrapper); err != nil {
 		return nil, fmt.Errorf("decode get response: %w", err)
 	}
 
@@ -146,6 +108,71 @@ func (c *Client) GetEventByID(ctx context.Context, id string) (*SorobanEvent, er
 	}
 
 	return wrapper.Event, nil
+}
+
+// doGet issues a GET request to reqURL, retrying according to the effective
+// retry policy (client-level config merged with any per-call opts). Returns
+// the response body on a 200 OK, or a typed error (*TridentApiError /
+// *RequestError) once retries are exhausted or the status is non-retryable.
+func (c *Client) doGet(ctx context.Context, reqURL string, opts []RequestOption) ([]byte, error) {
+	retryCfg := c.effectiveRetryConfig(opts)
+	maxAttempts := 1
+	if retryCfg != nil {
+		maxAttempts = retryCfg.MaxAttempts
+	}
+
+	var totalWaited time.Duration
+
+	for attempt := 1; ; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+		if err != nil {
+			return nil, fmt.Errorf("create request: %w", err)
+		}
+		if c.config.APIKey != "" {
+			req.Header.Set("X-API-Key", c.config.APIKey)
+		}
+
+		resp, err := c.client.Do(req)
+		if err != nil {
+			if retryCfg != nil && attempt < maxAttempts {
+				wait := computeBackoff(attempt, retryCfg)
+				if totalWaited+wait <= retryCfg.MaxTotalWait {
+					totalWaited += wait
+					if !sleepCtx(ctx, wait) {
+						return nil, ctx.Err()
+					}
+					continue
+				}
+			}
+			return nil, &RequestError{Attempts: attempt, Err: err}
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+
+			if retryCfg != nil && isRetryableStatus(resp.StatusCode) && attempt < maxAttempts {
+				wait := retryAfterOrBackoff(resp.Header.Get("Retry-After"), attempt, retryCfg)
+				if totalWaited+wait <= retryCfg.MaxTotalWait {
+					totalWaited += wait
+					if !sleepCtx(ctx, wait) {
+						return nil, ctx.Err()
+					}
+					continue
+				}
+			}
+			apiErr := parseApiError(resp.StatusCode, string(bodyBytes))
+			apiErr.Attempts = attempt
+			return nil, apiErr
+		}
+
+		bodyBytes, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("read response body: %w", err)
+		}
+		return bodyBytes, nil
+	}
 }
 
 // Subscription represents an active WebSocket subscription stream.
