@@ -19,6 +19,7 @@ import (
 	"github.com/Depo-dev/trident/services/api/validation"
 	"github.com/Depo-dev/trident/services/api/ws"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -57,90 +58,52 @@ var (
 	metricSSESlowConsumerDisconnects atomic.Int64
 )
 
-// RecordWebhookDelivery updates the webhook delivery counters. Call after
-// every attempted delivery.
-func RecordWebhookDelivery(success bool, deadLetter bool, durationMs int64) {
-	metricWebhookDurationMs.Add(durationMs)
-	metricWebhookTotal.Add(1)
-	switch {
-	case deadLetter:
-		metricWebhookDeadLetter.Add(1)
-	case success:
-		metricWebhookSuccess.Add(1)
-	default:
-		metricWebhookFailed.Add(1)
+// MetricsHandler exposes the Go API's Prometheus metrics in text format:
+// indexer-status gauges (populated as a side effect of GET /v1/stats/indexer;
+// note the trident_api_indexer_* prefix, which avoids colliding with the
+// indexer's own same-named counters/gauges of a different type), HTTP
+// request count/latency (all routes, via middleware.PrometheusHTTP), gRPC
+// client call count/latency, DB connection pool utilisation, and the
+// trident:events Redis Stream length. Mount at GET /metrics.
+func MetricsHandler(pool *pgxpool.Pool, rdb *redis.Client) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+
+		_, _ = fmt.Fprint(w, "# HELP trident_api_indexer_lag_ledgers Number of ledgers the indexer is behind the chain tip, as last observed via GET /v1/stats/indexer.\n")
+		_, _ = fmt.Fprint(w, "# TYPE trident_api_indexer_lag_ledgers gauge\n")
+		_, _ = fmt.Fprintf(w, "trident_api_indexer_lag_ledgers %g\n", metricLagLedgers.Get())
+		_, _ = fmt.Fprint(w, "# HELP trident_api_indexer_last_poll_timestamp_seconds Unix timestamp of the last successful indexer poll, as last observed via GET /v1/stats/indexer.\n")
+		_, _ = fmt.Fprint(w, "# TYPE trident_api_indexer_last_poll_timestamp_seconds gauge\n")
+		_, _ = fmt.Fprintf(w, "trident_api_indexer_last_poll_timestamp_seconds %g\n", metricLastPollTimestamp.Get())
+		_, _ = fmt.Fprint(w, "# HELP trident_api_indexer_events_indexed Cumulative events indexed, as last observed via GET /v1/stats/indexer.\n")
+		_, _ = fmt.Fprint(w, "# TYPE trident_api_indexer_events_indexed gauge\n")
+		_, _ = fmt.Fprintf(w, "trident_api_indexer_events_indexed %g\n", metricEventsTotal.Get())
+
+		middleware.WriteHTTPMetrics(w)
+		middleware.WriteGRPCClientMetrics(w)
+
+		if pool != nil {
+			stat := pool.Stat()
+			writeGauge(w, "trident_api_db_pool_acquired_connections", "Connections currently checked out of the API's Postgres pool.", float64(stat.AcquiredConns()))
+			writeGauge(w, "trident_api_db_pool_idle_connections", "Idle (available) connections in the API's Postgres pool.", float64(stat.IdleConns()))
+			writeGauge(w, "trident_api_db_pool_total_connections", "Total connections (idle + acquired) currently open in the API's Postgres pool.", float64(stat.TotalConns()))
+			writeGauge(w, "trident_api_db_pool_max_connections", "Configured maximum size of the API's Postgres pool.", float64(stat.MaxConns()))
+		}
+
+		if rdb != nil {
+			ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+			defer cancel()
+			if length, err := rdb.XLen(ctx, eventStreamKey).Result(); err == nil {
+				writeGauge(w, "trident_api_redis_stream_length", "Length of the trident:events Redis Stream (indexer -> API consumer backlog).", float64(length))
+			}
+		}
 	}
 }
 
-// MetricsHandler exposes indexer gauges, webhook counters, and gRPC client
-// counters in text format. Mount at GET /metrics (or /v1/metrics).
-func MetricsHandler() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-		_, _ = fmt.Fprintf(w, "# HELP trident_indexer_lag_ledgers Number of ledgers the indexer is behind the chain tip.\n")
-		_, _ = fmt.Fprintf(w, "# TYPE trident_indexer_lag_ledgers gauge\n")
-		_, _ = fmt.Fprintf(w, "trident_indexer_lag_ledgers %g\n", metricLagLedgers.Get())
-		_, _ = fmt.Fprintf(w, "# HELP trident_indexer_last_poll_timestamp_seconds Unix timestamp of the last successful indexer poll.\n")
-		_, _ = fmt.Fprintf(w, "# TYPE trident_indexer_last_poll_timestamp_seconds gauge\n")
-		_, _ = fmt.Fprintf(w, "trident_indexer_last_poll_timestamp_seconds %g\n", metricLastPollTimestamp.Get())
-		_, _ = fmt.Fprintf(w, "# HELP trident_indexer_events_total Cumulative events indexed.\n")
-		_, _ = fmt.Fprintf(w, "# TYPE trident_indexer_events_total gauge\n")
-		_, _ = fmt.Fprintf(w, "trident_indexer_events_total %g\n", metricEventsTotal.Get())
-		apigrpc.WriteClientMetrics(w)
-
-		// Webhook delivery metrics (#241).
-		_, _ = fmt.Fprintf(w, "# HELP trident_webhook_deliveries_success_total Successful webhook deliveries since startup.\n")
-		_, _ = fmt.Fprintf(w, "# TYPE trident_webhook_deliveries_success_total counter\n")
-		_, _ = fmt.Fprintf(w, "trident_webhook_deliveries_success_total %d\n", metricWebhookSuccess.Load())
-		_, _ = fmt.Fprintf(w, "# HELP trident_webhook_deliveries_failed_total Failed (retryable) webhook deliveries since startup.\n")
-		_, _ = fmt.Fprintf(w, "# TYPE trident_webhook_deliveries_failed_total counter\n")
-		_, _ = fmt.Fprintf(w, "trident_webhook_deliveries_failed_total %d\n", metricWebhookFailed.Load())
-		_, _ = fmt.Fprintf(w, "# HELP trident_webhook_deliveries_dead_lettered_total Webhook deliveries exhausted all retries.\n")
-		_, _ = fmt.Fprintf(w, "# TYPE trident_webhook_deliveries_dead_lettered_total counter\n")
-		_, _ = fmt.Fprintf(w, "trident_webhook_deliveries_dead_lettered_total %d\n", metricWebhookDeadLetter.Load())
-		total := metricWebhookTotal.Load()
-		var meanMs float64
-		if total > 0 {
-			meanMs = float64(metricWebhookDurationMs.Load()) / float64(total)
-		}
-		_, _ = fmt.Fprintf(w, "# HELP trident_webhook_delivery_mean_duration_ms Mean delivery round-trip latency in milliseconds.\n")
-		_, _ = fmt.Fprintf(w, "# TYPE trident_webhook_delivery_mean_duration_ms gauge\n")
-		_, _ = fmt.Fprintf(w, "trident_webhook_delivery_mean_duration_ms %g\n", meanMs)
-
-		// SSE + WS/GraphQL slow-consumer backpressure metrics (#224).
-		_, _ = fmt.Fprintf(w, "# HELP trident_sse_slow_consumer_disconnects_total SSE connections closed because a write exceeded the write deadline.\n")
-		_, _ = fmt.Fprintf(w, "# TYPE trident_sse_slow_consumer_disconnects_total counter\n")
-		_, _ = fmt.Fprintf(w, "trident_sse_slow_consumer_disconnects_total %d\n", metricSSESlowConsumerDisconnects.Load())
-		ws.WriteMetrics(w)
-
-		// Abuse-protection rejection counters, split by reason (issue #318):
-		// per-key (existing TieredRateLimit), per-IP, and global concurrency
-		// shedding.
-		rlAllowedN, rlRejectedN := middleware.RateLimitMetrics()
-		_, _ = fmt.Fprintf(w, "# HELP trident_ratelimit_key_allowed_total Requests allowed by the per-API-key tiered rate limiter.\n")
-		_, _ = fmt.Fprintf(w, "# TYPE trident_ratelimit_key_allowed_total counter\n")
-		_, _ = fmt.Fprintf(w, "trident_ratelimit_key_allowed_total %d\n", rlAllowedN)
-		_, _ = fmt.Fprintf(w, "# HELP trident_ratelimit_key_rejected_total Requests rejected by the per-API-key tiered rate limiter.\n")
-		_, _ = fmt.Fprintf(w, "# TYPE trident_ratelimit_key_rejected_total counter\n")
-		_, _ = fmt.Fprintf(w, "trident_ratelimit_key_rejected_total %d\n", rlRejectedN)
-
-		ipAllowedN, ipRejectedN, globalAllowedN, globalRejectedN := middleware.AbuseMetrics()
-		_, _ = fmt.Fprintf(w, "# HELP trident_ratelimit_ip_allowed_total Requests allowed by the pre-auth per-IP rate limiter.\n")
-		_, _ = fmt.Fprintf(w, "# TYPE trident_ratelimit_ip_allowed_total counter\n")
-		_, _ = fmt.Fprintf(w, "trident_ratelimit_ip_allowed_total %d\n", ipAllowedN)
-		_, _ = fmt.Fprintf(w, "# HELP trident_ratelimit_ip_rejected_total Requests rejected by the pre-auth per-IP rate limiter.\n")
-		_, _ = fmt.Fprintf(w, "# TYPE trident_ratelimit_ip_rejected_total counter\n")
-		_, _ = fmt.Fprintf(w, "trident_ratelimit_ip_rejected_total %d\n", ipRejectedN)
-		_, _ = fmt.Fprintf(w, "# HELP trident_concurrency_allowed_total Requests allowed through the global concurrency cap.\n")
-		_, _ = fmt.Fprintf(w, "# TYPE trident_concurrency_allowed_total counter\n")
-		_, _ = fmt.Fprintf(w, "trident_concurrency_allowed_total %d\n", globalAllowedN)
-		_, _ = fmt.Fprintf(w, "# HELP trident_concurrency_rejected_total Requests shed by the global concurrency cap.\n")
-		_, _ = fmt.Fprintf(w, "# TYPE trident_concurrency_rejected_total counter\n")
-		_, _ = fmt.Fprintf(w, "trident_concurrency_rejected_total %d\n", globalRejectedN)
-		_, _ = fmt.Fprintf(w, "# HELP trident_concurrency_in_flight Requests currently in flight.\n")
-		_, _ = fmt.Fprintf(w, "# TYPE trident_concurrency_in_flight gauge\n")
-		_, _ = fmt.Fprintf(w, "trident_concurrency_in_flight %d\n", middleware.InFlightRequests())
-	}
+func writeGauge(w http.ResponseWriter, name, help string, value float64) {
+	_, _ = fmt.Fprintf(w, "# HELP %s %s\n", name, help)
+	_, _ = fmt.Fprintf(w, "# TYPE %s gauge\n", name)
+	_, _ = fmt.Fprintf(w, "%s %g\n", name, value)
 }
 
 // ---------------------------------------------------------------------------

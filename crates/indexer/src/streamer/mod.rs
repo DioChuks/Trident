@@ -250,6 +250,12 @@ impl Streamer {
                 break;
             }
 
+            // Dead-man's-switch: ticks once per loop iteration regardless of
+            // poll outcome, so Prometheus can alert on a hung/crashed process
+            // even when lag itself still looks fine.
+            metrics::record_heartbeat();
+            metrics::set_db_pool_stats(self.db.size(), self.db.num_idle() as u32);
+
             // Periodically refresh the contract allowlist so new contracts
             // become active without a restart (issue #47).
             self.poll_count = self.poll_count.wrapping_add(1);
