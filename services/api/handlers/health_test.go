@@ -1,4 +1,4 @@
-package handlers_test
+package handlers
 
 import (
 	"context"
@@ -6,184 +6,237 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 
 	"github.com/Depo-dev/trident/services/api/gen"
-	"github.com/Depo-dev/trident/services/api/handlers"
+	"github.com/Depo-dev/trident/services/api/internal/contracttest"
 	"github.com/jackc/pgx/v5"
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
-type fakeHealthDB struct {
+// fakeEventsClient implements EventsLister for Ready() tests (package
+// handlers, not handlers_test — kept local rather than reusing
+// events_test.go's MockEventsClient, which lives in the separate
+// handlers_test package and isn't visible here).
+type fakeEventsClient struct {
+	listEvents func(context.Context, *gen.ListEventsRequest) (*gen.ListEventsResponse, error)
+}
+
+func (f *fakeEventsClient) ListEvents(ctx context.Context, in *gen.ListEventsRequest, _ ...grpc.CallOption) (*gen.ListEventsResponse, error) {
+	return f.listEvents(ctx, in)
+}
+
+// healthMockDB implements DBPool for Ready() tests. When pingErr is set,
+// Ping fails and QueryRow is never expected to matter (checkPostgres
+// returns before calling it in production code paths that check the ping
+// error first — this double doesn't need a real Row in that case).
+type healthMockDB struct {
 	pingErr    error
 	lastLedger *int64
-	rowErr     error
+	scanErr    error
 }
 
-func (db fakeHealthDB) Ping(context.Context) error {
-	return db.pingErr
+func (m *healthMockDB) Ping(_ context.Context) error { return m.pingErr }
+func (m *healthMockDB) QueryRow(_ context.Context, _ string, _ ...any) pgx.Row {
+	return &healthMockRow{m: m}
 }
-
-func (db fakeHealthDB) QueryRow(context.Context, string, ...any) pgx.Row {
-	return fakeHealthRow{lastLedger: db.lastLedger, err: db.rowErr}
-}
-
-func (db fakeHealthDB) Query(context.Context, string, ...any) (pgx.Rows, error) {
+func (m *healthMockDB) Query(_ context.Context, _ string, _ ...any) (pgx.Rows, error) {
 	return nil, nil
 }
 
-type fakeHealthRow struct {
-	lastLedger *int64
-	err        error
-}
+type healthMockRow struct{ m *healthMockDB }
 
-func (r fakeHealthRow) Scan(dest ...any) error {
-	if r.err != nil {
-		return r.err
+func (r *healthMockRow) Scan(dest ...any) error {
+	if r.m.scanErr != nil {
+		return r.m.scanErr
 	}
-	if len(dest) == 0 || r.lastLedger == nil {
-		return nil
-	}
-	target, ok := dest[0].(**int64)
-	if !ok {
-		return nil
-	}
-	value := *r.lastLedger
-	*target = &value
+	*dest[0].(**int64) = r.m.lastLedger
 	return nil
 }
 
-type fakeRedisPinger struct {
-	err error
+// healthyRedis and unhealthyRedis satisfy RedisPinger.
+type fakeRedisPinger struct{ err error }
+
+func (f fakeRedisPinger) Ping(ctx context.Context) *redis.StatusCmd {
+	return redis.NewStatusResult("PONG", f.err)
 }
 
-func (p fakeRedisPinger) Ping(ctx context.Context) *redis.StatusCmd {
-	cmd := redis.NewStatusCmd(ctx)
-	if p.err != nil {
-		cmd.SetErr(p.err)
-		return cmd
+func healthReadyReq(path string) *http.Request {
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	req.URL.Scheme = "http"
+	req.URL.Host = "localhost:3000"
+	req.Host = "localhost:3000"
+	return req
+}
+
+// TestHealth_AlwaysReturns200 verifies GET /v1/health is a cheap liveness
+// check: no dependencies wired at all, always 200 (issue #243).
+func TestHealth_AlwaysReturns200(t *testing.T) {
+	req := healthReadyReq("/v1/health")
+	rr := httptest.NewRecorder()
+	Health().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d", rr.Code)
 	}
-	cmd.SetVal("PONG")
-	return cmd
-}
-
-type fakeHealthEventsClient struct {
-	err error
-}
-
-func (c fakeHealthEventsClient) ListEvents(ctx context.Context, in *gen.ListEventsRequest, opts ...grpc.CallOption) (*gen.ListEventsResponse, error) {
-	if c.err != nil {
-		return nil, c.err
+	var body LivenessResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode body: %v", err)
 	}
-	return &gen.ListEventsResponse{}, nil
+	if body.Status != "ok" {
+		t.Errorf("status: want ok, got %q", body.Status)
+	}
+
+	doc := contracttest.LoadSpec(t)
+	router := contracttest.NewRouter(t, doc)
+	contracttest.ValidateResponse(t, router, req, rr.Code, rr.Header(), rr.Body.Bytes())
 }
 
-func TestHealthHandler_TableDriven(t *testing.T) {
-	dbErr := errors.New("database unavailable")
-	redisErr := errors.New("redis unavailable")
-	grpcErr := status.Error(codes.Unavailable, "grpc unavailable")
-
-	tests := []struct {
-		name       string
-		db         handlers.DBPool
-		redis      handlers.RedisPinger
-		grpc       handlers.EventsLister
-		wantStatus int
-		wantBody   handlers.HealthResponse
-		check      func(t *testing.T, body handlers.HealthResponse)
-	}{
-		{
-			name:       "all dependencies reachable",
-			db:         fakeHealthDB{},
-			redis:      fakeRedisPinger{},
-			grpc:       fakeHealthEventsClient{},
-			wantStatus: http.StatusOK,
-			wantBody: handlers.HealthResponse{
-				Status: "ok",
-				Checks: handlers.HealthChecks{
-					Postgres: "ok",
-					Redis:    "ok",
-					GRPCAPI:  "ok",
-				},
-			},
-		},
-		{
-			name:       "db unreachable returns degraded 503",
-			db:         fakeHealthDB{pingErr: dbErr},
-			redis:      fakeRedisPinger{},
-			grpc:       fakeHealthEventsClient{},
-			wantStatus: http.StatusServiceUnavailable,
-			check: func(t *testing.T, body handlers.HealthResponse) {
-				if body.Status != "degraded" {
-					t.Fatalf("status: got %q, want degraded", body.Status)
-				}
-				if !strings.Contains(body.Checks.Postgres, dbErr.Error()) {
-					t.Fatalf("postgres check: got %q, want db error", body.Checks.Postgres)
-				}
-			},
-		},
-		{
-			name:       "grpc unreachable reflected in checks",
-			db:         fakeHealthDB{},
-			redis:      fakeRedisPinger{},
-			grpc:       fakeHealthEventsClient{err: grpcErr},
-			wantStatus: http.StatusServiceUnavailable,
-			check: func(t *testing.T, body handlers.HealthResponse) {
-				if body.Status != "degraded" {
-					t.Fatalf("status: got %q, want degraded", body.Status)
-				}
-				if !strings.Contains(body.Checks.GRPCAPI, "Unavailable") {
-					t.Fatalf("grpc_api check: got %q, want Unavailable", body.Checks.GRPCAPI)
-				}
-			},
-		},
-		{
-			name:       "redis unreachable reflected in checks",
-			db:         fakeHealthDB{},
-			redis:      fakeRedisPinger{err: redisErr},
-			grpc:       fakeHealthEventsClient{},
-			wantStatus: http.StatusServiceUnavailable,
-			check: func(t *testing.T, body handlers.HealthResponse) {
-				if body.Status != "degraded" {
-					t.Fatalf("status: got %q, want degraded", body.Status)
-				}
-				if !strings.Contains(body.Checks.Redis, redisErr.Error()) {
-					t.Fatalf("redis check: got %q, want redis error", body.Checks.Redis)
-				}
-			},
+// TestReady_AllHealthy_Returns200 verifies GET /v1/ready reports 200 with
+// status ok when Postgres, Redis, and gRPC all succeed (issue #243).
+func TestReady_AllHealthy_Returns200(t *testing.T) {
+	ledger := int64(42)
+	db := &healthMockDB{lastLedger: &ledger}
+	rdb := fakeRedisPinger{}
+	grpcClient := &fakeEventsClient{
+		listEvents: func(_ context.Context, _ *gen.ListEventsRequest) (*gen.ListEventsResponse, error) {
+			return &gen.ListEventsResponse{}, nil
 		},
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodGet, "/v1/health", nil)
-			rr := httptest.NewRecorder()
+	req := healthReadyReq("/v1/ready")
+	rr := httptest.NewRecorder()
+	Ready(db, rdb, grpcClient).ServeHTTP(rr, req)
 
-			handlers.Health(tt.db, tt.redis, tt.grpc)(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var body ReadyResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if body.Status != "ok" {
+		t.Errorf("status: want ok, got %q", body.Status)
+	}
+	if body.Checks.Postgres != "ok" || body.Checks.Redis != "ok" || body.Checks.GRPCAPI != "ok" {
+		t.Errorf("want all checks ok, got %+v", body.Checks)
+	}
 
-			if rr.Code != tt.wantStatus {
-				t.Fatalf("status: got %d, want %d; body: %s", rr.Code, tt.wantStatus, rr.Body.String())
-			}
+	doc := contracttest.LoadSpec(t)
+	router := contracttest.NewRouter(t, doc)
+	contracttest.ValidateResponse(t, router, req, rr.Code, rr.Header(), rr.Body.Bytes())
+}
 
-			var body handlers.HealthResponse
-			if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
-				t.Fatalf("decode response: %v", err)
-			}
-			if tt.wantBody.Status != "" {
-				if body.Status != tt.wantBody.Status {
-					t.Fatalf("body.status: got %q, want %q", body.Status, tt.wantBody.Status)
-				}
-				if body.Checks != tt.wantBody.Checks {
-					t.Fatalf("checks: got %+v, want %+v", body.Checks, tt.wantBody.Checks)
-				}
-			}
-			if tt.check != nil {
-				tt.check(t, body)
-			}
-		})
+// TestReady_PostgresDown_Returns503 verifies a Postgres ping failure alone
+// degrades the whole readiness check to 503 (issue #243).
+func TestReady_PostgresDown_Returns503(t *testing.T) {
+	db := &healthMockDB{pingErr: errors.New("connection refused")}
+	rdb := fakeRedisPinger{}
+	grpcClient := &fakeEventsClient{
+		listEvents: func(_ context.Context, _ *gen.ListEventsRequest) (*gen.ListEventsResponse, error) {
+			return &gen.ListEventsResponse{}, nil
+		},
+	}
+
+	req := healthReadyReq("/v1/ready")
+	rr := httptest.NewRecorder()
+	Ready(db, rdb, grpcClient).ServeHTTP(rr, req)
+
+	assertDegraded(t, rr, "postgres")
+
+	doc := contracttest.LoadSpec(t)
+	router := contracttest.NewRouter(t, doc)
+	contracttest.ValidateResponse(t, router, req, rr.Code, rr.Header(), rr.Body.Bytes())
+}
+
+// TestReady_RedisDown_Returns503 verifies a Redis ping failure alone
+// degrades the whole readiness check to 503 (issue #243).
+func TestReady_RedisDown_Returns503(t *testing.T) {
+	ledger := int64(1)
+	db := &healthMockDB{lastLedger: &ledger}
+	rdb := fakeRedisPinger{err: errors.New("dial tcp: connection refused")}
+	grpcClient := &fakeEventsClient{
+		listEvents: func(_ context.Context, _ *gen.ListEventsRequest) (*gen.ListEventsResponse, error) {
+			return &gen.ListEventsResponse{}, nil
+		},
+	}
+
+	req := healthReadyReq("/v1/ready")
+	rr := httptest.NewRecorder()
+	Ready(db, rdb, grpcClient).ServeHTTP(rr, req)
+
+	assertDegraded(t, rr, "redis")
+
+	doc := contracttest.LoadSpec(t)
+	router := contracttest.NewRouter(t, doc)
+	contracttest.ValidateResponse(t, router, req, rr.Code, rr.Header(), rr.Body.Bytes())
+}
+
+// TestReady_GRPCDown_Returns503 verifies a gRPC backend failure alone
+// degrades the whole readiness check to 503 (issue #243).
+func TestReady_GRPCDown_Returns503(t *testing.T) {
+	ledger := int64(1)
+	db := &healthMockDB{lastLedger: &ledger}
+	rdb := fakeRedisPinger{}
+	grpcClient := &fakeEventsClient{
+		listEvents: func(_ context.Context, _ *gen.ListEventsRequest) (*gen.ListEventsResponse, error) {
+			return nil, errors.New("backend unreachable")
+		},
+	}
+
+	req := healthReadyReq("/v1/ready")
+	rr := httptest.NewRecorder()
+	Ready(db, rdb, grpcClient).ServeHTTP(rr, req)
+
+	assertDegraded(t, rr, "grpc_api")
+
+	doc := contracttest.LoadSpec(t)
+	router := contracttest.NewRouter(t, doc)
+	contracttest.ValidateResponse(t, router, req, rr.Code, rr.Header(), rr.Body.Bytes())
+}
+
+// TestReady_NilDependencies_Returns503 verifies unconfigured dependencies
+// (nil db/redis/grpc, e.g. at cold start before DATABASE_URL connects) are
+// treated as failures, not silently skipped (issue #243).
+func TestReady_NilDependencies_Returns503(t *testing.T) {
+	req := healthReadyReq("/v1/ready")
+	rr := httptest.NewRecorder()
+	Ready(nil, nil, nil).ServeHTTP(rr, req)
+
+	assertDegraded(t, rr, "postgres")
+
+	var body ReadyResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if body.Checks.Redis == "ok" || body.Checks.GRPCAPI == "ok" {
+		t.Errorf("want redis and grpc_api also reported as failing, got %+v", body.Checks)
+	}
+}
+
+func assertDegraded(t *testing.T, rr *httptest.ResponseRecorder, failingCheck string) {
+	t.Helper()
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("want 503, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var body ReadyResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if body.Status != "degraded" {
+		t.Errorf("status: want degraded, got %q", body.Status)
+	}
+	var got string
+	switch failingCheck {
+	case "postgres":
+		got = body.Checks.Postgres
+	case "redis":
+		got = body.Checks.Redis
+	case "grpc_api":
+		got = body.Checks.GRPCAPI
+	}
+	if got == "ok" || got == "" {
+		t.Errorf("checks.%s: want a failure reason, got %q", failingCheck, got)
 	}
 }
