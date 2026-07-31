@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
 	"net/http"
@@ -29,9 +30,12 @@ type DBAuthConfig struct {
 const authCacheTTL = 5 * time.Minute
 
 // ParseKeyHashes parses a comma-separated list of HMAC-SHA256 hex digests
-// (as stored in API_KEY_HASHES) into a set for O(1) lookup.
+// (as stored in API_KEY_HASHES or API_KEY) into a set for lookup.
 func ParseKeyHashes(raw string) map[string]struct{} {
 	out := map[string]struct{}{}
+	if raw == "" {
+		raw = os.Getenv("API_KEY")
+	}
 	for _, h := range strings.Split(raw, ",") {
 		h = strings.TrimSpace(h)
 		if h != "" {
@@ -41,8 +45,20 @@ func ParseKeyHashes(raw string) map[string]struct{} {
 	return out
 }
 
+// ConstantTimeContains checks whether target matches any hash in validHashes in
+// constant time using crypto/subtle.ConstantTimeCompare to avoid timing side-channel attacks.
+func ConstantTimeContains(validHashes map[string]struct{}, target string) bool {
+	var match int
+	for hash := range validHashes {
+		if len(hash) == len(target) {
+			match |= subtle.ConstantTimeCompare([]byte(hash), []byte(target))
+		}
+	}
+	return match == 1
+}
+
 // hmacKeyHash computes HMAC-SHA256 of key using API_KEY_SALT — used for the
-// legacy API_KEY_HASHES env-var authentication path.
+// legacy API_KEY_HASHES / API_KEY env-var authentication path.
 func hmacKeyHash(key string) string {
 	salt := []byte(os.Getenv("API_KEY_SALT"))
 	mac := hmac.New(sha256.New, salt)
@@ -70,7 +86,7 @@ func authRedisCacheKey(hash string) string {
 // NewDBAuth returns an authentication middleware that:
 //  1. Looks up the hashed API key in Redis cache (5 min TTL).
 //  2. Falls back to the api_keys database table (active keys only).
-//  3. Falls back to legacy HMAC-SHA256 env-var authentication (API_KEY_HASHES).
+//  3. Falls back to legacy HMAC-SHA256 env-var authentication (API_KEY_HASHES / API_KEY).
 //
 // On success, api_key_id and network are attached to the request context.
 // Unauthenticated requests receive 401 unless the path is excluded.
@@ -129,10 +145,10 @@ func NewDBAuth(cfg DBAuthConfig) func(http.Handler) http.Handler {
 				}
 			}
 
-			// ── 3. Legacy env-var fallback (API_KEY_HASHES) ────────────────
+			// ── 3. Legacy env-var fallback (API_KEY_HASHES / API_KEY) ──────
 			validHashes := ParseKeyHashes(os.Getenv("API_KEY_HASHES"))
 			if len(validHashes) > 0 {
-				if _, ok := validHashes[hmacKeyHash(key)]; ok {
+				if ConstantTimeContains(validHashes, hmacKeyHash(key)) {
 					next.ServeHTTP(w, r)
 					return
 				}
@@ -144,12 +160,11 @@ func NewDBAuth(cfg DBAuthConfig) func(http.Handler) http.Handler {
 }
 
 // Validator returns a func(string) bool that checks whether the HMAC-SHA256
-// of the provided key is in the given valid hashes set. Used by the GraphQL
-// WebSocket handler which needs a standalone key-check function.
+// of the provided key is in the given valid hashes set in constant time. Used
+// by the GraphQL WebSocket handler which needs a standalone key-check function.
 func Validator(hashes map[string]struct{}) func(string) bool {
 	return func(key string) bool {
-		_, ok := hashes[hmacKeyHash(key)]
-		return ok
+		return ConstantTimeContains(hashes, hmacKeyHash(key))
 	}
 }
 
@@ -180,7 +195,7 @@ func Auth(validHashes map[string]struct{}, next http.Handler) http.Handler {
 			return
 		}
 
-		if _, ok := validHashes[hmacKeyHash(key)]; !ok {
+		if !ConstantTimeContains(validHashes, hmacKeyHash(key)) {
 			httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "Unauthorized")
 			return
 		}
