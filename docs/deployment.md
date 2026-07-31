@@ -147,13 +147,13 @@ docker compose -f docker/docker-compose.yml -f docker/docker-compose.prod.yml up
 ### 7. Verify health
 
 ```bash
-curl https://your-domain.com/v1/health
+curl https://your-domain.com/v1/ready
 ```
 
-Expected response:
+Expected response (Postgres/Redis/gRPC all reachable):
 
 ```json
-{"status":"ok"}
+{"status":"ok","indexer_lag":0,"checks":{"postgres":"ok","redis":"ok","grpc_api":"ok"}}
 ```
 
 ---
@@ -198,7 +198,7 @@ docker compose -f docker/docker-compose.yml -f docker/docker-compose.prod.yml \
 ### 4. Verify deployment
 
 ```bash
-curl https://your-domain.com/v1/health
+curl https://your-domain.com/v1/ready
 docker compose -f docker/docker-compose.yml -f docker/docker-compose.prod.yml \
   logs --tail=50 api
 ```
@@ -227,7 +227,7 @@ Migrations in `database/migrations/` are plain SQL and have no automated down pa
 ### 4. Verify health after rollback
 
 ```bash
-curl https://your-domain.com/v1/health
+curl https://your-domain.com/v1/ready
 ```
 
 ---
@@ -285,20 +285,26 @@ curl https://your-domain.com/v1/health
 
 | Endpoint | Description |
 |---|---|
-| `GET /v1/health` | Public liveness check. Returns indexer poll status. |
+| `GET /v1/health` | Public liveness check. No dependency calls — just confirms the process is up (issue #243). |
+| `GET /v1/ready` | Public readiness check. Verifies Postgres, Redis, and the gRPC backend (issue #243); 503 if any is unreachable. |
 | `GET /internal/status` | Internal metrics endpoint (planned for a future release). |
 
-`/v1/health` response shapes:
+`/v1/health` response shape (always 200 while the process is alive):
 
 ```json
 {"status":"ok"}
 ```
-Indexer is polling within the last 60 seconds.
+
+`/v1/ready` response shapes:
 
 ```json
-{"status":"degraded"}
+{"status":"ok","indexer_lag":3,"checks":{"postgres":"ok","redis":"ok","grpc_api":"ok"}}
 ```
-Indexer has stalled or the database is unreachable.
+
+```json
+{"status":"degraded","indexer_lag":null,"checks":{"postgres":"error: dial tcp: connection refused","redis":"ok","grpc_api":"ok"}}
+```
+`indexer_lag` is null whenever Postgres is unreachable or the chain-tip cache hasn't been populated yet. Any non-"ok" entry in `checks` returns HTTP 503.
 
 ### PostgreSQL Disk Usage
 
@@ -321,10 +327,10 @@ A growing `trident:events` stream length indicates consumer lag. Investigate the
 
 ### Indexer Lag
 
-Check `last_poll_at` in the health response. If `status` is `degraded` or `last_poll_at` is more than 5 minutes ago, the indexer has stalled.
+Check `indexer_lag` in the readiness response, or query `GET /v1/stats/indexer` directly for `last_poll_at` and `status`. If `indexer_lag` is large or `checks.postgres` is not `ok`, investigate the indexer/database.
 
 ```bash
-curl https://your-domain.com/v1/health | jq .
+curl https://your-domain.com/v1/ready | jq .
 ```
 
 ### nginx / WebSocket Connections
@@ -588,8 +594,10 @@ lasting change.
   under the top-level `[checks]` section so Fly restarts the machine if
   readiness fails, not just if the TCP port stops accepting connections.
 - **Go API metrics**: `GET /metrics` on the public `trident-api` endpoint
-- **Go API health check**: `GET /v1/health` (used by Fly's HTTP service check
-  in `fly/api.toml`)
+- **Go API health check**: `GET /v1/ready` (used by Fly's HTTP service check
+  in `fly/api.toml` to gate traffic routing). `/v1/ready` verifies
+  Postgres/Redis/gRPC reachability, unlike `/v1/health`, which is a cheap
+  liveness check that says only that the process is up (issue #243).
 - **gRPC API**: no HTTP health endpoint exists in `crates/api` today; Fly's
   check in `fly/grpc-api.toml` is a plain TCP check against port 50051. This
   proves the socket is listening, not that gRPC calls actually succeed — if a
@@ -617,6 +625,7 @@ fly config validate -c fly/api.toml
 fly config validate -c fly/grpc-api.toml
 fly config validate -c fly/indexer.toml
 ```
+>>>>>>> origin/dev
 
 ### Updating secrets
 

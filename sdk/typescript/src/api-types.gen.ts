@@ -12,10 +12,30 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * Health check
-         * @description Returns indexer health status and last indexed ledger
+         * Liveness check
+         * @description Cheap process-liveness check (issue #243) — no dependency calls (no Postgres/Redis/gRPC). Always 200 while the process is up and serving requests. Intended for Kubernetes' liveness probe. For dependency health (Postgres/Redis/gRPC), see GET /v1/ready instead.
          */
         get: operations["getHealth"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/ready": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Readiness check
+         * @description Verifies Postgres, Redis, and the gRPC backend concurrently, each with a 3-second timeout (issue #243). Returns 503 if any dependency check fails. Intended for Kubernetes' readiness probe / Fly's HTTP service check, so a pod with a broken dependency is pulled out of rotation instead of continuing to receive traffic it can't serve.
+         */
+        get: operations["getReady"];
         put?: never;
         post?: never;
         delete?: never;
@@ -133,7 +153,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/v1/contracts/{id}/metadata": {
+    "/v1/contracts/{id}/spec": {
         parameters: {
             query?: never;
             header?: never;
@@ -141,10 +161,50 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * Get token metadata for a contract
-         * @description Returns cached name/symbol/decimals for a SEP-41 token contract, resolved via a read-only simulateTransaction call. `is_token` is false, with the other fields null, both when the contract has not been resolved yet and when it was resolved and found not to implement the token interface.
+         * Get a contract's parsed spec and detected interfaces
+         * @description Returns the functions captured from a tracked contract's spec (contractmeta / SEP-48) and the standard interfaces detected from them (e.g. SEP-41 token, NFT).
          */
-        get: operations["getContractTokenMetadata"];
+        get: operations["getContractSpec"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/contracts/{id}/storage": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get a contract's latest storage snapshot values
+         * @description Returns the most recently observed value for every storage key snapshotted for a tracked contract.
+         */
+        get: operations["getContractStorageLatest"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/contracts/{id}/storage/history": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get the change history of a single contract storage key
+         * @description Returns every recorded change for one storage key, oldest first, for a tracked contract.
+         */
+        get: operations["getContractStorageHistory"];
         put?: never;
         post?: never;
         delete?: never;
@@ -162,7 +222,7 @@ export interface paths {
         };
         /**
          * Get indexer statistics
-         * @description Returns real-time indexer health metrics and throughput
+         * @description Returns real-time indexer health metrics, throughput, and the public data-freshness contract (lag_ledgers, lag_seconds_estimated, last_ledger_indexed) — see docs/observability/data-freshness.md
          */
         get: operations["getIndexerStats"];
         put?: never;
@@ -329,24 +389,33 @@ export interface components {
             /** @description Opaque cursor for next page (null if has_more is false) */
             next_cursor?: string | null;
         };
-        HealthResponse: {
+        LivenessResponse: {
             /**
-             * @description Overall system status
+             * @description Always "ok" while the process is up — no dependency checks.
+             * @enum {string}
+             */
+            status: "ok";
+        };
+        ReadyChecks: {
+            /** @description "ok" or "error: <message>" */
+            postgres: string;
+            /** @description "ok" or "error: <message>" */
+            redis: string;
+            /** @description "ok" or "error: <message>" */
+            grpc_api: string;
+        };
+        ReadyResponse: {
+            /**
+             * @description "degraded" when any dependency check in `checks` failed.
              * @enum {string}
              */
             status: "ok" | "degraded";
-            indexer: {
-                /**
-                 * Format: int64
-                 * @description Latest indexed ledger sequence
-                 */
-                last_ledger_indexed: number | null;
-                /**
-                 * Format: date-time
-                 * @description Timestamp of last successful indexer poll
-                 */
-                last_poll_at?: string | null;
-            };
+            /**
+             * Format: int64
+             * @description Ledgers behind chain tip, from system_state. Null when Postgres is unreachable or the chain-tip cache hasn't been populated yet.
+             */
+            indexer_lag: number | null;
+            checks: components["schemas"]["ReadyChecks"];
         };
         IndexerStatsResponse: {
             /**
@@ -371,6 +440,11 @@ export interface components {
              * @description Number of ledgers behind chain tip
              */
             lag_ledgers?: number | null;
+            /**
+             * Format: double
+             * @description Estimated wall-clock staleness in seconds: lag_ledgers times Stellar's protocol-target ledger close time (~5s). Null whenever lag_ledgers is null. See docs/observability/data-freshness.md for the full freshness contract this field is part of.
+             */
+            lag_seconds_estimated?: number | null;
             /**
              * Format: int64
              * @description Cumulative events indexed
@@ -441,6 +515,58 @@ export interface components {
             name: string;
             /** @description Field type inferred from the contract interface or observed payloads */
             type: string;
+        };
+        ContractSpecResponse: {
+            /** @description Soroban contract address */
+            contract_id: string;
+            /**
+             * @description Network queried
+             * @enum {string}
+             */
+            network: "testnet" | "mainnet";
+            /** @description Deployed WASM code hash this spec was parsed from */
+            code_hash: string;
+            /** @description Whether an embedded contractspecv0 section was found */
+            has_spec: boolean;
+            /** @description Primary classification derived from detected interfaces (e.g. token, nft, custom) */
+            contract_type: string;
+            /** @description Every standard interface detected from the contract's spec functions */
+            interfaces: string[];
+            /** @description Functions captured from the contract's spec */
+            functions: components["schemas"]["ContractSpecFunction"][];
+        };
+        ContractSpecFunction: {
+            /** @description Exported function name */
+            name: string;
+        };
+        ContractStorageResponse: {
+            /** @description Soroban contract address */
+            contract_id: string;
+            /**
+             * @description Network queried
+             * @enum {string}
+             */
+            network: "testnet" | "mainnet";
+            /** @description Storage snapshot values (latest, or full history when queried via /storage/history) */
+            values: components["schemas"]["ContractStorageValue"][];
+        };
+        ContractStorageValue: {
+            /** @description Base64-encoded XDR LedgerKey this value was read from */
+            storage_key: string;
+            /** @description Human-readable decoded storage key */
+            key: unknown;
+            /** @description Human-readable decoded value (absent when the entry was removed) */
+            value?: unknown;
+            /**
+             * Format: int64
+             * @description Ledger sequence at which this value was observed
+             */
+            ledger_sequence: number;
+            /**
+             * Format: date-time
+             * @description Timestamp this snapshot row was recorded
+             */
+            observed_at: string;
         };
         ContractStatsResponse: {
             /** @description Contracts sorted by event count (descending) */
@@ -515,9 +641,42 @@ export interface components {
                 "application/json": components["schemas"]["ErrorResponse"];
             };
         };
-        /** @description Service temporarily unavailable */
+        /** @description Requested resource was not found */
+        NotFound: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["ErrorResponse"];
+            };
+        };
+        /** @description Rate limit exceeded for this API key's tier (error.code RATE_LIMITED). Carries the same X-RateLimit-* headers as a successful response (X-RateLimit-Remaining is 0) plus Retry-After. */
+        RateLimitExceeded: {
+            headers: {
+                "X-RateLimit-Limit": components["headers"]["X-RateLimit-Limit"];
+                "X-RateLimit-Remaining": components["headers"]["X-RateLimit-Remaining"];
+                "X-RateLimit-Reset": components["headers"]["X-RateLimit-Reset"];
+                "Retry-After": components["headers"]["Retry-After"];
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["ErrorResponse"];
+            };
+        };
+        /** @description Per-IP rate limit exceeded (error.code RATE_LIMITED). Applies to endpoints not covered by per-API-key limiting (public endpoints, or admin endpoints authenticated via ADMIN_API_KEY rather than X-API-Key) — only Retry-After is set, no X-RateLimit-* headers. */
+        TooManyRequestsIPOnly: {
+            headers: {
+                "Retry-After": components["headers"]["Retry-After"];
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["ErrorResponse"];
+            };
+        };
+        /** @description Service temporarily unavailable — either a dependency (database, Redis, gRPC backend) is down, or the server is shedding load under the global concurrency cap. When load-shedding is the cause, Retry-After is set; otherwise it is absent. */
         ServiceUnavailable: {
             headers: {
+                "Retry-After": components["headers"]["Retry-After"];
                 [name: string]: unknown;
             };
             content: {
@@ -527,7 +686,33 @@ export interface components {
     };
     parameters: never;
     requestBodies: never;
-    headers: never;
+    headers: {
+        /**
+         * @description Requests allowed per window for this API key's rate-limit tier. Present on every response from an endpoint secured by ApiKeyAuth (2xx and 429 alike) once a valid X-API-Key was presented.
+         * @example 50
+         */
+        "X-RateLimit-Limit": number;
+        /**
+         * @description Requests remaining in the current window for this API key. 0 on the response that triggers a 429.
+         * @example 12
+         */
+        "X-RateLimit-Remaining": number;
+        /**
+         * @description Unix timestamp (seconds) when the current rate-limit window resets.
+         * @example 1732900000
+         */
+        "X-RateLimit-Reset": number;
+        /**
+         * @description Seconds to wait before retrying. Present on 429 (rate limit exceeded, per-API-key or per-IP) and on 503 responses caused by the global concurrency cap shedding load. Not present on a 503 caused by an unavailable dependency (database/Redis/gRPC backend) — check the error envelope's `error.code` to distinguish the two.
+         * @example 1
+         */
+        "Retry-After": number;
+        /**
+         * @description Whether this response was served from the Redis response cache (HIT) or freshly computed (MISS). Only emitted by endpoints that cache their response.
+         * @example HIT
+         */
+        "X-Cache": "HIT" | "MISS";
+    };
     pathItems: never;
 }
 export type $defs = Record<string, never>;
@@ -541,16 +726,48 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Indexer is healthy or degraded */
+            /** @description Process is alive */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HealthResponse"];
+                    "application/json": components["schemas"]["LivenessResponse"];
                 };
             };
+            429: components["responses"]["TooManyRequestsIPOnly"];
             503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    getReady: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description All dependencies reachable */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReadyResponse"];
+                };
+            };
+            429: components["responses"]["TooManyRequestsIPOnly"];
+            /** @description Either one or more dependencies is unreachable (ReadyResponse body, status "degraded", the failing entry in checks set to "error: ..."), or the server is shedding load under the global concurrency cap (ErrorResponse body, Retry-After header set) — the same outermost load-shedding behavior every endpoint shares. */
+            503: {
+                headers: {
+                    "Retry-After": components["headers"]["Retry-After"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReadyResponse"] | components["schemas"]["ErrorResponse"];
+                };
+            };
         };
     };
     listEvents: {
@@ -573,8 +790,8 @@ export interface operations {
                 network?: "testnet" | "mainnet";
                 /** @description Maximum number of events to return */
                 limit?: number;
-                /** @description Opaque pagination cursor from previous response (for next page) */
-                after?: string;
+                /** @description Opaque pagination cursor from previous response's next_cursor (for next page) */
+                cursor?: string;
             };
             header?: never;
             path?: never;
@@ -585,6 +802,9 @@ export interface operations {
             /** @description List of events with pagination metadata */
             200: {
                 headers: {
+                    "X-RateLimit-Limit": components["headers"]["X-RateLimit-Limit"];
+                    "X-RateLimit-Remaining": components["headers"]["X-RateLimit-Remaining"];
+                    "X-RateLimit-Reset": components["headers"]["X-RateLimit-Reset"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -593,6 +813,7 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
+            429: components["responses"]["RateLimitExceeded"];
             503: components["responses"]["ServiceUnavailable"];
         };
     };
@@ -614,6 +835,9 @@ export interface operations {
             /** @description Event details */
             200: {
                 headers: {
+                    "X-RateLimit-Limit": components["headers"]["X-RateLimit-Limit"];
+                    "X-RateLimit-Remaining": components["headers"]["X-RateLimit-Remaining"];
+                    "X-RateLimit-Reset": components["headers"]["X-RateLimit-Reset"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -633,6 +857,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorResponse"];
                 };
             };
+            429: components["responses"]["RateLimitExceeded"];
             503: components["responses"]["ServiceUnavailable"];
         };
     };
@@ -653,6 +878,9 @@ export interface operations {
             /** @description Server-Sent Events stream */
             200: {
                 headers: {
+                    "X-RateLimit-Limit": components["headers"]["X-RateLimit-Limit"];
+                    "X-RateLimit-Remaining": components["headers"]["X-RateLimit-Remaining"];
+                    "X-RateLimit-Reset": components["headers"]["X-RateLimit-Reset"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -661,6 +889,7 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
+            429: components["responses"]["RateLimitExceeded"];
             503: components["responses"]["ServiceUnavailable"];
         };
     };
@@ -686,6 +915,9 @@ export interface operations {
              */
             200: {
                 headers: {
+                    "X-RateLimit-Limit": components["headers"]["X-RateLimit-Limit"];
+                    "X-RateLimit-Remaining": components["headers"]["X-RateLimit-Remaining"];
+                    "X-RateLimit-Reset": components["headers"]["X-RateLimit-Reset"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -699,6 +931,7 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
+            429: components["responses"]["RateLimitExceeded"];
             503: components["responses"]["ServiceUnavailable"];
         };
     };
@@ -717,6 +950,9 @@ export interface operations {
             /** @description Contract event schema registry entry */
             200: {
                 headers: {
+                    "X-RateLimit-Limit": components["headers"]["X-RateLimit-Limit"];
+                    "X-RateLimit-Remaining": components["headers"]["X-RateLimit-Remaining"];
+                    "X-RateLimit-Reset": components["headers"]["X-RateLimit-Reset"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -725,10 +961,11 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
+            429: components["responses"]["RateLimitExceeded"];
             503: components["responses"]["ServiceUnavailable"];
         };
     };
-    getContractTokenMetadata: {
+    getContractSpec: {
         parameters: {
             query?: never;
             header?: never;
@@ -740,17 +977,85 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Cached token metadata (or a not-a-token / not-yet-resolved result) */
+            /** @description Contract spec and detected interfaces */
             200: {
                 headers: {
+                    "X-RateLimit-Limit": components["headers"]["X-RateLimit-Limit"];
+                    "X-RateLimit-Remaining": components["headers"]["X-RateLimit-Remaining"];
+                    "X-RateLimit-Reset": components["headers"]["X-RateLimit-Reset"];
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TokenMetadataResponse"];
+                    "application/json": components["schemas"]["ContractSpecResponse"];
                 };
             };
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            429: components["responses"]["RateLimitExceeded"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    getContractStorageLatest: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Soroban contract address */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Latest known value per storage key */
+            200: {
+                headers: {
+                    "X-RateLimit-Limit": components["headers"]["X-RateLimit-Limit"];
+                    "X-RateLimit-Remaining": components["headers"]["X-RateLimit-Remaining"];
+                    "X-RateLimit-Reset": components["headers"]["X-RateLimit-Reset"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ContractStorageResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            429: components["responses"]["RateLimitExceeded"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    getContractStorageHistory: {
+        parameters: {
+            query: {
+                /** @description Storage key to fetch history for, as returned by the storage/spec endpoints */
+                key: string;
+            };
+            header?: never;
+            path: {
+                /** @description Soroban contract address */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Recorded changes for the requested storage key */
+            200: {
+                headers: {
+                    "X-RateLimit-Limit": components["headers"]["X-RateLimit-Limit"];
+                    "X-RateLimit-Remaining": components["headers"]["X-RateLimit-Remaining"];
+                    "X-RateLimit-Reset": components["headers"]["X-RateLimit-Reset"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ContractStorageResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            429: components["responses"]["RateLimitExceeded"];
             503: components["responses"]["ServiceUnavailable"];
         };
     };
@@ -772,6 +1077,7 @@ export interface operations {
                     "application/json": components["schemas"]["IndexerStatsResponse"];
                 };
             };
+            429: components["responses"]["TooManyRequestsIPOnly"];
             503: components["responses"]["ServiceUnavailable"];
         };
     };
@@ -793,9 +1099,13 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Contract activity statistics */
+            /** @description Contract activity statistics. X-Cache indicates whether this response was served from the 60s Redis response cache (HIT) or freshly computed (MISS). */
             200: {
                 headers: {
+                    "X-RateLimit-Limit": components["headers"]["X-RateLimit-Limit"];
+                    "X-RateLimit-Remaining": components["headers"]["X-RateLimit-Remaining"];
+                    "X-RateLimit-Reset": components["headers"]["X-RateLimit-Reset"];
+                    "X-Cache": components["headers"]["X-Cache"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -804,6 +1114,7 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
+            429: components["responses"]["RateLimitExceeded"];
             503: components["responses"]["ServiceUnavailable"];
         };
     };
@@ -840,6 +1151,7 @@ export interface operations {
                 };
             };
             401: components["responses"]["Unauthorized"];
+            429: components["responses"]["TooManyRequestsIPOnly"];
         };
     };
     createApiKey: {
@@ -888,6 +1200,7 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
+            429: components["responses"]["TooManyRequestsIPOnly"];
         };
     };
     deleteApiKey: {
@@ -919,6 +1232,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorResponse"];
                 };
             };
+            429: components["responses"]["TooManyRequestsIPOnly"];
         };
     };
     getAdminDbStats: {
@@ -940,6 +1254,7 @@ export interface operations {
                 };
             };
             401: components["responses"]["Unauthorized"];
+            429: components["responses"]["TooManyRequestsIPOnly"];
         };
     };
     getMetrics: {

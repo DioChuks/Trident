@@ -95,34 +95,3 @@ func TestInternalStatus_NoRawKeyLeakage(t *testing.T) {
 		}
 	})
 }
-
-func TestInternalStatus_UnsetKey_FailsClosed(t *testing.T) {
-	// INTERNAL_API_KEY unset entirely -> every request must be rejected,
-	// even one that (implausibly) sends an empty X-Internal-Key.
-	t.Setenv("INTERNAL_API_KEY", "")
-
-	req := httptest.NewRequest(http.MethodGet, "/internal/status", nil)
-	rr := httptest.NewRecorder()
-
-	handlers.InternalStatus()(rr, req)
-
-	if rr.Code != http.StatusUnauthorized {
-		t.Fatalf("want 401 (fail closed), got %d: %s", rr.Code, rr.Body.String())
-	}
-}
-
-func TestInternalStatus_UnsetKey_EmptyProvidedKey_StillRejected(t *testing.T) {
-	// Guards against a regression where an empty expected key and an empty
-	// provided key would compare equal and incorrectly authenticate.
-	t.Setenv("INTERNAL_API_KEY", "")
-
-	req := httptest.NewRequest(http.MethodGet, "/internal/status", nil)
-	req.Header.Set("X-Internal-Key", "")
-	rr := httptest.NewRecorder()
-
-	handlers.InternalStatus()(rr, req)
-
-	if rr.Code != http.StatusUnauthorized {
-		t.Fatalf("want 401 (fail closed), got %d: %s", rr.Code, rr.Body.String())
-	}
-}

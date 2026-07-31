@@ -2,7 +2,7 @@ pub mod endpoints;
 pub mod health;
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use trident_common::TridentError;
@@ -239,15 +239,32 @@ impl RpcHttpSettings {
 fn rpc_transport_error(err: reqwest::Error, context: &'static str) -> TridentError {
     if err.is_timeout() {
         metrics::record_rpc_timeout();
+        metrics::record_rpc_error(context, "timeout");
         return TridentError::rpc(anyhow::Error::new(err).context(format!("{context} timed out")));
     }
+    metrics::record_rpc_error(context, "transport");
     TridentError::rpc(anyhow::Error::new(err).context(context))
+}
+
+/// Coarse error-type label for a non-2xx RPC HTTP response (issue #294).
+fn classify_http_status(status: reqwest::StatusCode) -> &'static str {
+    match status.as_u16() {
+        429 => "rate_limited",
+        400..=499 => "http_4xx",
+        500..=599 => "http_5xx",
+        _ => "other",
+    }
 }
 
 pub struct RpcClient {
     http: reqwest::Client,
     /// Health scorer for multi-RPC failover with dynamic scoring.
     scorer: Arc<RpcHealthScorer>,
+    /// Configured endpoints in priority order. The scorer keys endpoints by
+    /// URL in a HashMap, which has no stable ordering, so this list is what
+    /// gives each endpoint the positional index used to label per-endpoint
+    /// latency metrics (issue #294).
+    endpoints: Vec<String>,
 }
 
 impl RpcClient {
@@ -264,11 +281,12 @@ impl RpcClient {
         urls: Vec<String>,
         settings: &RpcHttpSettings,
     ) -> Result<Self, TridentError> {
-        let scorer = Arc::new(RpcHealthScorer::new(urls)?);
+        let scorer = Arc::new(RpcHealthScorer::new(urls.clone())?);
 
         Ok(Self {
             http: settings.build_client()?,
             scorer,
+            endpoints: urls,
         })
     }
 
@@ -277,9 +295,18 @@ impl RpcClient {
         &self.scorer
     }
 
-    /// Select the healthiest endpoint for the next request.
-    fn select_endpoint(&self) -> String {
-        self.scorer.select_best_endpoint()
+    /// Select the healthiest endpoint for the next request. Also returns the
+    /// endpoint's position in the configured list, used to label per-endpoint
+    /// latency metrics (issue #294).
+    fn select_endpoint(&self) -> (String, usize) {
+        let url = self.scorer.select_best_endpoint();
+        let index = self
+            .endpoints
+            .iter()
+            .position(|candidate| candidate == &url)
+            .unwrap_or(0);
+        metrics::set_rpc_active_endpoint(index);
+        (url, index)
     }
 
     /// Record a successful response from the given endpoint.
@@ -315,7 +342,7 @@ impl RpcClient {
         P: Serialize,
         R: serde::de::DeserializeOwned,
     {
-        let url = self.select_endpoint();
+        let (url, endpoint_index) = self.select_endpoint();
         let req = JsonRpcRequest {
             jsonrpc: "2.0",
             id,
@@ -323,7 +350,13 @@ impl RpcClient {
             params,
         };
 
+        // Timed regardless of outcome: a provider that's getting slower but
+        // not yet erroring is exactly what this metric exists to catch
+        // (issue #294).
+        let started = Instant::now();
         let result = self.execute(&url, &req, context).await;
+        metrics::record_rpc_call_duration(context, endpoint_index, started.elapsed().as_secs_f64());
+
         match &result {
             Ok(_) => self.record_success(&url, None),
             Err(e) => self.record_error(&url, e),
@@ -371,9 +404,11 @@ impl RpcClient {
         // A non-2xx response (rate limit, 5xx) is an endpoint failure, not a
         // decode failure — surface it as such so failover can react.
         if !resp.status().is_success() {
+            let status = resp.status();
+            metrics::record_rpc_error(context, classify_http_status(status));
             return Err(TridentError::rpc(anyhow::anyhow!(
                 "{context}: endpoint {url} returned HTTP {}",
-                resp.status()
+                status
             )));
         }
 
@@ -383,6 +418,15 @@ impl RpcClient {
             .map_err(|e| rpc_transport_error(e, context))?;
 
         if let Some(err) = body.error {
+            // The RPC has no dedicated error code for an out-of-range cursor
+            // (issue #294 asks it be distinguishable from other JSON-RPC
+            // errors); its message is the only signal available.
+            let error_type = if err.message.to_lowercase().contains("cursor") {
+                "invalid_cursor"
+            } else {
+                "rpc_error"
+            };
+            metrics::record_rpc_error(context, error_type);
             return Err(TridentError::rpc(anyhow::anyhow!(
                 "{context}: RPC error {}: {}",
                 err.code,
@@ -390,8 +434,10 @@ impl RpcClient {
             )));
         }
 
-        body.result
-            .ok_or_else(|| TridentError::rpc(anyhow::anyhow!("{context}: empty result")))
+        body.result.ok_or_else(|| {
+            metrics::record_rpc_error(context, "empty_result");
+            TridentError::rpc(anyhow::anyhow!("{context}: empty result"))
+        })
     }
 
     /// Fetch the ledger hash for a given sequence number via `getLedgers`.
@@ -425,7 +471,7 @@ impl RpcClient {
         limit: u32,
         filters: &[EventFilter],
     ) -> Result<EventsPage, TridentError> {
-        let url = self.select_endpoint();
+        let (url, _endpoint_index) = self.select_endpoint();
         let params = GetEventsParams {
             start_ledger,
             filters,
@@ -439,7 +485,8 @@ impl RpcClient {
             params: &params,
         };
 
-        let result: Result<GetEventsResult, TridentError> = self.execute(&url, &req, "getEvents").await;
+        let result: Result<GetEventsResult, TridentError> =
+            self.execute(&url, &req, "getEvents").await;
         match &result {
             Ok(r) => {
                 self.record_success(&url, Some(r.latest_ledger));
@@ -466,6 +513,26 @@ impl RpcClient {
             .await
     }
 
+    /// Run a read-only host function call through `simulateTransaction`
+    /// (issue #263), used by `crate::token_metadata` to read SEP-41 token
+    /// metadata without ever signing or submitting a transaction.
+    ///
+    /// A simulation that the node rejects (e.g. the contract exposes no such
+    /// function) comes back as `Ok` with `error` set and `results` empty — that
+    /// is a normal "not a token" answer, not a transport failure, so it is left
+    /// for the caller to interpret. Only genuine RPC/transport failures are
+    /// returned as `Err`.
+    pub async fn simulate_transaction(
+        &self,
+        envelope_xdr: &str,
+    ) -> Result<SimulateTransactionResult, TridentError> {
+        let params = SimulateTransactionParams {
+            transaction: envelope_xdr,
+        };
+        self.call("simulateTransaction", 6, params, "simulateTransaction")
+            .await
+    }
+
     /// Fetch a batch of ledger entries (contract instance, contract code, or
     /// contract data) via `getLedgerEntries` (issues #260, #270). Keys not
     /// present on-chain (e.g. never written, or archived) are simply absent
@@ -482,18 +549,6 @@ impl RpcClient {
             .call("getLedgerEntries", 5, params, "getLedgerEntries")
             .await?;
         Ok(result.entries.unwrap_or_default())
-    }
-
-    /// Simulate a Soroban transaction via `simulateTransaction` (issue #263).
-    ///
-    /// Used for read-only host function calls (e.g., token name/symbol/decimals).
-    pub async fn simulate_transaction(
-        &self,
-        transaction: &str,
-    ) -> Result<SimulateTransactionResult, TridentError> {
-        let params = SimulateTransactionParams { transaction };
-        self.call("simulateTransaction", 4, params, "simulateTransaction")
-            .await
     }
 }
 
@@ -605,8 +660,10 @@ mod tests {
         )
         .unwrap();
 
-        // Two failures on the primary should cause it to be scored lower.
-        assert!(client.get_events(Some(1), None, 10, &[]).await.is_err());
+        // One 503 costs the primary 15 points (100 -> 85), which is already
+        // enough to put the untouched secondary ahead. Scoring fails over on
+        // the first failure, unlike the consecutive-failure threshold the
+        // superseded endpoint pool used.
         assert!(client.get_events(Some(1), None, 10, &[]).await.is_err());
 
         // The health scorer should now prefer the secondary endpoint.

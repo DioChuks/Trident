@@ -125,7 +125,7 @@ func TestContract_OpenAPIResponseValidation(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/v1/health", nil)
 		rr := httptest.NewRecorder()
 
-		handlers.Health(nil, nil, nil)(rr, req)
+		handlers.Health()(rr, req)
 
 		if rr.Code == http.StatusOK {
 			validateResponseAgainstSchema(t, doc, http.MethodGet, "/v1/health", rr.Code, rr.Body.Bytes())
@@ -239,6 +239,7 @@ func TestContract_RouteParity(t *testing.T) {
 	// Note: Admin routes and webhook routes are also currently not documented in OpenAPI
 	expectedRoutes := map[string]bool{
 		"GET /v1/health": true,
+		"GET /v1/ready":  true,
 		"GET /v1/events": true,
 		"POST /v1/events/batch": true,
 		"GET /v1/events/{id}": true,
