@@ -14,29 +14,84 @@ pub use filters::{EventFilter, FilterPlan};
 use crate::metrics;
 use health::RpcHealthScorer;
 
+/// Deserialize a field that the RPC may send as either a JSON string or a
+/// JSON number, normalising both to `String`.
+///
+/// `getEvents` is inconsistent across Soroban RPC versions: older releases
+/// quote `ledger` (`"7"`), current ones send a bare integer (`7`). Typing the
+/// field as `String` therefore failed the whole page with
+/// `invalid type: integer 7, expected a string`, so no events were ever
+/// ingested against a modern RPC (issue #388). Accepting both keeps the
+/// existing `String` contract for callers while tolerating either wire shape.
+fn string_or_number<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrNumber {
+        String(String),
+        Number(u64),
+    }
+
+    Ok(match StringOrNumber::deserialize(deserializer)? {
+        StringOrNumber::String(s) => s,
+        StringOrNumber::Number(n) => n.to_string(),
+    })
+}
+
 /// A single raw event as returned by the Stellar RPC `getEvents` method.
 /// Topics and data are base64-encoded XDR strings; the parser decodes them.
 #[derive(Debug, Deserialize)]
 pub struct RawEvent {
     #[serde(rename = "type")]
     pub event_type: String,
-    /// Ledger sequence number as a numeric string.
+    /// Ledger sequence number. Kept as a string because the RPC has sent it
+    /// both quoted and unquoted across versions; see [`string_or_number`].
+    #[serde(deserialize_with = "string_or_number")]
     pub ledger: String,
     #[serde(rename = "ledgerClosedAt")]
     pub ledger_closed_at: String,
     #[serde(rename = "contractId")]
     pub contract_id: Option<String>,
     pub id: String,
-    #[serde(rename = "pagingToken")]
-    pub paging_token: String,
+    /// Removed from the RPC response in stellar-rpc v22 (stellar-rpc#382):
+    /// `id` identifies an individual event and the top-level `cursor` drives
+    /// pagination. Older servers still send it, so it stays optional rather
+    /// than failing the whole page on a modern one. Prefer
+    /// [`RawEvent::page_cursor`] over reading this directly.
+    #[serde(rename = "pagingToken", default)]
+    pub paging_token: Option<String>,
     #[serde(rename = "txHash")]
     pub tx_hash: String,
+    /// Operation index within the transaction, added in stellar-rpc#383.
+    /// Absent on older servers, where the index was encoded in `id` instead.
+    #[serde(rename = "operationIndex", default)]
+    pub operation_index: Option<u32>,
     /// Ordered list of base64 XDR-encoded ScVal topic values.
     pub topic: Vec<String>,
     /// Base64 XDR-encoded ScVal event body.
     pub value: String,
-    #[serde(rename = "inSuccessfulContractCall")]
+    /// Deprecated upstream and slated for removal (stellar-rpc#4590), so a
+    /// missing value must not fail the page. Absent means the event was not
+    /// filtered out, hence the `true` default.
+    #[serde(rename = "inSuccessfulContractCall", default = "default_true")]
     pub in_successful_contract_call: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl RawEvent {
+    /// The token to resume paging from after this event.
+    ///
+    /// Uses `pagingToken` when the server still sends it and falls back to
+    /// `id`, which stellar-rpc#382 designates as its replacement. Both are
+    /// accepted by the `cursor` request parameter.
+    pub fn page_cursor(&self) -> String {
+        self.paging_token.clone().unwrap_or_else(|| self.id.clone())
+    }
 }
 
 #[derive(Debug)]
@@ -627,6 +682,75 @@ mod tests {
     #[test]
     fn settings_build_a_client() {
         assert!(RpcHttpSettings::default().build_client().is_ok());
+    }
+
+    fn raw_event_json(ledger: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "type": "contract",
+            "ledger": ledger,
+            "ledgerClosedAt": "2026-08-09T18:59:36Z",
+            "contractId": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+            // Deliberately different so tests can prove which one is used.
+            "id": "0000000000000000007-0000000001",
+            "pagingToken": "0000000000000000000-0000000000",
+            "txHash": "aabb",
+            "topic": ["AAAADwAAAARtaW50"],
+            "value": "AAAACgAAAAAAAAAAAAAAAAAAAGQ=",
+            "inSuccessfulContractCall": true
+        })
+    }
+
+    #[test]
+    fn raw_event_accepts_an_unquoted_ledger_number() {
+        // Regression (#388): current Soroban RPC sends `"ledger": 7` as a bare
+        // integer. Typing the field as String failed the entire page with
+        // `invalid type: integer 7, expected a string`, so nothing was indexed.
+        let ev: RawEvent = serde_json::from_value(raw_event_json(serde_json::json!(7)))
+            .expect("unquoted ledger must deserialize");
+        assert_eq!(ev.ledger, "7");
+    }
+
+    #[test]
+    fn raw_event_still_accepts_a_quoted_ledger_string() {
+        // Older RPC releases quote it; both shapes must keep working.
+        let ev: RawEvent = serde_json::from_value(raw_event_json(serde_json::json!("7")))
+            .expect("quoted ledger must deserialize");
+        assert_eq!(ev.ledger, "7");
+    }
+
+    #[test]
+    fn raw_event_parses_without_paging_token_and_falls_back_to_id() {
+        // Regression (#388): stellar-rpc#382 removed pagingToken in favour of
+        // `id`. Requiring it failed the whole page against a current server.
+        let mut json = raw_event_json(serde_json::json!(7));
+        json.as_object_mut().unwrap().remove("pagingToken");
+        let ev: RawEvent =
+            serde_json::from_value(json).expect("missing pagingToken must deserialize");
+        assert_eq!(ev.paging_token, None);
+        assert_eq!(ev.page_cursor(), ev.id, "paging must fall back to id");
+    }
+
+    #[test]
+    fn raw_event_prefers_paging_token_when_the_server_sends_one() {
+        // Older servers still send it; it must win over id so paging behaviour
+        // against them is unchanged.
+        let ev: RawEvent = serde_json::from_value(raw_event_json(serde_json::json!(7)))
+            .expect("event must deserialize");
+        assert_eq!(ev.page_cursor(), "0000000000000000000-0000000000");
+        assert_ne!(ev.page_cursor(), ev.id);
+    }
+
+    #[test]
+    fn raw_event_defaults_in_successful_contract_call_when_absent() {
+        // Deprecated upstream (stellar-rpc#4590) and due for removal, so its
+        // absence must not fail the page or silently drop the event.
+        let mut json = raw_event_json(serde_json::json!(7));
+        json.as_object_mut()
+            .unwrap()
+            .remove("inSuccessfulContractCall");
+        let ev: RawEvent = serde_json::from_value(json)
+            .expect("missing inSuccessfulContractCall must deserialize");
+        assert!(ev.in_successful_contract_call);
     }
 
     /// Mount an endpoint that always answers `getEvents` with an empty page.
