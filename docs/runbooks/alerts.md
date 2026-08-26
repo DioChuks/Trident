@@ -43,7 +43,7 @@ just slow.
 
 ## TridentIndexerHeartbeatStale
 
-**Means:** `trident_indexer_heartbeat_timestamp_seconds` — updated once per
+**Means:** `trident_indexer_last_poll_timestamp_seconds` — updated once per
 poll-loop iteration regardless of outcome — hasn't advanced in over 5
 minutes.
 
@@ -65,7 +65,7 @@ running slowly.
 
 ## TridentIndexerMetricsMissing
 
-**Means:** no `trident_indexer_heartbeat_timestamp_seconds` series exists at
+**Means:** no `trident_indexer_last_poll_timestamp_seconds` series exists at
 all — Prometheus can't find the metric, as opposed to finding it stale.
 
 **Why this threshold:** distinguishes "the indexer is emitting metrics but
@@ -91,29 +91,6 @@ without paging on a single transient network blip.
 **First steps:** same as `TridentIndexerMetricsMissing` — this is usually the
 same underlying problem (process down or network partition) observed from
 Prometheus's scrape health instead of the metric's own staleness.
-
-## TridentIndexerStalled
-
-**Means:** `trident_indexer_last_poll_timestamp_seconds` has not advanced in
-over 3 minutes, or the metric is absent entirely (issue #400).
-
-**Why this threshold:** this alert fires on silence itself, not just lag. If
-the indexer dies outright, or the metric stops being scraped,
-`trident_indexer_ledger_lag` stops updating and can present as a flat,
-healthy-looking line — the exact failure we most need to page on. This alert
-catches that case by monitoring the timestamp of the last successful poll,
-which must advance regardless of whether lag is increasing or not.
-
-**First steps:**
-1. Check `trident_indexer_last_poll_timestamp_seconds` — is it present but
-   stale, or absent entirely?
-2. If absent: same as `TridentIndexerMetricsMissing` (process down, scrape
-   failure, network partition).
-3. If present but stale: the indexer is alive but stuck — check
-   `trident_indexer_rpc_errors_total` and
-   `trident_indexer_rpc_retries_total` for whether it's hung retrying RPC
-   failures. Restart if the poll loop is deadlocked or blocked on I/O that
-   will never complete.
 
 ## TridentIndexerParseErrorRateHigh
 

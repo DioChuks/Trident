@@ -102,7 +102,7 @@ func NewDBAuth(cfg DBAuthConfig) func(http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// Public paths — skip auth entirely.
 			path := r.URL.Path
-			if path == "/v1/health" || path == "/v1/ready" || path == "/metrics" {
+			if path == "/v1/health" || path == "/v1/ready" || path == "/v1/version" || path == "/metrics" {
 				next.ServeHTTP(w, r)
 				return
 			}

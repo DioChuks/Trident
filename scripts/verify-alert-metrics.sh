@@ -48,7 +48,15 @@ echo "✓ Fetched indexer metrics ($(echo "$INDEXER_METRICS" | wc -l) lines)"
 
 # Extract metric names (lines that don't start with # and contain a metric name)
 # Format: metric_name{labels} value timestamp OR metric_name value timestamp
-EMITTED_METRICS=$(echo "$API_METRICS"; echo "$INDEXER_METRICS" | grep -v '^#' | grep -v '^$' | sed -E 's/^([a-zA-Z_:][a-zA-Z0-9_:]*).*/\1/' | sort -u)
+# Both payloads must go through the same extraction. Without the braces the
+# first `echo` is its own command and the API metrics reach EMITTED_METRICS
+# raw — values and `# HELP`/`# TYPE` lines included — so nothing matches by
+# name and the comparison below silently misbehaves.
+EMITTED_METRICS=$( { echo "$API_METRICS"; echo "$INDEXER_METRICS"; } \
+  | grep -v '^#' \
+  | grep -v '^$' \
+  | sed -E 's/^([a-zA-Z_:][a-zA-Z0-9_:]*).*/\1/' \
+  | sort -u)
 
 echo ""
 echo "=== Extracting metric names from alert rules ==="
@@ -99,7 +107,11 @@ MISSING_METRICS=()
 for metric in "${REFERENCED_METRICS[@]}"; do
   # Check if this metric name exists in the emitted metrics
   # Use grep -F for fixed string match (no regex interpretation)
-  if echo "$EMITTED_METRICS" | grep -qF "$metric"; then
+  # -x anchors to the whole line. Without it a referenced name matches any
+  # emitted name that merely contains it, so a metric nothing exports still
+  # passes as long as some longer series shares the prefix — which would let
+  # exactly the drift this script exists to catch through.
+  if printf '%s\n' "$EMITTED_METRICS" | grep -qxF "$metric"; then
     echo "✓ $metric"
   else
     echo "✗ $metric (NOT FOUND in live /metrics)"

@@ -2,7 +2,10 @@ package handlers
 
 import (
 	"context"
+	"errors"
+	"log/slog"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -52,14 +55,22 @@ func VersionHandler(db DBPool) http.HandlerFunc {
 			ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 			defer cancel()
 
-			var schemaVersion string
+			// sqlx creates _sqlx_migrations with `version BIGINT`, so this
+			// must scan into an integer — scanning into a string fails on
+			// every healthy database and silently reports a null version.
+			var schemaVersion int64
 			row := db.QueryRow(ctx, `SELECT version FROM _sqlx_migrations ORDER BY version DESC LIMIT 1`)
-			if err := row.Scan(&schemaVersion); err != nil && err != pgx.ErrNoRows {
-				// Log the error but don't fail the request — build metadata
-				// is still useful even if we can't reach the database.
-				resp.SchemaVersion = nil
-			} else if err == nil {
-				resp.SchemaVersion = &schemaVersion
+			switch err := row.Scan(&schemaVersion); {
+			case err == nil:
+				v := strconv.FormatInt(schemaVersion, 10)
+				resp.SchemaVersion = &v
+			case errors.Is(err, pgx.ErrNoRows):
+				// No migrations applied yet — a null version is accurate.
+			default:
+				// Build metadata is still useful when the database is
+				// unreachable, so report it with a null version rather than
+				// failing the request.
+				slog.WarnContext(ctx, "version: could not read schema version", "err", err)
 			}
 		}
 

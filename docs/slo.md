@@ -82,20 +82,26 @@ interpolated in) so cardinality stays bounded, plus a coarse `class` label
 (`read` | `write`) if per-route budgets prove too granular to alert on
 individually.
 
-**Measuring query** (using the actual emitted metric names from
-`services/api/middleware/metrics.go`):
+**Measuring query** (using the actual emitted metric names and labels from
+`services/api/middleware/metrics.go`, which exports `method`, `route` and
+`status` — there is no `class` label today, so read/write is split on the
+HTTP method until one is added):
 
 ```promql
 histogram_quantile(0.95,
-  sum(rate(trident_api_http_request_duration_seconds_bucket{class="read"}[5m])) by (le)
+  sum(rate(trident_api_http_request_duration_seconds_bucket{method="GET"}[5m])) by (le)
 )
 ```
 
 ```promql
 histogram_quantile(0.95,
-  sum(rate(trident_api_http_request_duration_seconds_bucket{class="write"}[5m])) by (le)
+  sum(rate(trident_api_http_request_duration_seconds_bucket{method!="GET"}[5m])) by (le)
 )
 ```
+
+A real `class="read"|"write"` label is the better long-term shape — see the
+per-class budget note above — but it has to be emitted by the middleware
+before any query can select on it.
 
 **Error budget:** 28 days × (1 − 0.95) = 33.6 hours where p95 may exceed
 target before the budget is exhausted, per class.

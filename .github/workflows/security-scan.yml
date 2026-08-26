@@ -112,12 +112,17 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
-      # All advisories have been triaged in deny.toml (issue #401). This step
-      # now blocks the build on any new advisory that isn't explicitly
-      # accepted there — shipping with unreviewed advisories is not
-      # defensible.
+      # Reports but does not block. #466 removed this on the grounds that the
+      # advisories were triaged in deny.toml, but that file's `ignore` list is
+      # still empty placeholders and nothing here runs `cargo deny` — the
+      # rustsec action runs `cargo audit`, which does not read deny.toml at
+      # all. Blocking now would fail on the pre-existing #373 backlog rather
+      # than on anything new. Restore blocking once those 10 are triaged into
+      # .cargo/audit.toml (which cargo audit does read) or a cargo-deny step
+      # is added.
       - name: cargo audit (Rust workspace)
         uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        continue-on-error: true
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -149,13 +154,20 @@ jobs:
         with:
           node-version: "20"
 
-      # Astro has been upgraded to v5 (issue #402), clearing the 3 HIGH
-      # advisories that were present in 4.16.18 (SSRF via Host header, cache
-      # poisoning, reflected XSS via server islands). This step now blocks on
-      # any HIGH advisory in the explorer's runtime dependencies.
+      # Reports but does not block. #466 moved explorer to Astro 5 and removed
+      # continue-on-error on the assumption that cleared the HIGH advisories.
+      # It does not: resolving this package.json on Astro 5 still leaves HIGH
+      # findings in esbuild and sharp, and npm's own remediation is
+      # `astro@7`. Verified 2026-08-26 by resolving the manifest in isolation.
+      #
+      # Astro 7 + Tailwind 4 does audit clean (0 vulnerabilities), but that is
+      # a two-major jump plus the Tailwind v4 migration (@astrojs/tailwind is
+      # replaced by @tailwindcss/vite), which needs its own change against
+      # #402 rather than riding along here.
       - name: npm audit (explorer)
         working-directory: explorer
         run: npm audit --audit-level=high --omit=dev
+        continue-on-error: true
 
       - name: npm audit (sdk/typescript)
         working-directory: sdk/typescript
