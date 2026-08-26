@@ -356,6 +356,33 @@ jobs:
           fi
 
   # ---------------------------------------------------------------------------
+  # Prometheus alert rules — promtool rule linting and unit tests (issue #392)
+  # ---------------------------------------------------------------------------
+  prometheus-alerts:
+    name: Prometheus Alert Rules
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Download promtool
+        run: |
+          PROM_VERSION="2.51.0"
+          curl -sSfL \
+            "https://github.com/prometheus/prometheus/releases/download/v${PROM_VERSION}/prometheus-${PROM_VERSION}.linux-amd64.tar.gz" \
+            | tar xz --strip-components=1 "prometheus-${PROM_VERSION}.linux-amd64/promtool"
+          chmod +x promtool
+          ./promtool --version
+
+      - name: Validate monitoring/alerts.yml
+        run: ./promtool check rules monitoring/alerts.yml
+
+      - name: Validate observability/burn-rate-alerts.yml
+        run: ./promtool check rules observability/burn-rate-alerts.yml
+
+      - name: Validate observability/rpc-alerts.yml
+        run: ./promtool check rules observability/rpc-alerts.yml
+
+  # ---------------------------------------------------------------------------
   # Rust integration tests — real Postgres + Redis
   # Runs integration tests that are silently skipped when TEST_DATABASE_URL
   # and TEST_REDIS_URL are absent. Scoped to push/PR against main and dev.
@@ -650,6 +677,13 @@ jobs:
 
           # Validate the response is valid JSON — python3 will exit non-zero if not.
           echo "$RESPONSE" | python3 -c "import sys,json; data=json.load(sys.stdin); print('✓ /v1/events returned valid JSON')"
+
+      - name: Verify alert metrics exist (issue #393)
+        run: |
+          chmod +x scripts/verify-alert-metrics.sh
+          ./scripts/verify-alert-metrics.sh \
+            http://localhost:3000/metrics \
+            http://localhost:9090/metrics
 
       - name: Dump service logs
         # Always run so logs are available for both passing and failing runs.

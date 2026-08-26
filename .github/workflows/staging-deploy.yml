@@ -4,17 +4,12 @@ name: Staging Deploy
 # smoke test staging (issue #313). See docs/deployment.md#staging for the
 # full write-up, including what is fully automated here vs. best-effort.
 #
-# IMPORTANT — partially stubbed pending issue #308:
-# The "run migrations" step below is a placeholder. Issue #308 ("database
-# migration job as a Helm hook") is still open/unimplemented — there is no
-# Helm pre-upgrade hook Job in helm/trident/templates yet. Until #308 lands,
-# this workflow runs migrations directly via `sqlx migrate run` against the
-# staging database from the runner (same mechanism CI's `rust` job already
-# uses), which is a reasonable stand-in but is NOT the same thing as an
-# in-cluster, chart-versioned migration hook that runs exactly once per
-# release and blocks the rollout on failure. Replace the "Run database
-# migrations" step with a `helm upgrade --wait` against the real hook once
-# #308 ships.
+# Database migrations run as a Helm pre-upgrade hook Job
+# (helm/trident/templates/migration-job.yaml, implemented in issue #308).
+# The Job is wired with helm.sh/hook: pre-install,pre-upgrade and
+# helm.sh/hook-weight: "-5" to ensure schema changes are applied before any
+# app Deployment (indexer/grpc-api/go-api) rolls out. This workflow's
+# `helm upgrade --install` step below triggers that hook automatically.
 on:
   push:
     branches: [dev]
@@ -161,20 +156,6 @@ jobs:
             --set grpcApi.image.tag=staging-${{ needs.build-and-push.outputs.sha }} \
             --set goApi.image.tag=staging-${{ needs.build-and-push.outputs.sha }} \
             --wait --timeout 5m
-
-      # STUBBED pending issue #308 — see the note at the top of this file.
-      # Runs migrations from the runner directly rather than via an in-cluster
-      # Helm hook. Requires STAGING_DATABASE_URL to be reachable from the
-      # runner (e.g. via a VPN/peering step not modeled here, or a public
-      # staging DB endpoint) — if your staging Postgres isn't runner-reachable,
-      # this step needs a `kubectl run`/Job variant instead.
-      - name: Run database migrations (stand-in for issue #308's Helm hook)
-        if: vars.STAGING_DATABASE_URL != ''
-        env:
-          DATABASE_URL: ${{ vars.STAGING_DATABASE_URL }}
-        run: |
-          cargo install sqlx-cli --no-default-features --features postgres || true
-          sqlx migrate run --source database/migrations
 
   # ---------------------------------------------------------------------------
   # Post-deploy smoke test against staging: health, a real query, the SSE
