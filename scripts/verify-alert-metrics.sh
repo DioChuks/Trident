@@ -46,17 +46,45 @@ INDEXER_METRICS=$(curl --silent --fail --max-time 10 "$INDEXER_METRICS_URL" || {
 echo "✓ Fetched API metrics ($(echo "$API_METRICS" | wc -l) lines)"
 echo "✓ Fetched indexer metrics ($(echo "$INDEXER_METRICS" | wc -l) lines)"
 
-# Extract metric names (lines that don't start with # and contain a metric name)
-# Format: metric_name{labels} value timestamp OR metric_name value timestamp
+# Collect the metric names both endpoints know about.
+#
 # Both payloads must go through the same extraction. Without the braces the
 # first `echo` is its own command and the API metrics reach EMITTED_METRICS
 # raw — values and `# HELP`/`# TYPE` lines included — so nothing matches by
 # name and the comparison below silently misbehaves.
-EMITTED_METRICS=$( { echo "$API_METRICS"; echo "$INDEXER_METRICS"; } \
+#
+# Two sources, deliberately:
+#
+#   sample lines  `metric_name{labels} value`  — a series with an observation
+#   HELP/TYPE     `# TYPE metric_name counter` — the metric is declared
+#
+# A counter or histogram with no observations yet prints its HELP/TYPE header
+# and no samples, so sample lines alone would report a perfectly good metric
+# as missing purely because nothing had exercised it — which is the normal
+# state for `trident_api_http_requests_total` on a freshly started API. We
+# are checking that a name exists, not that traffic has happened, so a
+# declaration counts.
+#
+# Histograms declare the base name but emit `_bucket`/`_sum`/`_count` series,
+# so each declared name is expanded to those suffixes too.
+DECLARED=$( { echo "$API_METRICS"; echo "$INDEXER_METRICS"; } \
+  | grep -E '^# (HELP|TYPE) ' \
+  | awk '{print $3}' \
+  | sort -u)
+
+DECLARED_SUFFIXED=$(
+  printf '%s\n' "$DECLARED"
+  printf '%s\n' "$DECLARED" | sed 's/$/_bucket/'
+  printf '%s\n' "$DECLARED" | sed 's/$/_sum/'
+  printf '%s\n' "$DECLARED" | sed 's/$/_count/'
+)
+
+SAMPLED=$( { echo "$API_METRICS"; echo "$INDEXER_METRICS"; } \
   | grep -v '^#' \
   | grep -v '^$' \
-  | sed -E 's/^([a-zA-Z_:][a-zA-Z0-9_:]*).*/\1/' \
-  | sort -u)
+  | sed -E 's/^([a-zA-Z_:][a-zA-Z0-9_:]*).*/\1/')
+
+EMITTED_METRICS=$(printf '%s\n%s\n' "$SAMPLED" "$DECLARED_SUFFIXED" | sort -u)
 
 echo ""
 echo "=== Extracting metric names from alert rules ==="
