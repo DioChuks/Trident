@@ -351,6 +351,9 @@ goApi:
 
 ### Multiple API key support
 
+For production issuance, overlap rotation, and compromise handling, follow
+the [API key lifecycle runbook](runbooks/api-key-lifecycle.md).
+
 Create API keys via the admin endpoint after deployment:
 
 ```bash
