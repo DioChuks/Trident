@@ -67,6 +67,25 @@ groups:
             /metrics may still respond.
           runbook_url: "docs/runbooks/alerts.md#tridentindexerheartbeatstale"
 
+      - alert: TridentIndexerStalled
+        expr: >
+          (time() - trident_indexer_last_poll_timestamp_seconds) > 180
+          or
+          absent(trident_indexer_last_poll_timestamp_seconds)
+        for: 2m
+        labels:
+          severity: critical
+          service: indexer
+        annotations:
+          summary: "Trident indexer has not completed a poll in over 3 minutes"
+          description: >
+            trident_indexer_last_poll_timestamp_seconds has not advanced in
+            over 3 minutes, or the metric is absent entirely. The indexer has
+            either died outright, stopped being scraped, or is stuck in a retry
+            loop. Unlike lag-based alerts (which can show a flat line when the
+            indexer is dead), this alert fires on silence itself (issue #400).
+          runbook_url: "docs/runbooks/alerts.md#tridentindexerstalled"
+
       - alert: TridentIndexerMetricsMissing
         expr: absent(trident_indexer_heartbeat_timestamp_seconds)
         for: 3m
