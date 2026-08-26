@@ -52,6 +52,8 @@ pub struct OpenApiModels {
     pub soroban_event: Option<SorobanEvent>,
 
     pub token_metadata_response: Option<TokenMetadataResponse>,
+
+    pub version_response: Option<VersionResponse>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -350,11 +352,11 @@ pub enum IndexerStatsResponseStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LivenessResponse {
-    /// Always "ok" while the process is up — no dependency checks.
+    /// Always "ok" while the process is up â€” no dependency checks.
     pub status: LivenessResponseStatus,
 }
 
-/// Always "ok" while the process is up — no dependency checks.
+/// Always "ok" while the process is up â€” no dependency checks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LivenessResponseStatus {
@@ -419,4 +421,24 @@ pub struct TokenMetadataResponse {
 
     /// Token symbol, from symbol(). Null unless is_token is true.
     pub symbol: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VersionResponse {
+    /// RFC 3339 build time, or "unknown" when not injected at build time. Not typed as date-time
+    /// because of that sentinel.
+    pub build_timestamp: String,
+
+    /// Full git commit SHA the binary was built from, or "unknown" when not injected at build
+    /// time.
+    pub commit_sha: String,
+
+    /// Highest applied migration version from _sqlx_migrations, as a string. Null when no
+    /// migrations have been applied yet or when Postgres is unreachable â€” the endpoint still
+    /// returns 200 in that case so build metadata stays available during an outage.
+    pub schema_version: String,
+
+    /// Semantic version tag of the running build, or "dev" for a binary built without release
+    /// ldflags.
+    pub version: String,
 }

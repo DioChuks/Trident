@@ -627,7 +627,7 @@ class IndexerStatsResponse:
 
 
 class LivenessResponseStatus(Enum):
-    """Always "ok" while the process is up — no dependency checks."""
+    """Always "ok" while the process is up â€” no dependency checks."""
 
     OK = "ok"
 
@@ -635,7 +635,7 @@ class LivenessResponseStatus(Enum):
 @dataclass
 class LivenessResponse:
     status: LivenessResponseStatus
-    """Always "ok" while the process is up — no dependency checks."""
+    """Always "ok" while the process is up â€” no dependency checks."""
 
     @staticmethod
     def from_dict(obj: Any) -> 'LivenessResponse':
@@ -762,6 +762,44 @@ class TokenMetadataResponse:
 
 
 @dataclass
+class VersionResponse:
+    build_timestamp: str
+    """RFC 3339 build time, or "unknown" when not injected at build time. Not typed as date-time
+    because of that sentinel.
+    """
+    commit_sha: str
+    """Full git commit SHA the binary was built from, or "unknown" when not injected at build
+    time.
+    """
+    schema_version: str
+    """Highest applied migration version from _sqlx_migrations, as a string. Null when no
+    migrations have been applied yet or when Postgres is unreachable â€” the endpoint still
+    returns 200 in that case so build metadata stays available during an outage.
+    """
+    version: str
+    """Semantic version tag of the running build, or "dev" for a binary built without release
+    ldflags.
+    """
+
+    @staticmethod
+    def from_dict(obj: Any) -> 'VersionResponse':
+        assert isinstance(obj, dict)
+        build_timestamp = from_str(obj.get("build_timestamp"))
+        commit_sha = from_str(obj.get("commit_sha"))
+        schema_version = from_str(obj.get("schema_version"))
+        version = from_str(obj.get("version"))
+        return VersionResponse(build_timestamp, commit_sha, schema_version, version)
+
+    def to_dict(self) -> dict:
+        result: dict = {}
+        result["build_timestamp"] = from_str(self.build_timestamp)
+        result["commit_sha"] = from_str(self.commit_sha)
+        result["schema_version"] = from_str(self.schema_version)
+        result["version"] = from_str(self.version)
+        return result
+
+
+@dataclass
 class OpenAPIModels:
     api_key_response: APIKeyResponse | None = None
     contract_event_field_schema: ContractEventFieldSchema | None = None
@@ -781,6 +819,7 @@ class OpenAPIModels:
     ready_response: ReadyResponse | None = None
     soroban_event: SorobanEvent | None = None
     token_metadata_response: TokenMetadataResponse | None = None
+    version_response: VersionResponse | None = None
 
     @staticmethod
     def from_dict(obj: Any) -> 'OpenAPIModels':
@@ -803,7 +842,8 @@ class OpenAPIModels:
         ready_response = from_union([ReadyResponse.from_dict, from_none], obj.get("ReadyResponse"))
         soroban_event = from_union([SorobanEvent.from_dict, from_none], obj.get("SorobanEvent"))
         token_metadata_response = from_union([TokenMetadataResponse.from_dict, from_none], obj.get("TokenMetadataResponse"))
-        return OpenAPIModels(api_key_response, contract_event_field_schema, contract_event_schema, contract_event_schema_response, contract_spec_function, contract_spec_response, contract_stats, contract_stats_response, contract_storage_response, contract_storage_value, error_response, event_list_response, indexer_stats_response, liveness_response, ready_checks, ready_response, soroban_event, token_metadata_response)
+        version_response = from_union([VersionResponse.from_dict, from_none], obj.get("VersionResponse"))
+        return OpenAPIModels(api_key_response, contract_event_field_schema, contract_event_schema, contract_event_schema_response, contract_spec_function, contract_spec_response, contract_stats, contract_stats_response, contract_storage_response, contract_storage_value, error_response, event_list_response, indexer_stats_response, liveness_response, ready_checks, ready_response, soroban_event, token_metadata_response, version_response)
 
     def to_dict(self) -> dict:
         result: dict = {}
@@ -843,6 +883,8 @@ class OpenAPIModels:
             result["SorobanEvent"] = from_union([lambda x: to_class(SorobanEvent, x), from_none], self.soroban_event)
         if self.token_metadata_response is not None:
             result["TokenMetadataResponse"] = from_union([lambda x: to_class(TokenMetadataResponse, x), from_none], self.token_metadata_response)
+        if self.version_response is not None:
+            result["VersionResponse"] = from_union([lambda x: to_class(VersionResponse, x), from_none], self.version_response)
         return result
 
 

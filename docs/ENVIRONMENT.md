@@ -259,5 +259,18 @@ the Go and gRPC API deployments after each phase.
 
 ## CI-only
 
+### Live OpenAPI contract suite
+
+`services/api/internal/contracttest` validates a running API's responses
+against `api/openapi.yaml`. It is skipped unless `CONTRACTTEST_BASE_URL` is
+set, so these are read only by the `e2e` job — never by a running service.
+
+| Variable | Required | Description |
+|---|---|---|
+| `CONTRACTTEST_BASE_URL` | Yes, to run the suite | Base URL of the API under test. Unset skips the whole suite. |
+| `CONTRACTTEST_API_KEY` | Yes, when the suite runs | Key for authenticated endpoints. |
+| `CONTRACTTEST_ADMIN_KEY` | Yes, when the suite runs | Key for the `/v1/admin/*` endpoints. |
+| `CONTRACTTEST_REDIS_URL` | Yes, when the suite runs | Redis used to seed stream fixtures before asserting on `/v1/events/stream`. |
+
 `.env.ci` additionally pins a fixed, publicly-known test API key/salt/hash —
 documented inline in that file as "do not use outside CI".

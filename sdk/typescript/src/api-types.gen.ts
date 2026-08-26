@@ -44,6 +44,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/version": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Build and schema version
+         * @description Reports which build is running — semantic version tag, git commit SHA, build timestamp, and the highest applied database migration (issue #397). Answers "which build is live?" during an incident without reading GHCR tags or pod specs.
+         *     Authenticated: the commit SHA and schema version narrow the search for known-vulnerable code paths, so this is not public. Use /v1/ready for an unauthenticated liveness signal.
+         *     When the database is unreachable the endpoint still returns 200 with build metadata and a null schema_version, so it stays usable during exactly the outage you need it for.
+         */
+        get: operations["getVersion"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/events": {
         parameters: {
             query?: never;
@@ -416,6 +438,25 @@ export interface components {
              */
             indexer_lag: number | null;
             checks: components["schemas"]["ReadyChecks"];
+        };
+        VersionResponse: {
+            /**
+             * @description Semantic version tag of the running build, or "dev" for a binary built without release ldflags.
+             * @example v1.2.3
+             */
+            version: string;
+            /**
+             * @description Full git commit SHA the binary was built from, or "unknown" when not injected at build time.
+             * @example 2e6ad17c8f9b4a1d3e5f7a9c2b4d6e8f0a1c3e5d
+             */
+            commit_sha: string;
+            /**
+             * @description RFC 3339 build time, or "unknown" when not injected at build time. Not typed as date-time because of that sentinel.
+             * @example 2026-08-26T15:19:00Z
+             */
+            build_timestamp: string;
+            /** @description Highest applied migration version from _sqlx_migrations, as a string. Null when no migrations have been applied yet or when Postgres is unreachable — the endpoint still returns 200 in that case so build metadata stays available during an outage. */
+            schema_version: string | null;
         };
         IndexerStatsResponse: {
             /**
@@ -802,12 +843,34 @@ export interface operations {
             };
         };
     };
+    getVersion: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Build metadata for the running instance */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["VersionResponse"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            429: components["responses"]["RateLimitExceeded"];
+        };
+    };
     listEvents: {
         parameters: {
             query?: {
                 /**
                  * @description Filter by Soroban contract address (strkey format, 56 chars starting with C)
-                 * @example CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM
+                 * @example CA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVSGZ
                  */
                 contractId?: string;
                 /** @description Filter by primary topic (XDR-encoded) */

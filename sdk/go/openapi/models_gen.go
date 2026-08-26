@@ -39,6 +39,7 @@ type OpenAPIModels struct {
 	ReadyResponse               *ReadyResponse               `json:"ReadyResponse,omitempty"`
 	SorobanEvent                *SorobanEvent                `json:"SorobanEvent,omitempty"`
 	TokenMetadataResponse       *TokenMetadataResponse       `json:"TokenMetadataResponse,omitempty"`
+	VersionResponse             *VersionResponse             `json:"VersionResponse,omitempty"`
 }
 
 type APIKeyResponse struct {
@@ -227,8 +228,8 @@ type IndexerStatsResponse struct {
 }
 
 type LivenessResponse struct {
-	// Always "ok" while the process is up — no dependency checks.                       
-	Status                                                        LivenessResponseStatus `json:"status"`
+	// Always "ok" while the process is up â€” no dependency checks.                       
+	Status                                                          LivenessResponseStatus `json:"status"`
 }
 
 type ReadyChecks struct {
@@ -267,6 +268,22 @@ type TokenMetadataResponse struct {
 	Symbol                                                                                    *string    `json:"symbol,omitempty"`
 }
 
+type VersionResponse struct {
+	// RFC 3339 build time, or "unknown" when not injected at build time. Not typed as date-time       
+	// because of that sentinel.                                                                       
+	BuildTimestamp                                                                              string `json:"build_timestamp"`
+	// Full git commit SHA the binary was built from, or "unknown" when not injected at build          
+	// time.                                                                                           
+	CommitSHA                                                                                   string `json:"commit_sha"`
+	// Highest applied migration version from _sqlx_migrations, as a string. Null when no              
+	// migrations have been applied yet or when Postgres is unreachable â€” the endpoint still         
+	// returns 200 in that case so build metadata stays available during an outage.                    
+	SchemaVersion                                                                               string `json:"schema_version"`
+	// Semantic version tag of the running build, or "dev" for a binary built without release          
+	// ldflags.                                                                                        
+	Version                                                                                     string `json:"version"`
+}
+
 // Network queried
 type Network string
 
@@ -293,7 +310,7 @@ const (
 	Stalled IndexerStatsResponseStatus = "stalled"
 )
 
-// Always "ok" while the process is up — no dependency checks.
+// Always "ok" while the process is up â€” no dependency checks.
 type LivenessResponseStatus string
 
 const (

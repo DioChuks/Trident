@@ -949,7 +949,6 @@ components:
             string. Null when no migrations have been applied yet or when
             Postgres is unreachable — the endpoint still returns 200 in that
             case so build metadata stays available during an outage.
-          example: "25"
 
     IndexerStatsResponse:
       type: object
