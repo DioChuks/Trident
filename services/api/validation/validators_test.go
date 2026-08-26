@@ -4,6 +4,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Depo-dev/trident/services/api/cursor"
 )
@@ -228,7 +229,7 @@ func TestValidateTimeRange(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, _, verr := ValidateTimeRange("from", "to", tt.from, tt.to)
+			_, _, verr := ValidateTimeRange("from", "to", tt.from, tt.to, 31*24*time.Hour)
 			if (verr != nil) != tt.wantErr {
 				t.Fatalf("got %v, wantErr=%v", verr, tt.wantErr)
 			}
