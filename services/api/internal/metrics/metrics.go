@@ -78,6 +78,11 @@ var (
 		Help: "Total requests rejected by a rate limiter, by limiter.",
 	}, []string{"limiter"}) // limiter: per_key|per_ip|global_concurrency
 
+	RateLimitFailOpenTotal = promauto.With(Registry).NewCounterVec(prometheus.CounterOpts{
+		Name: "trident_ratelimit_fail_open_total",
+		Help: "Total requests allowed because a rate-limit backend check failed, by limiter.",
+	}, []string{"limiter"}) // limiter: per_key
+
 	// DB pool saturation metrics (issue #238), sourced from pgxpool.Pool.Stat()
 	// by PollDBPool. All exposed as Gauges — Stat() itself only returns
 	// point-in-time cumulative totals (not deltas), which Set() reflects
