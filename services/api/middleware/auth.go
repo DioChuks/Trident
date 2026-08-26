@@ -102,7 +102,12 @@ func NewDBAuth(cfg DBAuthConfig) func(http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// Public paths — skip auth entirely.
 			path := r.URL.Path
-			if path == "/v1/health" || path == "/v1/ready" || path == "/v1/version" || path == "/metrics" {
+			// /v1/version stays authenticated: it publishes the exact commit
+			// SHA and applied schema version, which narrows an attacker's
+			// search for known-vulnerable code paths. Operators debugging
+			// "which build is live?" have a key; anonymous callers do not
+			// need one. /v1/ready already covers unauthenticated liveness.
+			if path == "/v1/health" || path == "/v1/ready" || path == "/metrics" {
 				next.ServeHTTP(w, r)
 				return
 			}

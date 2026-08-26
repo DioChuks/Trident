@@ -61,20 +61,63 @@ EMITTED_METRICS=$( { echo "$API_METRICS"; echo "$INDEXER_METRICS"; } \
 echo ""
 echo "=== Extracting metric names from alert rules ==="
 
-# Extract all metric names from alert YAML files. This regex captures:
-# - Metric names in PromQL expressions (alphanumeric + underscores + colons)
-# - Ignores Prometheus functions (e.g., rate, sum, avg_over_time)
-# - Captures metric names before { or [ or ( or space
+# Extract the metric names each rule file selects.
+#
+# This parses the YAML rather than grepping `expr:` lines, because most of our
+# expressions are block scalars (`expr: >` / `expr: |`) whose body lives on the
+# following lines — a line-oriented grep silently skips them. All four
+# burn-rate recording rules are written that way.
+#
+# Within an expression we drop three things that are not metrics: PromQL
+# keywords and functions, anything inside a `{...}` label selector (label keys
+# and values), and any bare token with no `_` or `:` in it. That last rule is
+# what keeps `GET`, `api`, `v1`, `up`, `job` and friends out — every metric we
+# emit is namespaced (`trident_*`) or a recording rule (`trident:*`).
 extract_metrics_from_alerts() {
-  local alert_file="$1"
-  # Extract PromQL expressions from expr: lines and recording rule expr: lines
-  # Then extract all potential metric names (word characters that could be metrics)
-  # Filter out Prometheus functions and operators
-  grep -E '^\s+expr:' "$alert_file" \
-    | sed 's/expr://g' \
-    | grep -oE '\b[a-zA-Z_:][a-zA-Z0-9_:]*\b' \
-    | grep -v -E '^(rate|irate|increase|sum|avg|min|max|count|stddev|stdvar|topk|bottomk|quantile|histogram_quantile|time|bool|by|and|or|unless|on|ignoring|group_left|group_right|offset|without|avg_over_time|min_over_time|max_over_time|sum_over_time|count_over_time|quantile_over_time|stddev_over_time|stdvar_over_time|last_over_time|present_over_time|absent|absent_over_time|changes|deriv|predict_linear|delta|idelta|resets|floor|ceil|round|exp|ln|log2|log10|sqrt|abs|le|humanizeDuration|humanizePercentage|for|labels|annotations|alert|record|if|else|end)$' \
-    | sort -u
+  python3 - "$1" <<'PYEOF'
+import re, sys, yaml
+
+FUNCS = {
+    "rate","irate","increase","sum","avg","min","max","count","stddev","stdvar",
+    "topk","bottomk","quantile","histogram_quantile","time","bool","by","and",
+    "or","unless","on","ignoring","group_left","group_right","offset","without",
+    "avg_over_time","min_over_time","max_over_time","sum_over_time",
+    "count_over_time","quantile_over_time","stddev_over_time","stdvar_over_time",
+    "last_over_time","present_over_time","absent","absent_over_time","changes",
+    "deriv","predict_linear","delta","idelta","resets","floor","ceil","round",
+    "exp","ln","log2","log10","sqrt","abs","le","clamp","clamp_min","clamp_max",
+    "vector","scalar","label_replace","label_join","count_values","sort",
+    "sort_desc","timestamp","year","month","day_of_month","days_in_month",
+}
+
+doc = yaml.safe_load(open(sys.argv[1], encoding="utf-8")) or {}
+found = set()
+for group in doc.get("groups") or []:
+    for rule in group.get("rules") or []:
+        expr = rule.get("expr")
+        if not expr:
+            continue
+        expr = str(expr)
+        # Drop label selectors — their keys and values are not metric names.
+        expr = re.sub(r"\{[^}]*\}", " ", expr)
+        # Drop range/offset windows, so `[5m:1m]` cannot yield a bare `m:1m`.
+        expr = re.sub(r"\[[^\]]*\]", " ", expr)
+        for tok in re.findall(r"[a-zA-Z_:][a-zA-Z0-9_:]*", expr):
+            if tok in FUNCS:
+                continue
+            # Every metric we emit is namespaced or a recording rule.
+            if "_" not in tok and ":" not in tok:
+                continue
+            # A recording rule is produced by Prometheus, not exported by a
+            # service, so it will never appear on a /metrics endpoint. Its
+            # own inputs are checked when its `record:` rule is scanned.
+            if ":" in tok:
+                continue
+            found.add(tok)
+
+for name in sorted(found):
+    print(name)
+PYEOF
 }
 
 ALERT_FILES=(

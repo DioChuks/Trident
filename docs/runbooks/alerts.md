@@ -18,7 +18,7 @@ what "behind" means. The 10-minute `for` absorbs normal RPC jitter and brief
 upstream slowdowns without paging.
 
 **First steps:**
-1. Check `trident_indexer_rpc_request_duration_seconds` and
+1. Check `trident_indexer_rpc_call_duration_seconds` and
    `trident_indexer_rpc_errors_total` — is the Stellar RPC node slow or
    erroring? (see `TridentIndexerRPCErrorRateHigh` below)
 2. Check `trident_indexer_db_pool_size`/`_idle_connections` — is the
@@ -122,7 +122,7 @@ load; 5% sustained for 10 minutes is well above normal noise and usually
 means the upstream node is degraded or rate-limiting.
 
 **First steps:**
-1. Check `trident_indexer_rpc_request_duration_seconds` for the same method
+1. Check `trident_indexer_rpc_call_duration_seconds` for the same method
    — is latency also elevated (overload) or normal (outright rejections)?
 2. Check the RPC provider's status page / try a manual `getHealth` call
    against `STELLAR_RPC_URL`.
@@ -336,7 +336,7 @@ over).
 **First steps:**
 1. Check the indexer's configured poll interval (`POLL_INTERVAL_MS`) — if
    it's very aggressive (e.g., <1s), consider backing off slightly.
-2. Check `trident_indexer_rpc_request_duration_seconds_count` to estimate
+2. Check `trident_indexer_rpc_call_duration_seconds_count` to estimate
    request rate — are we exceeding the provider's documented limits?
 3. Check the RPC provider's dashboard/billing page to see current quota usage
    and limits.

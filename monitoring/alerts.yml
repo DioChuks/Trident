@@ -136,7 +136,7 @@ groups:
           (
             sum(rate(trident_indexer_rpc_errors_total[5m]))
             /
-            (sum(rate(trident_indexer_rpc_request_duration_seconds_count[5m])) + 0.0001)
+            (sum(rate(trident_indexer_rpc_call_duration_seconds_count[5m])) + 0.0001)
           ) > 0.05
         for: 10m
         labels:
@@ -155,7 +155,7 @@ groups:
           (
             sum(rate(trident_indexer_rpc_errors_total[5m]))
             /
-            (sum(rate(trident_indexer_rpc_request_duration_seconds_count[5m])) + 0.0001)
+            (sum(rate(trident_indexer_rpc_call_duration_seconds_count[5m])) + 0.0001)
           ) > 0.25
         for: 5m
         labels:
