@@ -53,10 +53,12 @@ services:
   # ---------------------------------------------------------------------------
   redis:
     restart: "no"
+    ports:
+      - "6380:6379"
 
   # ---------------------------------------------------------------------------
-  # PgBouncer — disabled in CI. All services use DATABASE_URL pointing
-  # directly at postgres:5432 (set in .env.ci).
+  # PgBouncer — opt-in in CI. Application traffic still connects directly to
+  # Postgres; the e2e job enables it to test the admin statistics endpoint.
   # ---------------------------------------------------------------------------
   pgbouncer:
     profiles:
@@ -137,6 +139,10 @@ services:
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS}
       CORS_DEV_MODE: ${CORS_DEV_MODE:-false}
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      # Leave ample room for the contract cases, then deliberately exhaust
+      # this public-endpoint limit to verify documented 429 responses.
+      PER_IP_RATE_LIMIT_RPS: 100
+      RATE_LIMIT_FREE_RPS: 100
     ports:
       - "${PORT:-3000}:${PORT:-3000}"
     # Replace (not merge with) the base depends_on so the profile-disabled
