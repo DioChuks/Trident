@@ -228,8 +228,8 @@ type IndexerStatsResponse struct {
 }
 
 type LivenessResponse struct {
-	// Always "ok" while the process is up â€” no dependency checks.                       
-	Status                                                          LivenessResponseStatus `json:"status"`
+	// Always "ok" while the process is up — no dependency checks.                       
+	Status                                                        LivenessResponseStatus `json:"status"`
 }
 
 type ReadyChecks struct {
@@ -276,7 +276,7 @@ type VersionResponse struct {
 	// time.                                                                                           
 	CommitSHA                                                                                   string `json:"commit_sha"`
 	// Highest applied migration version from _sqlx_migrations, as a string. Null when no              
-	// migrations have been applied yet or when Postgres is unreachable â€” the endpoint still         
+	// migrations have been applied yet or when Postgres is unreachable — the endpoint still           
 	// returns 200 in that case so build metadata stays available during an outage.                    
 	SchemaVersion                                                                               string `json:"schema_version"`
 	// Semantic version tag of the running build, or "dev" for a binary built without release          
@@ -310,7 +310,7 @@ const (
 	Stalled IndexerStatsResponseStatus = "stalled"
 )
 
-// Always "ok" while the process is up â€” no dependency checks.
+// Always "ok" while the process is up — no dependency checks.
 type LivenessResponseStatus string
 
 const (

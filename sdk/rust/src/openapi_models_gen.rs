@@ -352,11 +352,11 @@ pub enum IndexerStatsResponseStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LivenessResponse {
-    /// Always "ok" while the process is up â€” no dependency checks.
+    /// Always "ok" while the process is up — no dependency checks.
     pub status: LivenessResponseStatus,
 }
 
-/// Always "ok" while the process is up â€” no dependency checks.
+/// Always "ok" while the process is up — no dependency checks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LivenessResponseStatus {
@@ -434,7 +434,7 @@ pub struct VersionResponse {
     pub commit_sha: String,
 
     /// Highest applied migration version from _sqlx_migrations, as a string. Null when no
-    /// migrations have been applied yet or when Postgres is unreachable â€” the endpoint still
+    /// migrations have been applied yet or when Postgres is unreachable — the endpoint still
     /// returns 200 in that case so build metadata stays available during an outage.
     pub schema_version: String,
 

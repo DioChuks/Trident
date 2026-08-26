@@ -122,7 +122,7 @@ func (s *liveSuite) do(method, path string, headers map[string]string, body []by
 	if err != nil {
 		s.t.Fatalf("%s %s: %v", method, path, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		s.t.Fatalf("read %s %s response: %v", method, path, err)
@@ -145,7 +145,7 @@ func (s *liveSuite) eventually(method, path string, headers map[string]string, b
 		resp, err := s.client.Do(req)
 		if err == nil {
 			responseBody, readErr := io.ReadAll(resp.Body)
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			if readErr == nil && resp.StatusCode == want {
 				s.validate(req, resp.StatusCode, resp.Header, responseBody)
 				return
@@ -166,7 +166,7 @@ func (s *liveSuite) stream(headers map[string]string) {
 		s.t.Fatalf("parse CONTRACTTEST_REDIS_URL: %v", err)
 	}
 	rdb := redis.NewClient(opts)
-	defer rdb.Close()
+	defer func() { _ = rdb.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	anchor, err := rdb.XAdd(ctx, &redis.XAddArgs{Stream: "trident:events", Values: map[string]any{"contract_id": "anchor"}}).Result()
@@ -183,7 +183,7 @@ func (s *liveSuite) stream(headers map[string]string) {
 	if err != nil {
 		s.t.Fatalf("open SSE response: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		responseBody, _ := io.ReadAll(resp.Body)
 		s.t.Fatalf("open SSE response: status %d; body=%s", resp.StatusCode, responseBody)
@@ -226,7 +226,7 @@ func (s *liveSuite) publicRateLimitErrors() {
 				return
 			}
 			responseBody, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			if resp.StatusCode == http.StatusTooManyRequests {
 				select {
 				case rejected <- capturedResponse{req: req, header: resp.Header, body: responseBody}:

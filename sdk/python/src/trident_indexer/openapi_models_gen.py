@@ -627,7 +627,7 @@ class IndexerStatsResponse:
 
 
 class LivenessResponseStatus(Enum):
-    """Always "ok" while the process is up â€” no dependency checks."""
+    """Always "ok" while the process is up — no dependency checks."""
 
     OK = "ok"
 
@@ -635,7 +635,7 @@ class LivenessResponseStatus(Enum):
 @dataclass
 class LivenessResponse:
     status: LivenessResponseStatus
-    """Always "ok" while the process is up â€” no dependency checks."""
+    """Always "ok" while the process is up — no dependency checks."""
 
     @staticmethod
     def from_dict(obj: Any) -> 'LivenessResponse':
@@ -773,7 +773,7 @@ class VersionResponse:
     """
     schema_version: str
     """Highest applied migration version from _sqlx_migrations, as a string. Null when no
-    migrations have been applied yet or when Postgres is unreachable â€” the endpoint still
+    migrations have been applied yet or when Postgres is unreachable — the endpoint still
     returns 200 in that case so build metadata stays available during an outage.
     """
     version: str
