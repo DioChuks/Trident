@@ -387,7 +387,7 @@ export interface components {
             /** @description Whether more results are available */
             has_more: boolean;
             /** @description Opaque cursor for next page (null if has_more is false) */
-            next_cursor?: string | null;
+            next_cursor: string | null;
         };
         LivenessResponse: {
             /**
@@ -429,42 +429,42 @@ export interface components {
              * Format: int64
              * @description Latest indexed ledger sequence
              */
-            last_ledger_indexed?: number | null;
+            last_ledger_indexed: number | null;
             /**
              * Format: int64
              * @description Current chain tip ledger (from RPC)
              */
-            chain_tip_ledger?: number | null;
+            chain_tip_ledger: number | null;
             /**
              * Format: int64
              * @description Number of ledgers behind chain tip
              */
-            lag_ledgers?: number | null;
+            lag_ledgers: number | null;
             /**
              * Format: double
              * @description Estimated wall-clock staleness in seconds: lag_ledgers times Stellar's protocol-target ledger close time (~5s). Null whenever lag_ledgers is null. See docs/observability/data-freshness.md for the full freshness contract this field is part of.
              */
-            lag_seconds_estimated?: number | null;
+            lag_seconds_estimated: number | null;
             /**
              * Format: int64
              * @description Cumulative events indexed
              */
-            events_indexed_total?: number | null;
+            events_indexed_total: number | null;
             /**
              * Format: int32
              * @description Events processed in last poll
              */
-            events_last_poll?: number | null;
+            events_last_poll: number | null;
             /**
              * Format: int32
              * @description Average poll duration in milliseconds
              */
-            avg_poll_duration_ms?: number | null;
+            avg_poll_duration_ms: number | null;
             /**
              * Format: date-time
              * @description Timestamp of last successful poll
              */
-            last_poll_at?: string | null;
+            last_poll_at: string | null;
         };
         TokenMetadataResponse: {
             /** @description Soroban contract address */
@@ -556,7 +556,7 @@ export interface components {
             /** @description Human-readable decoded storage key */
             key: unknown;
             /** @description Human-readable decoded value (absent when the entry was removed) */
-            value?: unknown;
+            value: unknown;
             /**
              * Format: int64
              * @description Ledger sequence at which this value was observed
@@ -610,6 +610,38 @@ export interface components {
              * @description Timestamp of last event for this contract
              */
             last_seen_at: string;
+            /** Format: int64 */
+            invocation_count: number | null;
+            /** Format: int64 */
+            total_fee_charged: number | null;
+            /** Format: double */
+            avg_fee_charged: number | null;
+            /** Format: double */
+            avg_cpu_instructions: number | null;
+            /** Format: double */
+            avg_read_bytes: number | null;
+            /** Format: double */
+            avg_write_bytes: number | null;
+        };
+        APIKeyResponse: {
+            /** Format: uuid */
+            id: string;
+            key_prefix: string;
+            /** @description Raw key, returned only at creation time. */
+            key?: string;
+            label: string;
+            /** @enum {string} */
+            network: "testnet" | "mainnet";
+            rate_limit_tier: string;
+            created_by?: string;
+            /** Format: date-time */
+            last_used_at: string | null;
+            /** Format: int64 */
+            request_count: number;
+            /** Format: date-time */
+            revoked_at?: string | null;
+            /** Format: date-time */
+            created_at: string;
         };
         ErrorResponse: {
             error: {
@@ -777,17 +809,15 @@ export interface operations {
                  * @description Filter by Soroban contract address (strkey format, 56 chars starting with C)
                  * @example CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM
                  */
-                contract_id?: string;
+                contractId?: string;
                 /** @description Filter by primary topic (XDR-encoded) */
-                topic_0?: string;
+                topic0?: string;
                 /** @description Filter by secondary topic (XDR-encoded) */
-                topic_1?: string;
+                topic1?: string;
                 /** @description Lower bound of ledger range (inclusive) */
-                from_ledger?: number;
+                ledgerFrom?: number;
                 /** @description Upper bound of ledger range (inclusive) */
-                to_ledger?: number;
-                /** @description Network to query */
-                network?: "testnet" | "mainnet";
+                ledgerTo?: number;
                 /** @description Maximum number of events to return */
                 limit?: number;
                 /** @description Opaque pagination cursor from previous response's next_cursor (for next page) */
@@ -865,9 +895,9 @@ export interface operations {
         parameters: {
             query: {
                 /** @description Contract to subscribe to */
-                contract_id: string;
+                contractId: string;
                 /** @description Optional topic filter */
-                topic_0?: string;
+                topic0?: string;
             };
             header?: never;
             path?: never;
@@ -884,7 +914,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "text/event-stream": Record<string, never>;
+                    "text/event-stream": string;
                 };
             };
             400: components["responses"]["BadRequest"];
@@ -1134,19 +1164,7 @@ export interface operations {
                 };
                 content: {
                     "application/json": {
-                        keys?: {
-                            /** Format: uuid */
-                            id?: string;
-                            key_prefix?: string;
-                            label?: string;
-                            network?: string;
-                            rate_limit_tier?: string;
-                            /** Format: date-time */
-                            last_used_at?: string;
-                            request_count?: number;
-                            /** Format: date-time */
-                            created_at?: string;
-                        }[];
+                        api_keys: components["schemas"]["APIKeyResponse"][];
                     };
                 };
             };
@@ -1188,14 +1206,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        /** Format: uuid */
-                        id?: string;
-                        /** @description The raw API key (shown only once) */
-                        key?: string;
-                        /** @description First 16 characters of key for reference */
-                        key_prefix?: string;
-                    };
+                    "application/json": components["schemas"]["APIKeyResponse"];
                 };
             };
             400: components["responses"]["BadRequest"];
@@ -1250,7 +1261,14 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": Record<string, never>;
+                    "application/json": {
+                        pools: {
+                            [key: string]: unknown;
+                        }[];
+                        stats: {
+                            [key: string]: unknown;
+                        }[];
+                    };
                 };
             };
             401: components["responses"]["Unauthorized"];
