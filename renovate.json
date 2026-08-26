@@ -1,7 +1,5 @@
 {
-  "extends": [
-    "config:recommended"
-  ],
+  "extends": ["config:recommended"],
   "schedule": ["before 5am on Monday"],
   "timezone": "UTC",
   "labels": ["dependencies"],
@@ -23,11 +21,6 @@
       "description": "Pin digests for Docker images",
       "matchDatasources": ["docker"],
       "pinDigests": true
-    },
-    {
-      "description": "Automerge patch updates",
-      "matchUpdateTypes": ["patch"],
-      "automerge": true
     }
   ],
   "docker": {
@@ -36,8 +29,6 @@
   },
   "vulnerabilityAlerts": {
     "enabled": true,
-    "labels": ["security"],
-    "schedule": ["at any time"],
-    "groupName": "Security Updates"
+    "labels": ["security"]
   }
 }

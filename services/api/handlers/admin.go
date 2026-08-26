@@ -128,7 +128,7 @@ func AdminKeyUsage(cfg AdminConfig) http.HandlerFunc {
 			return
 		}
 
-		from, to, verr := validation.ValidateTimeRange("from", "to", q.Get("from"), q.Get("to"), 31*24*time.Hour)
+		from, to, verr := validation.ValidateTimeRange("from", "to", q.Get("from"), q.Get("to"))
 		if verr != nil {
 			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
 			return
