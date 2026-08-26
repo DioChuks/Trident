@@ -1008,7 +1008,9 @@ jobs:
           kubectl create secret generic trident-secrets \
             --from-literal=DATABASE_URL="postgres://trident:trident@postgres:5432/trident" \
             --from-literal=REDIS_URL="redis://redis:6379" \
-            --from-literal=ADMIN_API_KEY="ci-admin-key"
+            --from-literal=ADMIN_API_KEY="ci-admin-key" \
+            --from-literal=API_KEY_SALT="not-a-production-secret-ci-salt" \
+            --from-literal=STELLAR_RPC_URL="https://soroban-testnet.stellar.org"
 
       # migrations.enabled=false alongside the busybox image overrides: the
       # migration Job is a pre-install hook, and Helm always waits on hooks
