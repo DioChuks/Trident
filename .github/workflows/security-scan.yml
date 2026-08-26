@@ -112,14 +112,12 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
-      # Reports but does not block: this job had never actually run (its
-      # toolchain pin resolved to nothing), so its first green-field run
-      # surfaced 10 pre-existing advisories in transitive dependencies.
-      # Triage is tracked in #373. Restore blocking (drop continue-on-error)
-      # once that backlog is cleared.
+      # All advisories have been triaged in deny.toml (issue #401). This step
+      # now blocks the build on any new advisory that isn't explicitly
+      # accepted there — shipping with unreviewed advisories is not
+      # defensible.
       - name: cargo audit (Rust workspace)
         uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
-        continue-on-error: true
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -151,22 +149,13 @@ jobs:
         with:
           node-version: "20"
 
-      # --omit=dev drops the @astrojs/language-server / volar-service-* editor
-      # tooling, which is never bundled into the built site. What remains is
-      # not dev tooling: astro ^4.16.18 itself carries high-severity runtime
-      # advisories (SSRF via Host header, cache poisoning, reflected XSS via
-      # server islands), fixable only by the breaking major bump to Astro 5.
-      #
-      # Reports but does not block, matching how `cargo audit` above is
-      # handled and for the same reason: this job had never run — its action
-      # pins resolved to nothing — so its first real run surfaced a backlog
-      # that predates any change here. Nothing in this branch touches
-      # explorer/. Triage is tracked in #373; restore blocking (drop
-      # continue-on-error) once the Astro 5 bump lands.
+      # Astro has been upgraded to v5 (issue #402), clearing the 3 HIGH
+      # advisories that were present in 4.16.18 (SSRF via Host header, cache
+      # poisoning, reflected XSS via server islands). This step now blocks on
+      # any HIGH advisory in the explorer's runtime dependencies.
       - name: npm audit (explorer)
         working-directory: explorer
         run: npm audit --audit-level=high --omit=dev
-        continue-on-error: true
 
       - name: npm audit (sdk/typescript)
         working-directory: sdk/typescript
