@@ -129,6 +129,7 @@ func initTracer(ctx context.Context) func() {
 }
 
 func main() {
+	initLogger()
 	shutdownTracer := initTracer(context.Background())
 	defer shutdownTracer()
 
