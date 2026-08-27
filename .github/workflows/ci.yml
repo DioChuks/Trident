@@ -1297,32 +1297,7 @@ jobs:
 
       - name: Enforce Python SDK floor (hand-written client only)
         working-directory: sdk/python
-        run: |
-          set -euo pipefail
-          python - <<'"PY"'
-          import sys, xml.etree.ElementTree as ET
-
-          # Generated models are excluded: they are emitted by
-          # scripts/generate_sdk_models.py, so "cover the generator output"
-          # is not a meaningful ask of a test suite.
-          EXCLUDE = ("openapi_models_gen.py",)
-          FLOOR = 75.0
-
-          root = ET.parse("coverage.xml").getroot()
-          hits = total = 0
-          for cls in root.iter("class"):
-              if cls.get("filename", "").endswith(EXCLUDE):
-                  continue
-              for line in cls.iter("line"):
-                  total += 1
-                  hits += int(line.get("hits", "0")) > 0
-
-          pct = 100.0 * hits / total if total else 0.0
-          print(f"hand-written client coverage: {pct:.1f}% ({hits}/{total} lines, floor {FLOOR}%)")
-          if pct < FLOOR:
-              print(f"::error::Python SDK client coverage {pct:.1f}% is below the {FLOOR}% floor")
-              sys.exit(1)
-          PY
+        run: python ../../scripts/check-python-sdk-coverage.py coverage.xml --floor 75
 
       # --- Artefacts -------------------------------------------------------
       # Uploaded rather than pushed to a third party: the issue accepts "CI
