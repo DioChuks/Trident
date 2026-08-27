@@ -1336,6 +1336,24 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             429: components["responses"]["TooManyRequestsIPOnly"];
+            /** @description The PgBouncer admin console could not be read. It is the upstream here, so a failure to reach it is a bad-gateway condition rather than an error in this service (see handlers/admin.go). */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description The endpoint is not configured — ADMIN_API_KEY or PGBOUNCER_ADMIN_URL is unset, so no stats source exists. Deploying without PgBouncer is a supported configuration. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
         };
     };
     getMetrics: {

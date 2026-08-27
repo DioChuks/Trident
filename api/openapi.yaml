@@ -769,6 +769,24 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "429":
           $ref: "#/components/responses/TooManyRequestsIPOnly"
+        "502":
+          description: >-
+            The PgBouncer admin console could not be read. It is the upstream
+            here, so a failure to reach it is a bad-gateway condition rather
+            than an error in this service (see handlers/admin.go).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: >-
+            The endpoint is not configured — ADMIN_API_KEY or
+            PGBOUNCER_ADMIN_URL is unset, so no stats source exists. Deploying
+            without PgBouncer is a supported configuration.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 
   /metrics:
     get:
