@@ -671,18 +671,29 @@ impl Streamer {
                             "value": &raw.value,
                         }))
                         .unwrap_or_else(|_| "{}".to_string());
-                        if let Err(db_err) = db::insert_parse_error(
-                            &self.db,
-                            ledger_seq,
-                            event_idx,
-                            &raw_payload,
-                            &e.to_string(),
-                        )
+                        // Retry dead-letter insert with bounded backoff so a
+                        // transient DB hiccup does not lose the audit record
+                        // (issue #414).
+                        let db = self.db.clone();
+                        let payload = raw_payload.clone();
+                        let errmsg = e.to_string();
+                        let dead_letter_strategy = ExponentialBackoff::from_millis(100)
+                            .max_delay(Duration::from_secs(1))
+                            .take(3);
+                        if let Err(db_err) = Retry::start(dead_letter_strategy, || {
+                            let db = db.clone();
+                            let payload = payload.clone();
+                            let errmsg = errmsg.clone();
+                            async move {
+                                db::insert_parse_error(&db, ledger_seq, event_idx, &payload, &errmsg)
+                                    .await
+                            }
+                        })
                         .await
                         {
                             tracing::error!(
                                 error = %db_err,
-                                "Failed to record parse error in database"
+                                "Failed to record parse error in database after retries"
                             );
                         }
                         skipped_in_page += 1;
