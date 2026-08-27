@@ -158,6 +158,16 @@ jobs:
                 }
               }'
 
+      # Issue #455: report-only for now — extending to middleware and
+      # cursor handling, which the issue names as launch-critical paths.
+      # Not floor-enforced yet: doing that safely means measuring current
+      # coverage first and ratcheting up from there, not guessing a number
+      # that could fail CI on the very next merge.
+      - name: Middleware and cursor coverage (report only)
+        run: |
+          go test ./middleware ./cursor -coverprofile=critical-paths.out
+          go tool cover -func=critical-paths.out | tail -1
+
       # v8 is the first line of the action that supports golangci-lint v2. v4
       # invokes it with `--out-format`, which v2 removed, so the lint aborted
       # with "unknown flag" before checking anything (issue #371).
