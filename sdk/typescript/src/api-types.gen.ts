@@ -1371,7 +1371,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "text/plain; version=0.0.4": string;
+                    "text/plain; version=0.0.4; charset=utf-8": string;
                 };
             };
         };

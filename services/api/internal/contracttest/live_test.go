@@ -119,6 +119,12 @@ func TestLiveOpenAPIContract(t *testing.T) {
 		http.StatusServiceUnavailable,
 	)
 	s.do(http.MethodGet, "/v1/admin/db", invalidAdmin, nil, http.StatusUnauthorized)
+
+	// /v1/version is authenticated (it reports the exact commit sha and
+	// applied schema version), so both cases are exercised here.
+	s.do(http.MethodGet, "/v1/version", api, nil, http.StatusOK)
+	s.do(http.MethodGet, "/v1/version", nil, nil, http.StatusUnauthorized)
+
 	s.do(http.MethodGet, "/metrics", nil, nil, http.StatusOK)
 
 	s.publicRateLimitErrors()
@@ -325,7 +331,13 @@ func assertOperationCoverage(t *testing.T, doc *openapi3.T, covered map[string]m
 			if operation == nil {
 				continue
 			}
-			if !covered[operation.OperationID]["success"] {
+			// getAdminDbStats' success case needs a reachable PgBouncer admin
+			// console, which CI does not provide (see the eventuallyAny call
+			// above). Its error cases are still required, so the operation is
+			// not exempt from validation wholesale — only from the assertion
+			// that a 200 was observed.
+			if !covered[operation.OperationID]["success"] &&
+				operation.OperationID != "getAdminDbStats" {
 				t.Errorf("operation %s has no live success contract case", operation.OperationID)
 			}
 			hasDocumentedError := false
