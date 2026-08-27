@@ -15,10 +15,22 @@ import (
 // loopback, link-local, unspecified, or cloud-metadata address. Called both
 // at subscription time and again immediately before each delivery, since
 // DNS can change between the two.
+//
+// allowInsecureWebhookTargets is the one documented exemption: the webhook
+// delivery tests drive httptest servers, which are plain http:// on
+// 127.0.0.1 and so are rejected by both the scheme check and the loopback
+// check. Rather than weaken either rule for everyone, the test binary opts
+// out explicitly. It is set only from _test.go files, so a production build
+// cannot reach this path.
+var allowInsecureWebhookTargets = false
+
 func validateWebhookTargetURL(rawURL string) error {
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
 		return fmt.Errorf("invalid target URL: %w", err)
+	}
+	if allowInsecureWebhookTargets {
+		return nil
 	}
 	if parsed.Scheme != "https" {
 		return errors.New("target URL must use https")

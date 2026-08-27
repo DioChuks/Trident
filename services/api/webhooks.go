@@ -22,6 +22,7 @@ import (
 
 	"github.com/Depo-dev/trident/services/api/handlers"
 	"github.com/Depo-dev/trident/services/api/internal/httputil"
+	"github.com/Depo-dev/trident/services/api/internal/metrics"
 	"github.com/Depo-dev/trident/services/api/middleware"
 	"github.com/Depo-dev/trident/services/api/validation"
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -309,6 +310,7 @@ func processWebhookEvent(ctx context.Context, db *sql.DB, event webhookEvent) er
 	for _, sub := range subs {
 		if !tryAcquireSubscriptionSlot(sub.ID) {
 			slog.Warn("skipping delivery: previous delivery for this subscription still in flight", "subscription_id", sub.ID)
+			metrics.WebhookDeliveriesTotal.WithLabelValues("skipped_in_flight").Inc()
 			continue
 		}
 		wg.Add(1)
@@ -317,9 +319,16 @@ func processWebhookEvent(ctx context.Context, db *sql.DB, event webhookEvent) er
 			defer wg.Done()
 			defer func() { <-globalDeliverySem }()
 			defer releaseSubscriptionSlot(sub.ID)
+			// Counted around the delivery itself so the gauge reflects work
+			// actually in flight, not queue admission.
+			metrics.WebhookDeliveriesInFlight.Inc()
+			defer metrics.WebhookDeliveriesInFlight.Dec()
 			if err := deliverSubscriptionWithRetry(ctx, db, sub, event); err != nil {
 				slog.Warn("webhook delivery failed for subscription", "subscription_id", sub.ID, "err", err)
+				metrics.WebhookDeliveriesTotal.WithLabelValues("failure").Inc()
+				return
 			}
+			metrics.WebhookDeliveriesTotal.WithLabelValues("success").Inc()
 		}(sub)
 	}
 	wg.Wait()
@@ -372,6 +381,13 @@ func performWebhookDelivery(ctx context.Context, sub webhookSubscription, event 
 	// change between the two, re-pointing an already-approved hostname at
 	// an internal address (Issue #453).
 	if err := validateWebhookTargetURL(sub.TargetURL); err != nil {
+		// A subscription that passed validation at creation and fails it now
+		// means the hostname was re-pointed at an internal address. That is a
+		// security event, not routine delivery noise, so it gets its own
+		// outcome label rather than being folded into "failure".
+		metrics.WebhookDeliveriesTotal.WithLabelValues("blocked_url").Inc()
+		slog.Warn("webhook delivery blocked: target URL failed revalidation",
+			"subscription_id", sub.ID, "err", err)
 		return webhookDeliveryResult{Err: err}
 	}
 
