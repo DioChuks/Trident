@@ -1223,8 +1223,20 @@ mod tests {
 
         let contract_id = format!("CCONC_{}", Uuid::new_v4());
         const EVENT_COUNT: u32 = 50;
+        // Each event needs its own transaction_hash. `make_event` hardcodes a
+        // single hash, which is harmless for tests confined to one ledger, but
+        // these events span several ledgers with repeating event_index values.
+        // That collides on the natural-key constraint from migration 0025,
+        // `UNIQUE (ledger_sequence, transaction_hash, event_index, network)` —
+        // a fixture artifact, not the duplicate this test is about. Distinct
+        // hashes model reality: separate protocol events come from separate
+        // transactions.
         let events: Vec<SorobanEvent> = (0..EVENT_COUNT)
-            .map(|i| make_event(&contract_id, 1000 + u64::from(i) / 10, i))
+            .map(|i| {
+                let mut event = make_event(&contract_id, 1000 + u64::from(i) / 10, i);
+                event.transaction_hash = format!("txhash_conc_{i:04}");
+                event
+            })
             .collect();
 
         fn page(events: &[SorobanEvent], cursor: u64) -> PageCommit<'_> {

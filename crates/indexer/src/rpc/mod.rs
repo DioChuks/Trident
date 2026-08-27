@@ -143,9 +143,13 @@ struct GetLedgersResult {
 
 /// `getLatestLedger` takes no parameters, but the JSON-RPC envelope this client
 /// builds always serialises a `params` member.
+///
+/// Test-gated alongside [`RpcClient::get_latest_ledger`], its only caller.
+#[cfg(test)]
 #[derive(Serialize)]
 struct EmptyParams {}
 
+#[cfg(test)]
 #[derive(Deserialize)]
 struct GetLatestLedgerResult {
     sequence: u64,
@@ -511,6 +515,13 @@ impl RpcClient {
     /// already carries a valid in-range `startLedger` — which is precisely what
     /// a caller who does not yet know the tip cannot supply. This method has no
     /// such precondition.
+    ///
+    /// Test-gated: the poll loop learns the tip from the `getEvents` responses
+    /// it already makes, so the running indexer has no reason to spend an extra
+    /// round trip on it. Only the testnet correctness suite (issue #419), which
+    /// must choose a ledger window before it can request anything, needs it.
+    /// Remove the gate if a production caller ever appears.
+    #[cfg(test)]
     pub async fn get_latest_ledger(&self) -> Result<u64, TridentError> {
         let result: GetLatestLedgerResult = self
             .call("getLatestLedger", 3, EmptyParams {}, "getLatestLedger")
