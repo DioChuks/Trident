@@ -91,6 +91,24 @@ jobs:
           DATABASE_URL: postgres://trident:password@localhost:5432/trident
         run: cargo test --all -- --test-threads=1
 
+      # Issue #416: the proptest suite already runs above as part of `cargo
+      # test`, but at its in-file case count. This step re-runs only the parser
+      # property tests with a much larger budget so CI does a real (if short)
+      # fuzz pass on every push, rather than relying on the default cases to
+      # stumble onto a crash. PROPTEST_CASES overrides the
+      # `ProptestConfig::with_cases` value at runtime.
+      #
+      # For longer campaigns, run locally with a bigger budget and a persisted
+      # corpus, e.g.:
+      #   PROPTEST_CASES=1000000 cargo test -p trident-indexer --bin trident-indexer parser::tests::
+      # Any input that trips a panic is written by proptest to
+      # crates/indexer/proptest-regressions/ — commit that file so the case
+      # becomes a permanent regression test.
+      - name: Fuzz the XDR parser (short run)
+        env:
+          PROPTEST_CASES: 50000
+        run: "cargo test -p trident-indexer --bin trident-indexer parser::tests:: -- --test-threads=1"
+
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats
