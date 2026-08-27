@@ -26,6 +26,13 @@ pub const LEDGER_LAG_SECONDS_ESTIMATED: &str = "trident_indexer_ledger_lag_secon
 pub const EVENTS_TOTAL: &str = "trident_indexer_events_total";
 pub const EVENTS_SKIPPED_TOTAL: &str = "trident_indexer_events_skipped_total";
 pub const PARSE_ERRORS_TOTAL: &str = "trident_indexer_parse_errors_total";
+
+/// Incremented when an event exhausts its retry budget and is written to the
+/// parse-error (dead-letter) table so the poll can advance past it (issue
+/// #414). Distinct from PARSE_ERRORS_TOTAL, which counts every parse failure
+/// including ones that later succeed on retry: this counter only moves when an
+/// event is actually abandoned, which is what an alert should fire on.
+pub const DEAD_LETTERED_TOTAL: &str = "trident_indexer_dead_lettered_total";
 pub const POLL_DURATION_SECONDS: &str = "trident_indexer_poll_duration_seconds";
 pub const POLL_ERRORS_TOTAL: &str = "trident_indexer_poll_errors_total";
 pub const RPC_RETRIES_TOTAL: &str = "trident_indexer_rpc_retries_total";
@@ -229,6 +236,10 @@ pub fn record_events_skipped(count: u64) {
 
 pub fn record_parse_error() {
     counter!(PARSE_ERRORS_TOTAL).increment(1);
+}
+
+pub fn record_dead_lettered() {
+    counter!(DEAD_LETTERED_TOTAL).increment(1);
 }
 
 pub fn record_unhandled_scvariant() {

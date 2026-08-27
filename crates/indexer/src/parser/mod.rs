@@ -305,6 +305,16 @@ pub fn scval_to_string(val: &ScVal) -> String {
         }
         ScVal::Bytes(b) => hex::encode(b.as_slice()),
         ScVal::Address(addr) => scaddress_to_string(addr),
+        // Timepoint and Duration are u64 newtypes; without these arms they fell
+        // through to the debug catch-all and rendered as "Timepoint(1700000000)"
+        // rather than a usable value, while also tripping the
+        // unhandled-variant metric on well-understood types (issue #415).
+        ScVal::Timepoint(t) => t.0.to_string(),
+        ScVal::Duration(d) => d.0.to_string(),
+        // A contract error in topic/data position. Rendered via Debug
+        // deliberately: the variant carries a code whose meaning is
+        // contract-defined, so there is no stable scalar to project it to.
+        ScVal::Error(e) => format!("{e:?}"),
         // For complex types in topic position, fall back to debug representation
         other => {
             crate::metrics::record_unhandled_scvariant();
@@ -355,6 +365,12 @@ pub fn scval_to_json(val: &ScVal) -> Json {
         )),
         ScVal::Bytes(b) => Json::String(hex::encode(b.as_slice())),
         ScVal::Address(addr) => Json::String(scaddress_to_string(addr)),
+        // u64-valued, so emitted as strings for the same reason U64/I64 are:
+        // values above 2^53 do not survive a JSON number round-trip through a
+        // JavaScript consumer (issue #415).
+        ScVal::Timepoint(t) => Json::String(t.0.to_string()),
+        ScVal::Duration(d) => Json::String(d.0.to_string()),
+        ScVal::Error(e) => Json::String(format!("{e:?}")),
         ScVal::Vec(Some(items)) => Json::Array(items.iter().map(scval_to_json).collect()),
         ScVal::Vec(None) => Json::Array(vec![]),
         ScVal::Map(Some(entries)) => {
@@ -1064,6 +1080,61 @@ mod tests {
             scval_to_string(&val),
             "-57896044618658097711785492504343953926634992332820282019728792003956564819968"
         );
+    }
+
+    // Timepoint/Duration/Error (issue #415). Before these arms existed all
+    // three fell through to the debug catch-all, so they rendered as
+    // "Timepoint(1700000000)" and incremented the unhandled-variant metric
+    // despite being fully understood types.
+    #[test]
+    fn scval_to_string_timepoint() {
+        let val = ScVal::Timepoint(stellar_xdr::curr::TimePoint(1_700_000_000));
+        assert_eq!(scval_to_string(&val), "1700000000");
+    }
+
+    #[test]
+    fn scval_to_string_duration() {
+        let val = ScVal::Duration(stellar_xdr::curr::Duration(86_400));
+        assert_eq!(scval_to_string(&val), "86400");
+    }
+
+    #[test]
+    fn scval_to_json_timepoint_and_duration_are_strings() {
+        // u64-valued, so they must not become JSON numbers: anything above
+        // 2^53 loses precision in a JavaScript consumer.
+        let tp = ScVal::Timepoint(stellar_xdr::curr::TimePoint(u64::MAX));
+        assert_eq!(
+            scval_to_json(&tp),
+            Json::String("18446744073709551615".to_string())
+        );
+        let d = ScVal::Duration(stellar_xdr::curr::Duration(u64::MAX));
+        assert_eq!(
+            scval_to_json(&d),
+            Json::String("18446744073709551615".to_string())
+        );
+    }
+
+    #[test]
+    fn timepoint_does_not_count_as_unhandled_variant() {
+        // The point of the dedicated arms: a known type must not trip the
+        // unhandled-variant signal, or that metric stops meaning anything.
+        let val = ScVal::Timepoint(stellar_xdr::curr::TimePoint(1));
+        let rendered = scval_to_string(&val);
+        assert!(
+            !rendered.contains("Timepoint"),
+            "rendered via the debug catch-all: {rendered}"
+        );
+    }
+
+    #[test]
+    fn scval_to_json_bytes_is_hex_not_base64() {
+        // docs/soroban-event-model.md claimed base64 for ScvBytes while the
+        // code has always emitted hex. Pinning the real behaviour so the doc
+        // and the encoder cannot drift apart again.
+        let val = ScVal::Bytes(stellar_xdr::curr::ScBytes(
+            BytesM::try_from(vec![0xDE, 0xAD, 0xBE, 0xEF]).unwrap(),
+        ));
+        assert_eq!(scval_to_json(&val), Json::String("deadbeef".to_string()));
     }
 
     #[test]

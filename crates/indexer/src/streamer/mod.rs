@@ -697,6 +697,12 @@ impl Streamer {
                                 error = %db_err,
                                 "Failed to record parse error in database after retries"
                             );
+                        } else {
+                            // Only count a dead-letter once the row is durably
+                            // recorded (issue #414). Incrementing on the failure
+                            // path instead would make the alert fire for events
+                            // that were never actually captured for replay.
+                            metrics::record_dead_lettered();
                         }
                         skipped_in_page += 1;
                     }
