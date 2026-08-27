@@ -141,6 +141,16 @@ struct GetLedgersResult {
     ledgers: Vec<LedgerSummary>,
 }
 
+/// `getLatestLedger` takes no parameters, but the JSON-RPC envelope this client
+/// builds always serialises a `params` member.
+#[derive(Serialize)]
+struct EmptyParams {}
+
+#[derive(Deserialize)]
+struct GetLatestLedgerResult {
+    sequence: u64,
+}
+
 #[derive(Deserialize)]
 struct LedgerSummary {
     hash: String,
@@ -493,6 +503,19 @@ impl RpcClient {
             metrics::record_rpc_error(context, "empty_result");
             TridentError::rpc(anyhow::anyhow!("{context}: empty result"))
         })
+    }
+
+    /// Fetch the current chain tip via `getLatestLedger`.
+    ///
+    /// `getEvents` also reports `latestLedger`, but only on a request that
+    /// already carries a valid in-range `startLedger` — which is precisely what
+    /// a caller who does not yet know the tip cannot supply. This method has no
+    /// such precondition.
+    pub async fn get_latest_ledger(&self) -> Result<u64, TridentError> {
+        let result: GetLatestLedgerResult = self
+            .call("getLatestLedger", 3, EmptyParams {}, "getLatestLedger")
+            .await?;
+        Ok(result.sequence)
     }
 
     /// Fetch the ledger hash for a given sequence number via `getLedgers`.
