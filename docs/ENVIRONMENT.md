@@ -140,6 +140,7 @@ description is accurate. Keep this file honest by hand.
 |---|---|---|---|
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | Optional (compose only) | `trident` / `password` / `trident` | Postgres container bootstrap credentials. |
 | `LOG_LEVEL` | Optional | `info` | Go API log verbosity (`.env.ci`/compose convenience; not read directly by Rust services, which use `RUST_LOG`). |
+| `APP_ENV` | Optional | unset | Go API log *format*, not verbosity. `production` emits JSON for log aggregation; anything else (including unset) emits human-readable text. Pair with `LOG_LEVEL`, which controls the threshold. |
 
 ## CI-only
 
