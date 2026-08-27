@@ -109,3 +109,19 @@ lint-openapi: ## Lint the OpenAPI specification
 		echo "spectral CLI not found. Install with: npm install -g @stoplight/spectral-cli"; \
 		exit 1; \
 	fi
+
+coverage: ## Run coverage reporting for Rust crates
+	@echo "Running Rust coverage with cargo-tarpaulin..."
+	cargo tarpaulin --ignore-tests --out Html
+	@echo "Running Go coverage..."
+	cd services/api && go test -coverprofile=coverage.out ./...
+	cd services/api && go tool cover -html=coverage.out -o coverage.html
+
+coverage-check: ## Check coverage thresholds
+	@echo "Checking Rust coverage threshold (80%)..."
+	cargo tarpaulin --ignore-tests --fail-under 80
+	@echo "Checking Go coverage threshold (80%)..."
+	# basic check for go coverage
+	@cd services/api && \
+	TOTAL=$$(go tool cover -func=coverage.out | grep total | awk '{print substr($$3, 1, length($$3)-1)}') && \
+	if [ "$${TOTAL%%.*}" -lt 80 ]; then echo "Go coverage $$TOTAL% is below 80%"; exit 1; else echo "Go coverage $$TOTAL% is OK"; fi
