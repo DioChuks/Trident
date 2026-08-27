@@ -192,6 +192,86 @@ LIMIT 50;
 
 Expected output should show `Index Scan`, not `Seq Scan` or `Bitmap Heap Scan`.
 
+## Indexer Catch-Up Throughput
+
+How fast the indexer backfills from a cold start determines two things a user
+notices: how long a testnet outage takes to recover from, and whether "start
+indexing my contract from ledger X" is a minutes or an hours answer.
+
+### Measuring
+
+```bash
+# With the indexer running and its cursor behind the chain tip:
+scripts/measure-catchup-throughput.sh --metrics-url http://localhost:9090/metrics
+```
+
+To create a deficit to measure against, rewind the cursor and restart:
+
+```bash
+psql "$DATABASE_URL" -c   "UPDATE system_state SET value = (value::bigint - 10000)::text    WHERE key = 'latest_ledger_cursor'"
+```
+
+The script reads the indexer's own metrics rather than timing it externally, so
+a benchmark run and a production dashboard report the same figure from the same
+source.
+
+### Observability
+
+Two gauges are exported while the indexer is behind the chain tip:
+
+| Metric | Meaning |
+|---|---|
+| `trident_indexer_catchup_ledgers_per_second` | Backfill rate in ledgers/sec |
+| `trident_indexer_catchup_events_per_second` | Backfill rate in events/sec |
+
+Both are published **only** while the ledger lag exceeds
+`CATCHUP_LAG_THRESHOLD_LEDGERS` (10, in
+[`crates/indexer/src/metrics.rs`](../crates/indexer/src/metrics.rs)). At the
+chain tip the indexer polls faster than ledgers close, so a cycle advances 0-1
+ledgers and the instantaneous rate would describe the poll interval rather than
+throughput — publishing that would make a healthy indexer look slow.
+
+Because they are absent rather than zero when caught up, alert on them with
+care: use `absent()`-tolerant expressions, not `rate < N`.
+
+Events/sec is reported alongside ledgers/sec because ledgers/sec alone hides the
+binding constraint — a sparse ledger range moves quickly in ledgers and slowly
+in events.
+
+### Recording results
+
+Catch-up figures are meaningless without the deployment shape that produced
+them. When recording a measurement here, state:
+
+- Indexer CPU/memory limits (`helm/trident/values.yaml`, `indexer.resources`)
+- Postgres instance class and whether it is co-located
+- RPC endpoint (public testnet, or a dedicated node) and any rate limits
+- `MAX_EVENTS_PER_POLL` and the poll interval in force
+
+Without those, a number from one environment cannot be compared to another.
+
+> **Note:** no reference figures are committed here yet. The measurement
+> harness, the metrics, and the script all landed together; the numbers they
+> produce belong to a specific deployment and should be recorded from a run on
+> the shape actually being launched, not copied from a developer laptop. Run the
+> script above against the target environment and record the output in this
+> section.
+
+### Identifying the binding constraint
+
+Catch-up is bound by one of three things. The metrics already exported
+distinguish them:
+
+| Suspected constraint | Evidence to look at |
+|---|---|
+| RPC page latency | `trident_indexer_rpc_call_duration_seconds{method="getEvents"}` dominates `trident_indexer_poll_duration_seconds` |
+| Decode CPU | `trident_indexer_event_decode_duration_seconds` sums to a large share of the poll cycle; indexer CPU at its limit |
+| DB insert throughput | Poll duration greatly exceeds RPC + decode time; `trident_indexer_db_pool_idle_connections` near zero |
+
+Compare the per-cycle sum of RPC and decode time against
+`trident_indexer_poll_duration_seconds`: the unexplained remainder is
+predominantly database write time.
+
 ## Future Improvements
 
 1. **Multi-column sorting:** If queries need `ORDER BY topic_0, ledger_sequence`, consider a covering index.
