@@ -39,19 +39,10 @@ services:
   postgres:
     restart: "no"
     environment:
-      # Store md5 password hashes rather than Postgres 15's scram-sha-256
-      # default. PgBouncer's auth_query reads pg_shadow.passwd and hands the
-      # stored hash to its own auth check, so the two must agree: md5 on the
-      # PgBouncer side (see the pgbouncer override below, which explains why
-      # SCRAM is not usable on 1.15) against a SCRAM verifier fails with
-      # "password authentication failed". The comment here previously claimed
-      # md5 without anything actually setting it.
-      POSTGRES_INITDB_ARGS: "--auth-host=md5 --auth-local=md5"
-      POSTGRES_HOST_AUTH_METHOD: md5
+      # Override to use simple md5 so PgBouncer auth bootstrapping is not needed
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
-    command: ["postgres", "-c", "password_encryption=md5"]
     volumes:
       - ../database/migrations:/docker-entrypoint-initdb.d/migrations:ro
       - ./ci-initdb.sh:/docker-entrypoint-initdb.d/01_migrations.sh:ro
@@ -73,20 +64,17 @@ services:
     profiles:
       - pgbouncer  # only started when this profile is explicitly selected
     environment:
-      # CI only. PgBouncer 1.15 cannot complete scram-sha-256 against its own
-      # admin console (the virtual `pgbouncer` database behind
-      # GET /v1/admin/db), which is why that endpoint has never returned 200
-      # here. md5 works, and auth_query hands PgBouncer whatever hash Postgres
-      # has stored — so this only authenticates if Postgres stores an md5
-      # hash, which is what the password_encryption override on the postgres
-      # service below arranges. Changing one without the other fails: md5
-      # here against a SCRAM verifier gives "password authentication failed".
+      # CI only: the admin console (the virtual `pgbouncer` database behind
+      # GET /v1/admin/db) cannot authenticate under scram-sha-256 on
+      # PgBouncer 1.15 — even with auth_query resolving the user, SCRAM
+      # verification against the console fails, which is why that endpoint
+      # has never returned 200 in CI. md5 works and is adequate here: the
+      # credential is the publicly-documented `.env.ci` fixture password on a
+      # container-network-only port.
       #
-      # Adequate for CI: the credential is the publicly-documented `.env.ci`
-      # fixture password on a port published only to the compose network.
-      # The base compose keeps scram-sha-256 for real deployments. Fold both
-      # overrides away once PgBouncer moves past 1.15 (see the pin note in
-      # docker-compose.yml) and confirm the endpoint still answers 200.
+      # The base compose keeps scram-sha-256 for real deployments. Fold this
+      # override away once PgBouncer is upgraded past 1.15 (see the pin note
+      # in docker-compose.yml) and confirm the endpoint still answers 200.
       PGBOUNCER_AUTH_TYPE: md5
 
   # ---------------------------------------------------------------------------
