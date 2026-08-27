@@ -685,8 +685,10 @@ impl Streamer {
                             let payload = payload.clone();
                             let errmsg = errmsg.clone();
                             async move {
-                                db::insert_parse_error(&db, ledger_seq, event_idx, &payload, &errmsg)
-                                    .await
+                                db::insert_parse_error(
+                                    &db, ledger_seq, event_idx, &payload, &errmsg,
+                                )
+                                .await
                             }
                         })
                         .await

@@ -157,8 +157,7 @@ impl Config {
         let rpc_failover_threshold = parse_bounded_u64("RPC_FAILOVER_THRESHOLD", 3, 1, 100);
         let rpc_endpoint_cooldown_ms =
             parse_bounded_u64("RPC_ENDPOINT_COOLDOWN_MS", 30_000, 1_000, 3_600_000);
-        let outbox_poll_interval_ms =
-            parse_bounded_u64("OUTBOX_POLL_INTERVAL_MS", 100, 10, 60_000);
+        let outbox_poll_interval_ms = parse_bounded_u64("OUTBOX_POLL_INTERVAL_MS", 100, 10, 60_000);
         let outbox_batch_size = parse_bounded_u64("OUTBOX_BATCH_SIZE", 500, 1, 10_000);
         let outbox_backlog_alert_threshold =
             parse_bounded_u64("OUTBOX_BACKLOG_ALERT_THRESHOLD", 10_000, 1, 10_000_000);
@@ -168,8 +167,12 @@ impl Config {
             parse_bounded_u64("DB_STATEMENT_TIMEOUT_MS", 30_000, 100, 3_600_000);
         let idle_in_transaction_timeout_ms =
             parse_bounded_u64("DB_IDLE_IN_TRANSACTION_TIMEOUT_MS", 10_000, 100, 3_600_000);
-        let token_metadata_refresh_interval_secs =
-            parse_bounded_u64("TOKEN_METADATA_REFRESH_INTERVAL_SECS", 86_400, 60, 2_592_000);
+        let token_metadata_refresh_interval_secs = parse_bounded_u64(
+            "TOKEN_METADATA_REFRESH_INTERVAL_SECS",
+            86_400,
+            60,
+            2_592_000,
+        );
         let db_pool_size = parse_pool_size("INDEXER_DB_POOL_SIZE", DEFAULT_DB_POOL_SIZE);
 
         // Collect all parse/range errors at once.
@@ -178,24 +181,45 @@ impl Config {
             ("MAX_EVENTS_PER_POLL", max_events_per_poll.as_ref()),
             ("DB_BATCH_SIZE", db_batch_size.as_ref()),
             ("POLL_INTERVAL_FLOOR_MS", poll_interval_floor_ms.as_ref()),
-            ("POLL_INTERVAL_CEILING_MS", poll_interval_ceiling_ms.as_ref()),
+            (
+                "POLL_INTERVAL_CEILING_MS",
+                poll_interval_ceiling_ms.as_ref(),
+            ),
             ("LAG_HIGH_WATERMARK", lag_high_watermark.as_ref()),
             ("POLL_HYSTERESIS_LEDGERS", poll_hysteresis_ledgers.as_ref()),
             ("RPC_CONNECT_TIMEOUT_MS", rpc_connect_timeout_ms.as_ref()),
             ("RPC_REQUEST_TIMEOUT_MS", rpc_request_timeout_ms.as_ref()),
-            ("RPC_POOL_IDLE_TIMEOUT_MS", rpc_pool_idle_timeout_ms.as_ref()),
-            ("RPC_POOL_MAX_IDLE_PER_HOST", rpc_pool_max_idle_per_host.as_ref()),
+            (
+                "RPC_POOL_IDLE_TIMEOUT_MS",
+                rpc_pool_idle_timeout_ms.as_ref(),
+            ),
+            (
+                "RPC_POOL_MAX_IDLE_PER_HOST",
+                rpc_pool_max_idle_per_host.as_ref(),
+            ),
             ("RPC_TCP_KEEPALIVE_MS", rpc_tcp_keepalive_ms.as_ref()),
             ("RPC_FAILOVER_THRESHOLD", rpc_failover_threshold.as_ref()),
-            ("RPC_ENDPOINT_COOLDOWN_MS", rpc_endpoint_cooldown_ms.as_ref()),
+            (
+                "RPC_ENDPOINT_COOLDOWN_MS",
+                rpc_endpoint_cooldown_ms.as_ref(),
+            ),
             ("OUTBOX_POLL_INTERVAL_MS", outbox_poll_interval_ms.as_ref()),
             ("OUTBOX_BATCH_SIZE", outbox_batch_size.as_ref()),
-            ("OUTBOX_BACKLOG_ALERT_THRESHOLD", outbox_backlog_alert_threshold.as_ref()),
+            (
+                "OUTBOX_BACKLOG_ALERT_THRESHOLD",
+                outbox_backlog_alert_threshold.as_ref(),
+            ),
             ("ALERT_LAG_THRESHOLD", alert_lag_threshold.as_ref()),
             ("ALERT_COOLDOWN_MINUTES", alert_cooldown_minutes.as_ref()),
             ("DB_STATEMENT_TIMEOUT_MS", statement_timeout_ms.as_ref()),
-            ("DB_IDLE_IN_TRANSACTION_TIMEOUT_MS", idle_in_transaction_timeout_ms.as_ref()),
-            ("TOKEN_METADATA_REFRESH_INTERVAL_SECS", token_metadata_refresh_interval_secs.as_ref()),
+            (
+                "DB_IDLE_IN_TRANSACTION_TIMEOUT_MS",
+                idle_in_transaction_timeout_ms.as_ref(),
+            ),
+            (
+                "TOKEN_METADATA_REFRESH_INTERVAL_SECS",
+                token_metadata_refresh_interval_secs.as_ref(),
+            ),
         ] {
             if let Err(e) = result {
                 errors.push(format!("[indexer] {key}: {e}"));
