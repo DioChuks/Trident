@@ -37,8 +37,8 @@ const EVENT_NS: Uuid = Uuid::NAMESPACE_DNS;
 
 /// Derive a deterministic UUID for an event from its natural key.
 /// Using the same inputs will always produce the same UUID, so duplicate
-/// events produce the same (ledger_sequence, id) pair and `ON CONFLICT
-/// (ledger_sequence, id) DO NOTHING` fires.
+/// events produce the same (ledger_sequence, id) pair and the insert's
+/// `ON CONFLICT DO NOTHING` absorbs the replay.
 fn event_uuid(contract_id: &str, ledger_sequence: u64, event_index: u32) -> Uuid {
     let key = format!("{contract_id}:{ledger_sequence}:{event_index}");
     Uuid::new_v5(&EVENT_NS, key.as_bytes())
@@ -165,16 +165,36 @@ impl EventColumns {
 
 /// Insert a batch of events in a single statement (issue #199).
 ///
-/// One round-trip per batch instead of one per row. Duplicate handling is
-/// unchanged in spirit: the deterministic UUIDv5 id plus `ON CONFLICT
-/// (ledger_sequence, id) DO NOTHING` means a replayed page inserts nothing
-/// new. The target is the full (ledger_sequence, id) pair, not just id, since
-/// migration 0017 made soroban_events RANGE-partitioned by ledger_sequence —
-/// PostgreSQL requires every unique constraint on a partitioned table to
-/// include the partition key, so a single-column PK on id alone no longer
-/// exists to match against. ledger_sequence is itself part of the input
-/// event_uuid() derives id from, so a replayed page always reproduces the
-/// same (ledger_sequence, id) pair — the idempotency guarantee is unchanged.
+/// One round-trip per batch instead of one per row. A replayed page inserts
+/// nothing new: the deterministic UUIDv5 id reproduces the same
+/// (ledger_sequence, id) pair, and `ON CONFLICT DO NOTHING` absorbs it.
+///
+/// The conflict clause is deliberately **untargeted** (issue #418).
+/// `soroban_events` carries two unique constraints:
+///
+///   1. `PRIMARY KEY (ledger_sequence, id)` — from migration 0017, which made
+///      the table RANGE-partitioned by ledger_sequence. PostgreSQL requires
+///      every unique constraint on a partitioned table to include the
+///      partition key, so a single-column PK on id alone no longer exists.
+///   2. `uq_soroban_events_tx_index_network
+///      (ledger_sequence, transaction_hash, event_index, network)` — from
+///      migration 0025, mirroring the protocol guarantee that a
+///      (transaction_hash, event_index) pair identifies exactly one event.
+///
+/// A targeted `ON CONFLICT (ledger_sequence, id)` only guards the first. That
+/// is enough for a single writer replaying its own page, but not for two
+/// indexer replicas committing the same page concurrently: the second writer's
+/// rows collide on the natural key, which the targeted clause does not absorb,
+/// and the whole batch fails with a unique-violation error rather than being
+/// silently ignored. In production that aborts a poll cycle during any rollout
+/// overlap or double deploy. Caught by
+/// `concurrent_indexers_persist_each_event_exactly_once`.
+///
+/// Untargeted `DO NOTHING` covers both constraints. It does not weaken the
+/// safety net migration 0025 describes: a genuine id-derivation bug still
+/// cannot write a duplicate row, it is simply dropped rather than raised. The
+/// natural-key constraint remains as the enforcement point, and 0025's
+/// pre-flight duplicate check still runs against existing data.
 pub async fn insert_events_batch<'e, E>(
     executor: E,
     events: &[SorobanEvent],
@@ -197,7 +217,7 @@ where
             $1::uuid[], $2::text[], $3::bigint[], $4::timestamptz[], $5::text[],
             $6::int[], $7::text[], $8::jsonb[], $9::jsonb[]
         )
-        ON CONFLICT (ledger_sequence, id) DO NOTHING
+        ON CONFLICT DO NOTHING
         "#,
     )
     .bind(&cols.ids)
@@ -1223,14 +1243,10 @@ mod tests {
 
         let contract_id = format!("CCONC_{}", Uuid::new_v4());
         const EVENT_COUNT: u32 = 50;
-        // Each event needs its own transaction_hash. `make_event` hardcodes a
-        // single hash, which is harmless for tests confined to one ledger, but
-        // these events span several ledgers with repeating event_index values.
-        // That collides on the natural-key constraint from migration 0025,
-        // `UNIQUE (ledger_sequence, transaction_hash, event_index, network)` —
-        // a fixture artifact, not the duplicate this test is about. Distinct
-        // hashes model reality: separate protocol events come from separate
-        // transactions.
+        // Distinct transaction hashes, as real protocol events have: separate
+        // events come from separate transactions. `make_event` hardcodes one
+        // hash, which is fine for a single-ledger test but would make the
+        // natural key repeat across the ledgers this test spans.
         let events: Vec<SorobanEvent> = (0..EVENT_COUNT)
             .map(|i| {
                 let mut event = make_event(&contract_id, 1000 + u64::from(i) / 10, i);
