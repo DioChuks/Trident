@@ -17,6 +17,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Depo-dev/trident/services/api/handlers"
@@ -280,6 +281,7 @@ func processWebhookEvent(ctx context.Context, db *sql.DB, event webhookEvent) er
 	}
 	defer func() { _ = rows.Close() }()
 
+	var subs []webhookSubscription
 	for rows.Next() {
 		var sub webhookSubscription
 		var topic0 sql.NullString
@@ -293,11 +295,35 @@ func processWebhookEvent(ctx context.Context, db *sql.DB, event webhookEvent) er
 		if pausedAt.Valid {
 			sub.PausedAt = &pausedAt.Time
 		}
-		if err := deliverSubscriptionWithRetry(ctx, db, sub, event); err != nil {
-			slog.Warn("webhook delivery failed for subscription", "subscription_id", sub.ID, "err", err)
-		}
+		subs = append(subs, sub)
 	}
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	// Issue #454: fan out deliveries for this event's subscriptions
+	// concurrently, bounded by globalDeliverySem, instead of one at a
+	// time — a single slow/hanging endpoint no longer delays every other
+	// subscriber matching the same event.
+	var wg sync.WaitGroup
+	for _, sub := range subs {
+		if !tryAcquireSubscriptionSlot(sub.ID) {
+			slog.Warn("skipping delivery: previous delivery for this subscription still in flight", "subscription_id", sub.ID)
+			continue
+		}
+		wg.Add(1)
+		globalDeliverySem <- struct{}{}
+		go func(sub webhookSubscription) {
+			defer wg.Done()
+			defer func() { <-globalDeliverySem }()
+			defer releaseSubscriptionSlot(sub.ID)
+			if err := deliverSubscriptionWithRetry(ctx, db, sub, event); err != nil {
+				slog.Warn("webhook delivery failed for subscription", "subscription_id", sub.ID, "err", err)
+			}
+		}(sub)
+	}
+	wg.Wait()
+	return nil
 }
 
 func deliverSubscriptionWithRetry(ctx context.Context, db *sql.DB, sub webhookSubscription, event webhookEvent) error {
@@ -342,6 +368,13 @@ func deliverSubscriptionWithRetry(ctx context.Context, db *sql.DB, sub webhookSu
 }
 
 func performWebhookDelivery(ctx context.Context, sub webhookSubscription, event webhookEvent) webhookDeliveryResult {
+	// Re-validate at delivery time, not just at subscription time: DNS can
+	// change between the two, re-pointing an already-approved hostname at
+	// an internal address (Issue #453).
+	if err := validateWebhookTargetURL(sub.TargetURL); err != nil {
+		return webhookDeliveryResult{Err: err}
+	}
+
 	now := time.Now().Unix()
 	payload, err := buildWebhookPayload(sub.ID, event, now)
 	if err != nil {
@@ -357,7 +390,7 @@ func performWebhookDelivery(ctx context.Context, sub webhookSubscription, event 
 	req.Header.Set("X-Trident-Timestamp", strconv.FormatInt(now, 10))
 	req.Header.Set("X-Trident-Signature", "sha256="+signWebhookPayload(now, string(payload), sub.Secret))
 
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := newWebhookDeliveryHTTPClient()
 	resp, err := client.Do(req)
 	if err != nil {
 		return webhookDeliveryResult{Err: err}
@@ -471,6 +504,10 @@ func createWebhookHandler(db *sql.DB) http.HandlerFunc {
 		}
 		if req.TargetURL == "" || req.ContractID == "" {
 			http.Error(w, "contractId and targetUrl are required", http.StatusBadRequest)
+			return
+		}
+		if err := validateWebhookTargetURL(req.TargetURL); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 		if req.Network == "" {
