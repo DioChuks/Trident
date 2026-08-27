@@ -183,6 +183,24 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     gauge!(DB_POOL_SIZE).set(0.0);
     gauge!(DB_POOL_IDLE_CONNECTIONS).set(0.0);
 
+    // Histograms render nothing at all until they observe a value — not even
+    // a HELP/TYPE header — so an indexer that has not yet made an RPC call
+    // exports no `trident_indexer_rpc_call_duration_seconds_*` series. Any
+    // alert dividing by `..._count` then evaluates against an empty vector
+    // and silently never fires, which is exactly the class of dead alert the
+    // metric-name check exists to catch. Seeding a zero observation makes the
+    // series exist from the first scrape, matching the counters above.
+    //
+    // The cost is one bucketed sample of 0.0 per histogram, which shifts the
+    // reported minimum but not the alerting ratios these feed.
+    histogram!(POLL_DURATION_SECONDS).record(0.0);
+    histogram!(EVENT_DECODE_DURATION_SECONDS).record(0.0);
+    // Labelled, so seed the methods the poll loop actually calls — the RPC
+    // alerts `sum()` across labels, so the series just has to exist.
+    for method in ["getEvents", "getLedgers"] {
+        histogram!(RPC_CALL_DURATION_SECONDS, "method" => method, "endpoint" => "0").record(0.0);
+    }
+
     tracing::info!(port, "Metrics endpoint listening");
     Ok(())
 }
