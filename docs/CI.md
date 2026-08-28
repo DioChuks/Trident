@@ -189,3 +189,63 @@ fixed in the same change:
 production apply the migration chain — but `make migrate` falls back to it when
 `sqlx-cli` is absent, so a developer bootstrapping from it was getting a
 materially different database from production.
+
+## SDK versioning and publishing
+
+### Versions are tied to the spec
+
+All five SDKs (TypeScript, React, Python, Rust, Go) declare the version of the
+`api/openapi.yaml` spec they are generated from. `scripts/check-sdk-versions.sh`
+enforces this in the `schema-guard` job.
+
+The rule exists because the SDKs are generated artifacts. If `sdk/python` ships
+`0.3.0` built from spec `1.1.0` while `sdk/typescript` ships `0.2.0` built from
+`1.0.0`, the version tells a user nothing about which API contract the client
+implements. Tying them together means `trident-sdk 1.2.0` implements OpenAPI
+`1.2.0`, and a breaking spec change bumps all five at once.
+
+Realign after a spec version bump:
+
+```bash
+scripts/check-sdk-versions.sh --fix
+```
+
+Go has no version field in `go.mod` — the module proxy resolves versions from
+git tags — so `sdk/go/VERSION` records the intended version in-tree, and the
+publish job refuses to tag unless it matches.
+
+### Publishing
+
+`publish-sdk.yml` is `workflow_dispatch` only. Pick an SDK (or `all`), give a
+semver version, and optionally check `dry_run`.
+
+| SDK | Registry | Mechanism |
+|---|---|---|
+| TypeScript | npm | `npm publish --provenance` |
+| React | npm | same, after rewriting the `file:../typescript` dependency to the published range |
+| Python | TestPyPI → PyPI | trusted publisher (OIDC), promotion gated on the `pypi` environment |
+| Rust | crates.io | `cargo publish`, always preceded by `--dry-run` |
+| Go | module proxy | git tag `sdk/go/vX.Y.Z`, then a proxy warm request |
+
+`dry_run` builds, tests, and packages everything without publishing. Use it
+before a real release: it exercises the parts that usually break — a Rust crate
+that compiles in-workspace but not standalone, or a React package whose
+`file:` dependency cannot resolve outside this repo.
+
+Two things are deliberately not automated:
+
+- **Publishing is never triggered by a push.** Registry uploads are effectively
+  irreversible (npm unpublish is time-limited, crates.io has none, Go module
+  versions are immutable), so a human chooses the moment.
+- **The Go publish creates a tag.** Tags are the module version, so republishing
+  a version is impossible by design — the job fails rather than trying.
+
+### Credentials
+
+`NPM_TOKEN` and `CARGO_REGISTRY_TOKEN` are repository secrets. Python uses
+PyPI's trusted-publisher OIDC flow, so it has no token to manage. The Go job
+uses the workflow's own `GITHUB_TOKEN` to push a tag.
+
+A first publish of any package also needs the name to be claimed on the registry
+and, for Python, the trusted publisher configured for this repo and workflow.
+That is a one-time manual setup per registry and cannot be done from CI.

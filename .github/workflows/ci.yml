@@ -1095,6 +1095,12 @@ jobs:
       - name: Lint migrations
         run: bash scripts/lint-migrations.sh
 
+      # SDK versions must equal the OpenAPI spec version they are generated
+      # from (issue #429), so a published client's version identifies the API
+      # contract it implements. Needs no database, so it rides along here.
+      - name: Check SDK versions match the spec
+        run: bash scripts/check-sdk-versions.sh
+
       - name: Check schema.sql matches the migration chain
         env:
           DATABASE_URL: postgres://postgres:trident@localhost:5432/trident_schema_check
