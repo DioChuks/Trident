@@ -775,10 +775,10 @@ following require you to provision them once:
   kubeconfig scoped to the staging namespace), `STAGING_API_KEY`,
   `STAGING_DATABASE_URL` (when runner migrations are used), and
   `STAGING_ALERT_WEBHOOK_URL` (optional) are stored as encrypted secrets. The
-  kubeconfig and API key must be
-  set for `deploy-staging`/`smoke-test-staging` to run at all. Without them,
-  those jobs are skipped (not failed) — see `check-staging-config` in the
-  workflow.
+  kubeconfig and database URL must be set for `deploy-staging`/`smoke-test-staging`
+  to run at all. Without them, `check-staging-config` succeeds with
+  `configured=false`, those jobs are skipped, and a workflow notice names the
+  missing credentials — the workflow itself stays green (issue #498).
 - **Variables**: `STAGING_NAMESPACE` (defaults to `trident-staging`) and
   `STAGING_URL` (public URL of the deployed staging stack, used by the smoke
   test). Variables must never contain credentials.

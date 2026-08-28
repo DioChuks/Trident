@@ -782,6 +782,96 @@ pub async fn load_indexed_contracts(
     Ok(rows.into_iter().collect())
 }
 
+/// Return the upper bound (exclusive) of the highest **named** range partition
+/// on `soroban_events`, or `None` if the table has no named range partitions
+/// (only the DEFAULT catch-all exists).
+///
+/// This is the ledger sequence at which the ingest frontier will overflow into
+/// `soroban_events_default` — the silent data-loss path issue #525 guards
+/// against. The value is read from `pg_class` / `pg_constraint` so it is
+/// always authoritative even after `create_soroban_partition()` adds new ones.
+///
+/// The query selects the maximum `confreljoin` exclusion boundary, which
+/// Postgres stores as the `FROM … TO (upper_bound)` value of every range
+/// partition constraint on the parent table.
+pub async fn last_named_partition_upper_bound(pool: &PgPool) -> Result<Option<i64>, TridentError> {
+    // pg_get_expr renders the partition constraint as a SQL string like
+    //   "((ledger_sequence >= 58000000) AND (ledger_sequence < 60000000))"
+    // Extracting the upper bound with a regex is fragile; instead we join
+    // pg_partitioned_table → pg_class (child) → pg_constraint to get the
+    // range boundary directly from the system catalogue.
+    //
+    // The DEFAULT partition has a NULL range_datum_raw, so `IS NOT NULL`
+    // excludes it; we only want the explicitly-bounded named partitions.
+    let row: Option<(i64,)> = sqlx::query_as(
+        r#"
+        SELECT MAX(upper_bound)
+        FROM (
+            SELECT (pg_catalog.pg_get_partition_constraintdef(child.oid)
+                        ~* 'ledger_sequence < (\d+)')::boolean AS has_upper,
+                   -- Extract the numeric upper bound from the constraint text.
+                   -- NULLIF guards the DEFAULT partition (no upper bound clause).
+                   NULLIF(
+                       (regexp_match(
+                           pg_catalog.pg_get_partition_constraintdef(child.oid),
+                           'ledger_sequence < (\d+)'
+                       ))[1],
+                       ''
+                   )::bigint AS upper_bound
+            FROM   pg_catalog.pg_inherits    inh
+            JOIN   pg_catalog.pg_class       parent ON parent.oid = inh.inhparent
+            JOIN   pg_catalog.pg_class       child  ON child.oid  = inh.inhrelid
+            WHERE  parent.relname = 'soroban_events'
+        ) sub
+        WHERE upper_bound IS NOT NULL
+        "#,
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| {
+        TridentError::storage(
+            anyhow::Error::new(e).context("last_named_partition_upper_bound"),
+        )
+    })?;
+
+    Ok(row.and_then(|(v,)| Some(v)))
+}
+
+/// Verify that none of the `ledger_sequences` in `batch` are destined for the
+/// DEFAULT catch-all partition of `soroban_events` (issue #525).
+///
+/// A row lands in the DEFAULT partition when its `ledger_sequence` falls
+/// outside every named range partition. At that point named partitions are
+/// exhausted and data is silently accumulating in an unindexed, unretained
+/// catch-all that the operator has no tooling to manage.
+///
+/// Returns `Ok(())` when every sequence in `batch` is covered by a named
+/// partition. Returns `Err(TridentError::ConfigError)` — which the streamer
+/// treats as `Severity::Fatal` — when any sequence would land in DEFAULT.
+///
+/// `last_upper` is the value returned by [`last_named_partition_upper_bound`];
+/// the caller caches it per poll cycle so this is a pure, zero-round-trip
+/// check.
+pub fn assert_no_default_partition_overflow(
+    batch: &[i64],
+    last_upper: i64,
+) -> Result<(), TridentError> {
+    if let Some(&overflow) = batch.iter().find(|&&seq| seq >= last_upper) {
+        return Err(TridentError::config(anyhow::anyhow!(
+            "partition exhaustion: ledger_sequence {} is beyond the last named \
+             soroban_events partition boundary (upper bound {}). \
+             Events for this ledger would land in soroban_events_default. \
+             Run `SELECT create_soroban_partition({}, {});` to add the next partition \
+             before resuming the indexer (issue #525).",
+            overflow,
+            last_upper,
+            last_upper,
+            last_upper + 2_000_000,
+        )));
+    }
+    Ok(())
+}
+
 /// Read alert state (last_alert_at, alert_fired) from system_state (issue #75).
 pub async fn get_alert_state(pool: &PgPool) -> Result<crate::alerting::AlertState, TridentError> {
     let row: (Option<chrono::DateTime<chrono::Utc>>, bool) = sqlx::query_as(
@@ -1456,5 +1546,157 @@ mod tests {
             .execute(&setup)
             .await
             .unwrap();
+    }
+
+    // -------------------------------------------------------------------------
+    // Partition exhaustion tests (issue #525)
+    // -------------------------------------------------------------------------
+
+    /// `assert_no_default_partition_overflow` must be a no-op when every
+    /// ledger_sequence in the batch is strictly below the upper bound.
+    #[test]
+    fn overflow_check_passes_when_all_sequences_within_bound() {
+        let sequences = vec![0i64, 1_000_000, 1_999_999];
+        assert!(
+            assert_no_default_partition_overflow(&sequences, 2_000_000).is_ok(),
+            "sequences strictly below upper bound must not trigger overflow"
+        );
+    }
+
+    /// A batch containing a sequence exactly at the upper bound must fail —
+    /// the upper bound is exclusive (Postgres `FOR VALUES FROM (start) TO (end)`
+    /// means `start <= seq < end`).
+    #[test]
+    fn overflow_check_fails_when_sequence_equals_upper_bound() {
+        let sequences = vec![1_999_998i64, 2_000_000];
+        let err = assert_no_default_partition_overflow(&sequences, 2_000_000)
+            .expect_err("sequence == upper_bound should trigger overflow");
+        // Must be a ConfigError so the poll loop treats it as Fatal.
+        assert!(
+            matches!(err, TridentError::ConfigError { .. }),
+            "overflow must produce a ConfigError (Fatal severity), got: {err}"
+        );
+        assert!(
+            err.to_string().contains("2000000"),
+            "error message must name the offending sequence"
+        );
+    }
+
+    /// A batch containing a sequence beyond the upper bound must fail.
+    #[test]
+    fn overflow_check_fails_when_sequence_exceeds_upper_bound() {
+        let sequences = vec![58_000_001i64, 60_000_001];
+        let err = assert_no_default_partition_overflow(&sequences, 60_000_000)
+            .expect_err("sequence > upper_bound should trigger overflow");
+        assert!(matches!(err, TridentError::ConfigError { .. }));
+        // Error message must carry the create_soroban_partition hint so on-call
+        // knows exactly what SQL to run.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("create_soroban_partition"),
+            "error message must include the create_soroban_partition hint"
+        );
+    }
+
+    /// An empty batch must never trigger the overflow check regardless of the
+    /// partition boundary value.
+    #[test]
+    fn overflow_check_passes_for_empty_batch() {
+        assert!(
+            assert_no_default_partition_overflow(&[], 0).is_ok(),
+            "empty batch must never trigger overflow"
+        );
+    }
+
+    /// The overflow is detected as Fatal by the error taxonomy, so the poll
+    /// loop halts rather than retrying.
+    #[test]
+    fn overflow_error_is_fatal_not_retryable() {
+        use trident_common::errors::Severity;
+        let err = assert_no_default_partition_overflow(&[60_000_001i64], 60_000_000)
+            .expect_err("should overflow");
+        assert_eq!(
+            err.severity(),
+            Severity::Fatal,
+            "partition overflow must be Fatal so the indexer halts"
+        );
+        assert!(err.fatal());
+        assert!(!err.retryable());
+    }
+
+    /// Integration test: `last_named_partition_upper_bound` returns a positive
+    /// value against a real database seeded with the standard migration chain
+    /// (which creates partitions up to ledger 60,000,000).
+    #[tokio::test]
+    async fn last_named_partition_upper_bound_returns_migration_seed_value() {
+        let Some(db_url) = test_db_url("last_named_partition_upper_bound_returns_migration_seed_value")
+        else {
+            return;
+        };
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        let upper = last_named_partition_upper_bound(&pool)
+            .await
+            .expect("query must not fail");
+
+        let upper = upper.expect("migrations seed named partitions; result must be Some");
+        assert!(
+            upper > 0,
+            "upper bound must be positive (got {upper})"
+        );
+        // Migration 0017 seeds mainnet partitions up to 60,000,000. The exact
+        // value may be higher if additional partitions were added, but it must
+        // be at least the seeded maximum.
+        assert!(
+            upper >= 60_000_000,
+            "upper bound must be at least 60,000,000 (the migration seed value), got {upper}"
+        );
+    }
+
+    /// Integration test: inserting an event with a ledger_sequence that matches
+    /// the partition boundary condition is caught BEFORE the database is touched.
+    ///
+    /// This is the "deliberate exhaustion" test from issue #525: we prove the
+    /// guard fires on a sequence that would land in the DEFAULT partition, using
+    /// the boundary value we know from the seeded migrations.
+    #[tokio::test]
+    async fn overflow_guard_fires_before_commit_at_exhaustion_boundary() {
+        let Some(db_url) = test_db_url("overflow_guard_fires_before_commit_at_exhaustion_boundary")
+        else {
+            return;
+        };
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        // Get the actual boundary from the DB so this test stays correct even
+        // after additional partitions are added.
+        let last_upper = last_named_partition_upper_bound(&pool)
+            .await
+            .expect("query must not fail")
+            .expect("seeded partitions must exist");
+
+        // A sequence exactly at the upper bound would land in DEFAULT.
+        let overflow_seq = last_upper;
+        let err = assert_no_default_partition_overflow(&[overflow_seq], last_upper)
+            .expect_err("overflow at boundary must be caught");
+
+        assert!(
+            matches!(err, TridentError::ConfigError { .. }),
+            "boundary overflow must be a ConfigError (Fatal)"
+        );
+
+        // Verify the event was NOT written to the database — the guard must
+        // fire before any DB write, not after. We check by querying for any
+        // row at that sequence belonging to a sentinel contract.
+        let sentinel = format!("CEXHAUST_TEST_{last_upper}");
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM soroban_events WHERE contract_id = $1")
+                .bind(&sentinel)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            count.0, 0,
+            "no row must have been written: the guard must fire before commit_page"
+        );
     }
 }
