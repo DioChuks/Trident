@@ -102,3 +102,66 @@ real PR:
    should now hit consistently across runs that don't change dependency
    manifests, instead of only on the specific job that most recently wrote
    the shared `buildkit` scope.
+
+## Coverage: collection and enforced floors
+
+The `coverage` job collects coverage for Rust, Go, and the TypeScript/Python
+SDKs, publishes a summary to the workflow run, uploads the raw reports as the
+`coverage-reports` artifact (14-day retention), and enforces a floor on the
+MVP-critical packages (issue #325).
+
+### Running it locally
+
+```bash
+make coverage          # collect everything
+make coverage-rust     # Rust only  -> target/llvm-cov/html/index.html
+make coverage-go       # Go only    -> services/api/coverage.html
+make coverage-sdk      # TypeScript + Python SDKs
+make coverage-check    # enforce the same floors CI enforces
+```
+
+Rust coverage needs `cargo-llvm-cov`:
+
+```bash
+cargo install cargo-llvm-cov
+rustup component add llvm-tools-preview
+```
+
+`cargo llvm-cov` is used rather than `cargo tarpaulin` because it drives the
+compiler's own instrumentation, so it reports the regions rustc actually
+generates instead of a ptrace-based approximation.
+
+### Why the floors are where they are
+
+Thresholds are set from **measured** baselines, never from aspiration. A floor
+above the current number turns the next unrelated merge red, which trains people
+to bypass the gate. The floors sit just under each package's real figure: they
+catch regression while leaving room for normal variation.
+
+Measured on the commit that introduced this job:
+
+| Package | Measured | Floor |
+|---|---|---|
+| `services/api/handlers` | 45.5% | 43% |
+| `services/api/middleware` | 69.6% | 66% |
+| `services/api/cursor` | 94.4% | 90% |
+| `services/api/validation` | 99.2% | 95% |
+| Python SDK (hand-written client) | 84.0% | 75% |
+
+Raise them deliberately as suites grow — that ratchet is the point of the gate.
+
+Two deliberate exclusions:
+
+- **Rust is report-only for now.** No baseline existed before this job, and
+  picking a threshold without one is the guesswork this section argues against.
+  The first runs publish the real figure; enforce from that in a follow-up.
+- **The Python SDK floor covers hand-written code only.** `openapi_models_gen.py`
+  is emitted by `scripts/generate_sdk_models.py`; "cover the generator's output"
+  is not a meaningful ask of a test suite. Including it drags the reported total
+  to ~53% and would fail the build for a reason no test can fix. The
+  `fail_under = 90` in `sdk/python/pyproject.toml` is aspirational and is
+  overridden in CI with `--cov-fail-under=0`; the enforced gate is the
+  exclusion-aware check in the workflow.
+
+Coverage is deliberately scoped to critical packages rather than the whole tree,
+per the issue's explicit non-goal of a repo-wide coverage mandate.
