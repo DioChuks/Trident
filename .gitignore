@@ -45,3 +45,8 @@ coverage.html
 services/api/coverage.html
 sdk/typescript/coverage/
 htmlcov/
+
+# Local output from the launch verification harnesses (load-tests/*.sh)
+load-tests/launch-soak-results/
+load-tests/chaos-results/
+load-tests/shutdown-results/

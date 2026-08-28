@@ -272,6 +272,114 @@ Compare the per-cycle sum of RPC and decode time against
 `trident_indexer_poll_duration_seconds`: the unexplained remainder is
 predominantly database write time.
 
+## Launch Soak Baseline
+
+Issue #440 requires the launch baseline to come from a combined soak rather than
+from individual short load scripts. Use `load-tests/launch-soak.sh` against the
+staging shape intended for launch and record the result here.
+
+Recommended command:
+
+```bash
+BASE_URL=https://staging.example.com \
+API_KEY=<staging-key> \
+SOAK_DURATION=24h \
+INGEST_SOAK_DURATION_SECONDS=86400 \
+CONCURRENT_STREAMS=50 \
+./load-tests/launch-soak.sh
+```
+
+Record these fields for each accepted baseline:
+
+| Field | Value |
+|---|---|
+| Run timestamp | TBD |
+| Commit SHA | TBD |
+| Environment | TBD |
+| API replicas / resources | TBD |
+| Indexer replicas / resources | TBD |
+| Postgres instance / connection limits | TBD |
+| Redis instance / limits | TBD |
+| RPC endpoint and rate limits | TBD |
+| Ingest events generated | TBD |
+| API request failure rate | TBD |
+| p95/p99 latency by workload | TBD |
+| SSE subscribers and disconnects | TBD |
+| API/indexer memory start vs end | TBD |
+| DB connection count start vs end | TBD |
+| PgBouncer wait time / saturation | TBD |
+| Pool exhaustion behavior | TBD |
+| Cursor stalls / dead letters / restarts | TBD |
+| Verdict | TBD |
+
+A launch baseline should be accepted only when memory and connection counts stay
+flat, cursor progress does not stall, no unexplained restarts occur, and latency
+percentiles remain stable from the first hour through the final hour.
+
+## Rolling Shutdown Baseline
+
+Issue #442 requires a rolling-deploy check that proves shutdown behavior under
+active API, SSE, and indexer work. Use `load-tests/graceful-shutdown-launch.sh`
+against the launch-like environment and record the result here.
+
+Recommended command:
+
+```bash
+BASE_URL=http://localhost:3000 \
+COMPOSE_FILE=docker/docker-compose.yml \
+DRAIN_SECONDS=30 \
+RECOVERY_SECONDS=45 \
+./load-tests/graceful-shutdown-launch.sh
+```
+
+Record these fields:
+
+| Field | Value |
+|---|---|
+| API drain time | TBD |
+| In-flight request failures | TBD |
+| SSE reconnect / Last-Event-ID behavior | TBD |
+| Indexer cursor state before exit | TBD |
+| Indexer cursor state after recovery | TBD |
+| Kubernetes terminationGracePeriodSeconds | TBD |
+| Kubernetes preStop behavior | TBD |
+| Verdict | TBD |
+
+The accepted shutdown baseline should show no silent SSE hangs, no ambiguous
+partially processed ledger, and drain/recovery timings that fit within the
+configured Kubernetes termination grace period.
+## Launch Chaos Baseline
+
+Issue #439 requires actual fault injection for the launch environment. Use
+`load-tests/chaos-launch.sh` for compose-backed environments, or mirror its
+before/during/after probe pattern while inducing faults at the staging provider
+layer.
+
+Recommended command for a compose-backed run:
+
+```bash
+BASE_URL=http://localhost:3000 \
+COMPOSE_FILE=docker/docker-compose.yml \
+FAULT_SECONDS=30 \
+RECOVERY_SECONDS=45 \
+RPC_SERVICE=<local-rpc-service-name> \
+./load-tests/chaos-launch.sh
+```
+
+Record one row per fault:
+
+| Fault | During-fault behavior | Recovery behavior | Data/cursor check | Follow-up issue |
+|---|---|---|---|---|
+| RPC down | TBD | TBD | TBD | TBD |
+| RPC slow | TBD | TBD | TBD | TBD |
+| RPC malformed response | TBD | TBD | TBD | TBD |
+| Postgres down | TBD | TBD | TBD | TBD |
+| Postgres slow | TBD | TBD | TBD | TBD |
+| Redis down | TBD | TBD | TBD | TBD |
+| Redis evicting | TBD | TBD | TBD | TBD |
+
+Every surprise found during the run should become its own issue before the
+launch baseline is marked complete.
 ## Future Improvements
 
 1. **Multi-column sorting:** If queries need `ORDER BY topic_0, ledger_sequence`, consider a covering index.
