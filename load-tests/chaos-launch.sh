@@ -18,8 +18,6 @@ mkdir -p "$OUT_DIR"
 BASE_URL="${BASE_URL:-http://localhost:3000}"
 COMPOSE_FILE="${COMPOSE_FILE:-docker/docker-compose.yml}"
 COMPOSE_PROJECT="${COMPOSE_PROJECT:-}"
-API_SERVICE="${API_SERVICE:-api}"
-INDEXER_SERVICE="${INDEXER_SERVICE:-indexer}"
 POSTGRES_SERVICE="${POSTGRES_SERVICE:-postgres}"
 REDIS_SERVICE="${REDIS_SERVICE:-redis}"
 RPC_SERVICE="${RPC_SERVICE:-}"
@@ -37,44 +35,62 @@ compose() {
 probe() {
   local label="$1"
   local path="${2:-/v1/ready}"
-  local log="${OUT_DIR}/${label}.probe.log"
+  local body="${OUT_DIR}/${label}.body"
   local status
-  status="$(curl -sS -o "${log}.body" -w '%{http_code}' "${BASE_URL}${path}" || true)"
+  status="$(curl -sS -o "$body" -w '%{http_code}' "${BASE_URL}${path}" || true)"
   printf '%s,%s,%s,%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$label" "$path" "$status" \
     | tee -a "${OUT_DIR}/probes.csv"
-  cat "${log}.body" >> "$log" 2>/dev/null || true
 }
 
-stop_service_fault() {
+record_ps() {
+  local scenario="$1"
+  compose ps >> "${OUT_DIR}/${scenario}.log" 2>&1 || true
+}
+
+run_stop_scenario() {
   local scenario="$1"
   local service="$2"
+  echo "=== ${scenario} ===" | tee -a "${OUT_DIR}/summary.txt"
+  probe "${scenario}-before"
   echo "[$scenario] stopping ${service}" | tee -a "${OUT_DIR}/${scenario}.log"
   compose stop "$service" >> "${OUT_DIR}/${scenario}.log" 2>&1 || true
+  sleep 5
+  probe "${scenario}-during"
   sleep "$FAULT_SECONDS"
   echo "[$scenario] starting ${service}" | tee -a "${OUT_DIR}/${scenario}.log"
   compose start "$service" >> "${OUT_DIR}/${scenario}.log" 2>&1 || true
+  sleep "$RECOVERY_SECONDS"
+  probe "${scenario}-after"
+  record_ps "$scenario"
 }
 
-pause_service_fault() {
+run_pause_scenario() {
   local scenario="$1"
   local service="$2"
+  echo "=== ${scenario} ===" | tee -a "${OUT_DIR}/summary.txt"
+  probe "${scenario}-before"
   echo "[$scenario] pausing ${service}" | tee -a "${OUT_DIR}/${scenario}.log"
   compose pause "$service" >> "${OUT_DIR}/${scenario}.log" 2>&1 || true
+  sleep 5
+  probe "${scenario}-during"
   sleep "$FAULT_SECONDS"
   echo "[$scenario] unpausing ${service}" | tee -a "${OUT_DIR}/${scenario}.log"
   compose unpause "$service" >> "${OUT_DIR}/${scenario}.log" 2>&1 || true
+  sleep "$RECOVERY_SECONDS"
+  probe "${scenario}-after"
+  record_ps "$scenario"
 }
 
-run_scenario() {
-  local scenario="$1"
-  shift
+run_redis_evicting() {
+  local scenario="redis-evicting"
   echo "=== ${scenario} ===" | tee -a "${OUT_DIR}/summary.txt"
   probe "${scenario}-before"
-  "$@"
+  echo "[$scenario] flushing Redis DB" | tee -a "${OUT_DIR}/${scenario}.log"
+  compose exec -T "$REDIS_SERVICE" redis-cli FLUSHDB >> "${OUT_DIR}/${scenario}.log" 2>&1 || true
   probe "${scenario}-during"
   sleep "$RECOVERY_SECONDS"
   probe "${scenario}-after"
-  compose ps >> "${OUT_DIR}/${scenario}.log" 2>&1 || true
+  record_ps "$scenario"
 }
 
 echo "timestamp,label,path,status" > "${OUT_DIR}/probes.csv"
@@ -82,14 +98,14 @@ echo "Trident launch chaos run ${RUN_ID}" > "${OUT_DIR}/summary.txt"
 echo "BASE_URL=${BASE_URL}" >> "${OUT_DIR}/summary.txt"
 echo "COMPOSE_FILE=${COMPOSE_FILE}" >> "${OUT_DIR}/summary.txt"
 
-run_scenario postgres-down stop_service_fault postgres-down "$POSTGRES_SERVICE"
-run_scenario postgres-slow pause_service_fault postgres-slow "$POSTGRES_SERVICE"
-run_scenario redis-down stop_service_fault redis-down "$REDIS_SERVICE"
-run_scenario redis-evicting bash -c "compose exec -T '$REDIS_SERVICE' redis-cli FLUSHDB >> '${OUT_DIR}/redis-evicting.log' 2>&1 || true"
+run_stop_scenario postgres-down "$POSTGRES_SERVICE"
+run_pause_scenario postgres-slow "$POSTGRES_SERVICE"
+run_stop_scenario redis-down "$REDIS_SERVICE"
+run_redis_evicting
 
 if [ -n "$RPC_SERVICE" ]; then
-  run_scenario rpc-down stop_service_fault rpc-down "$RPC_SERVICE"
-  run_scenario rpc-slow pause_service_fault rpc-slow "$RPC_SERVICE"
+  run_stop_scenario rpc-down "$RPC_SERVICE"
+  run_pause_scenario rpc-slow "$RPC_SERVICE"
 else
   cat <<'EOF' | tee -a "${OUT_DIR}/summary.txt"
 RPC_SERVICE is not set, so rpc-down and rpc-slow were not induced automatically.
