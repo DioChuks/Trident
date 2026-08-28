@@ -26,6 +26,8 @@ LIST_VUS="${LIST_VUS:-40}"
 GET_VUS="${GET_VUS:-20}"
 BATCH_VUS="${BATCH_VUS:-10}"
 STATS_VUS="${STATS_VUS:-10}"
+PGB_VUS="${PGB_VUS:-100}"
+PGB_REQS="${PGB_REQS:-10}"
 
 export BASE_URL API_KEY
 
@@ -72,6 +74,9 @@ run_k6_background stats \
 run_k6_background stream \
   env CONCURRENT_STREAMS="$CONCURRENT_STREAMS" HOLD_SECONDS="$HOLD_SECONDS" \
   k6 run "${SCRIPT_DIR}/stream-load.js"
+run_k6_background pgbouncer \
+  env VUS="$PGB_VUS" REQS="$PGB_REQS" \
+  k6 run "${SCRIPT_DIR}/pgbouncer-validation.js"
 
 if [ "${RUN_INGEST_SOAK:-1}" = "1" ]; then
   echo "Starting ingest soak..."
@@ -108,6 +113,8 @@ LIST_VUS=${LIST_VUS}
 GET_VUS=${GET_VUS}
 BATCH_VUS=${BATCH_VUS}
 STATS_VUS=${STATS_VUS}
+PGB_VUS=${PGB_VUS}
+PGB_REQS=${PGB_REQS}
 RUN_ID=${RUN_ID}
 EOF
 
