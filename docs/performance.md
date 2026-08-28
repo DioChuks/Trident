@@ -377,6 +377,13 @@ These rules read `node_filesystem_*` from node_exporter on the database host. On
 managed Postgres without those series, substitute the provider's disk metric —
 the thresholds carry over.
 
+Because those metrics come from node_exporter rather than from Trident, they are
+exempt from `scripts/verify-alert-metrics.sh`, which checks that alert-referenced
+metrics exist on the API and indexer `/metrics` endpoints. The indexer does not,
+and should not, report the host's disk usage. That exemption is by prefix
+(`node_`, `pg_`, `redis_`, `container_`), so deploying one of those exporters is
+what verifies the series exists — a different check from this one.
+
 ### Remeasuring
 
 The figure above is workload-dependent. To recheck against real data:
