@@ -1060,6 +1060,53 @@ jobs:
         run: bash scripts/check-image-digests.sh
 
   # ---------------------------------------------------------------------------
+  # Schema guard — migration lint + schema.sql drift detection (issue #436,
+  # closes #246).
+  #
+  # Exists because of #437: migration 0017 ran `CREATE INDEX IF NOT EXISTS`
+  # against names that still belonged to the pre-rename table, so six indexes
+  # silently failed to be created and were then dropped with the legacy table.
+  # schema.sql still listed them, nothing compared the two, and the database
+  # ran without them for nine migrations. Both checks below would have caught
+  # it on the commit that introduced it.
+  # ---------------------------------------------------------------------------
+  schema-guard:
+    name: Schema guard
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: trident
+          POSTGRES_DB: trident_schema_check
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      # Static checks first: they need no database and fail in under a second,
+      # so a numbering or destructive-statement mistake does not wait on a
+      # container to start.
+      - name: Lint migrations
+        run: bash scripts/lint-migrations.sh
+
+      # SDK versions must equal the OpenAPI spec version they are generated
+      # from (issue #429), so a published client's version identifies the API
+      # contract it implements. Needs no database, so it rides along here.
+      - name: Check SDK versions match the spec
+        run: bash scripts/check-sdk-versions.sh
+
+      - name: Check schema.sql matches the migration chain
+        env:
+          DATABASE_URL: postgres://postgres:trident@localhost:5432/trident_schema_check
+        run: bash scripts/check-schema-drift.sh
+
+  # ---------------------------------------------------------------------------
   # Helm — lint, template render, and kind cluster deployment validation
   # ---------------------------------------------------------------------------
   helm:
