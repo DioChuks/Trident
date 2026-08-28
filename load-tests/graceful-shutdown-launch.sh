@@ -35,12 +35,24 @@ compose() {
   fi
 }
 
+FAILURES=0
+
 probe_ready() {
   local label="$1"
   local status
-  status="$(curl -sS -o "${OUT_DIR}/${label}.body" -w '%{http_code}' "${BASE_URL}/v1/ready" || true)"
+  status="$(curl -sS -o "${OUT_DIR}/${label}.body" -w '%{http_code}' --max-time 10 "${BASE_URL}/v1/ready" || echo "000")"
+  PROBE_STATUS="$status"
   printf '%s,%s,%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$label" "$status" \
     | tee -a "${OUT_DIR}/ready.csv"
+}
+
+pass() {
+  echo "PASS: $1" | tee -a "${OUT_DIR}/summary.txt"
+}
+
+fail() {
+  echo "FAIL: $1" | tee -a "${OUT_DIR}/summary.txt"
+  FAILURES=$((FAILURES + 1))
 }
 
 start_load() {
@@ -53,17 +65,54 @@ start_load() {
   echo $! > "${OUT_DIR}/stream-load.pid"
 }
 
+# During SIGTERM the expectation differs per service:
+#   api     - the process is going away, so an unreachable endpoint (000) or an
+#             intentional 503 are both acceptable; a 200 means it never drained.
+#   indexer - the API is untouched, so readiness must stay 200 throughout.
 terminate_service() {
   local scenario="$1"
   local service="$2"
+  local expectation="$3"
+
   echo "=== ${scenario}: SIGTERM ${service} ===" | tee -a "${OUT_DIR}/summary.txt"
+
   probe_ready "${scenario}-before"
+  if [ "$PROBE_STATUS" = "200" ]; then
+    pass "${scenario}: /v1/ready was 200 before SIGTERM"
+  else
+    fail "${scenario}: /v1/ready was ${PROBE_STATUS} before SIGTERM (environment was not healthy to begin with)"
+  fi
+
   compose kill -s SIGTERM "$service" >> "${OUT_DIR}/${scenario}.log" 2>&1 || true
   sleep "$DRAIN_SECONDS"
   probe_ready "${scenario}-during-drain"
+
+  case "$expectation" in
+    unreachable-or-degraded)
+      case "$PROBE_STATUS" in
+        000|503) pass "${scenario}: /v1/ready reported ${PROBE_STATUS} while draining" ;;
+        200)     fail "${scenario}: /v1/ready still returned 200 after SIGTERM (traffic would keep arriving mid-drain)" ;;
+        *)       fail "${scenario}: /v1/ready returned unexpected status ${PROBE_STATUS} while draining" ;;
+      esac
+      ;;
+    stay-healthy)
+      if [ "$PROBE_STATUS" = "200" ]; then
+        pass "${scenario}: API stayed ready while ${service} shut down"
+      else
+        fail "${scenario}: API readiness dropped to ${PROBE_STATUS} when only ${service} was terminated"
+      fi
+      ;;
+  esac
+
   compose up -d "$service" >> "${OUT_DIR}/${scenario}.log" 2>&1 || true
   sleep "$RECOVERY_SECONDS"
   probe_ready "${scenario}-after-recovery"
+  if [ "$PROBE_STATUS" = "200" ]; then
+    pass "${scenario}: /v1/ready recovered to 200 after restart"
+  else
+    fail "${scenario}: /v1/ready did not recover (status ${PROBE_STATUS}) within ${RECOVERY_SECONDS}s"
+  fi
+
   compose logs --no-color --tail=200 "$service" > "${OUT_DIR}/${scenario}.service.log" 2>&1 || true
 }
 
@@ -74,8 +123,8 @@ echo "COMPOSE_FILE=${COMPOSE_FILE}" >> "${OUT_DIR}/summary.txt"
 
 start_load
 sleep 5
-terminate_service api-shutdown "$API_SERVICE"
-terminate_service indexer-shutdown "$INDEXER_SERVICE"
+terminate_service api-shutdown "$API_SERVICE" unreachable-or-degraded
+terminate_service indexer-shutdown "$INDEXER_SERVICE" stay-healthy
 
 status=0
 for pid_file in "${OUT_DIR}"/*.pid; do
@@ -97,7 +146,15 @@ Review checklist:
 - Confirm SSE clients did not hang silently and can reconnect with Last-Event-ID.
 - Confirm indexer logs show cursor commit or an explicit safe retry point before exit.
 - Confirm Kubernetes terminationGracePeriodSeconds/preStop settings exceed measured drain time.
+
+Assertion failures: ${FAILURES}
 EOF
 
 echo "Shutdown verification complete. Results: ${OUT_DIR}"
+
+if [ "$FAILURES" -gt 0 ]; then
+  echo "Shutdown verification FAILED with ${FAILURES} assertion failure(s)." >&2
+  status=1
+fi
+
 exit "$status"

@@ -77,6 +77,11 @@ log per workload plus `run-metadata.env` and `summary.txt`. Copy the relevant
 latency, failure-rate, memory, connection, cursor, and restart observations into
 [`docs/performance.md`](../docs/performance.md) after the run.
 
+`stream-load.js` runs a single connect-and-hold iteration per VU, so it only
+covers `HOLD_SECONDS` per invocation. The soak harness relaunches it in a loop
+until `SOAK_DURATION` elapses; without that, SSE would stop being exercised
+minutes into a 24-hour run. `SOAK_DURATION` accepts `24h`, `90m`, or `300s`.
+
 ### Rolling shutdown verification (`graceful-shutdown-launch.sh`)
 
 `graceful-shutdown-launch.sh` covers issue #442 by running API read load and SSE
@@ -94,6 +99,14 @@ Results are written under `load-tests/shutdown-results/<timestamp>/`. Use the
 ready probes, k6 logs, and service logs to confirm API requests drain, SSE
 clients do not hang silently, the indexer exits at a safe cursor boundary, and
 Kubernetes termination settings exceed the measured drain time.
+
+The harness asserts a different readiness expectation per service. Terminating
+the API should stop it serving, so a `503` or an unreachable endpoint (recorded
+as `000`) passes while a `200` fails — that would mean traffic kept arriving
+mid-drain. Terminating the indexer leaves the API untouched, so readiness must
+stay `200` throughout. Both scenarios also require recovery to `200` within
+`RECOVERY_SECONDS`. The script exits non-zero if any assertion fails or any load
+generator fails.
 ### Launch chaos verification (`chaos-launch.sh`)
 
 `chaos-launch.sh` is the fault-injection harness for issue #439. It records
@@ -110,9 +123,23 @@ RPC_SERVICE=<local-rpc-service-name> \
 
 The script covers Postgres down/slow, Redis down/evicted, and RPC down/slow when
 `RPC_SERVICE` points at a compose-managed RPC service. Results are written under
-`load-tests/chaos-results/<timestamp>/`. Treat unexpected hangs, missing
-recovery, data loss, cursor corruption, or unbounded retry loops as follow-up
-issues.
+`load-tests/chaos-results/<timestamp>/`.
+
+The harness asserts the readiness contract rather than only recording it.
+`GET /v1/ready` returns 200 only when Postgres, Redis, and the gRPC backend all
+pass, and 503 when any check fails, so each scenario checks that:
+
+- readiness reported 503 while the dependency was stopped or paused — a 200
+  means the outage went undetected, and a timeout (recorded as `000`) means the
+  probe hung instead of failing fast;
+- readiness returned to 200 within `RECOVERY_SECONDS` after the dependency came
+  back;
+- flushing Redis stays 200, because an emptied cache is a miss, not an outage.
+
+The script exits non-zero if any assertion fails and prints the failure count in
+`summary.txt`, so it can gate a launch checklist. Still treat data loss, cursor
+corruption, or unbounded retry loops seen in the logs as follow-up issues — those
+are not asserted automatically.
 ## Interpreting Results
 
 ### k6 scripts (`events-load.js`, `batch-load.js`, `stats-load.js`, `stream-load.js`)

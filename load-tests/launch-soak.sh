@@ -31,6 +31,26 @@ PGB_REQS="${PGB_REQS:-10}"
 
 export BASE_URL API_KEY
 
+# Convert the k6-style SOAK_DURATION (e.g. 24h, 90m, 300s) into seconds so the
+# stream relaunch loop knows when the soak window closes.
+duration_to_seconds() {
+  local value="$1"
+  local number="${value%[smh]}"
+  case "$value" in
+    *h) echo $(( number * 3600 )) ;;
+    *m) echo $(( number * 60 )) ;;
+    *s) echo "$number" ;;
+    *)  echo "$value" ;;
+  esac
+}
+
+SOAK_SECONDS="$(duration_to_seconds "$SOAK_DURATION")"
+if ! [ "$SOAK_SECONDS" -gt 0 ] 2>/dev/null; then
+  echo "SOAK_DURATION must be a positive duration like 24h, 90m, or 300s (got: ${SOAK_DURATION})" >&2
+  exit 1
+fi
+
+
 echo "Trident launch soak starting"
 echo "  run id:              ${RUN_ID}"
 echo "  base url:            ${BASE_URL}"
@@ -64,16 +84,35 @@ run_k6_background events \
   k6 run "${SCRIPT_DIR}/events-load.js"
 
 run_k6_background batch \
-  env BATCH_VUS="$BATCH_VUS" DURATION="$SOAK_DURATION" \
+  env VUS="$BATCH_VUS" DURATION="$SOAK_DURATION" \
   k6 run "${SCRIPT_DIR}/batch-load.js"
 
 run_k6_background stats \
-  env STATS_VUS="$STATS_VUS" DURATION="$SOAK_DURATION" \
+  env VUS="$STATS_VUS" DURATION="$SOAK_DURATION" \
   k6 run "${SCRIPT_DIR}/stats-load.js"
 
-run_k6_background stream \
-  env CONCURRENT_STREAMS="$CONCURRENT_STREAMS" HOLD_SECONDS="$HOLD_SECONDS" \
-  k6 run "${SCRIPT_DIR}/stream-load.js"
+# stream-load.js runs a single connect-and-hold iteration per VU, so one
+# invocation only covers HOLD_SECONDS. Relaunch it for the whole soak window,
+# otherwise SSE stops being exercised after the first cycle.
+run_stream_soak() {
+  local deadline=$(( $(date +%s) + SOAK_SECONDS ))
+  local cycle=0
+  local rc=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    cycle=$((cycle + 1))
+    if ! env CONCURRENT_STREAMS="$CONCURRENT_STREAMS" HOLD_SECONDS="$HOLD_SECONDS" \
+      k6 run "${SCRIPT_DIR}/stream-load.js" >> "${OUT_DIR}/stream.log" 2>&1; then
+      echo "stream cycle ${cycle} failed" >> "${OUT_DIR}/stream.log"
+      rc=1
+    fi
+  done
+  return "$rc"
+}
+
+echo "Starting stream..."
+run_stream_soak &
+echo $! > "${OUT_DIR}/stream.pid"
+
 run_k6_background pgbouncer \
   env VUS="$PGB_VUS" REQS="$PGB_REQS" \
   k6 run "${SCRIPT_DIR}/pgbouncer-validation.js"
