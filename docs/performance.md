@@ -307,6 +307,8 @@ Record these fields for each accepted baseline:
 | SSE subscribers and disconnects | TBD |
 | API/indexer memory start vs end | TBD |
 | DB connection count start vs end | TBD |
+| PgBouncer wait time / saturation | TBD |
+| Pool exhaustion behavior | TBD |
 | Cursor stalls / dead letters / restarts | TBD |
 | Verdict | TBD |
 
@@ -314,6 +316,38 @@ A launch baseline should be accepted only when memory and connection counts stay
 flat, cursor progress does not stall, no unexplained restarts occur, and latency
 percentiles remain stable from the first hour through the final hour.
 
+## Rolling Shutdown Baseline
+
+Issue #442 requires a rolling-deploy check that proves shutdown behavior under
+active API, SSE, and indexer work. Use `load-tests/graceful-shutdown-launch.sh`
+against the launch-like environment and record the result here.
+
+Recommended command:
+
+```bash
+BASE_URL=http://localhost:3000 \
+COMPOSE_FILE=docker/docker-compose.yml \
+DRAIN_SECONDS=30 \
+RECOVERY_SECONDS=45 \
+./load-tests/graceful-shutdown-launch.sh
+```
+
+Record these fields:
+
+| Field | Value |
+|---|---|
+| API drain time | TBD |
+| In-flight request failures | TBD |
+| SSE reconnect / Last-Event-ID behavior | TBD |
+| Indexer cursor state before exit | TBD |
+| Indexer cursor state after recovery | TBD |
+| Kubernetes terminationGracePeriodSeconds | TBD |
+| Kubernetes preStop behavior | TBD |
+| Verdict | TBD |
+
+The accepted shutdown baseline should show no silent SSE hangs, no ambiguous
+partially processed ledger, and drain/recovery timings that fit within the
+configured Kubernetes termination grace period.
 ## Launch Chaos Baseline
 
 Issue #439 requires actual fault injection for the launch environment. Use
