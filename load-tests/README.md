@@ -35,6 +35,8 @@ scripts to match rather than the other way around.
 | `stream-load.js` | `GET /v1/events/stream` (SSE) — connect-and-hold under concurrency | `BASE_URL=http://localhost:3000 API_KEY=<key> CONCURRENT_STREAMS=20 HOLD_SECONDS=30 k6 run load-tests/stream-load.js` |
 | `rate-limit-concurrency.js` | One-key burst proving the tier limit holds under launch-scale concurrency | `BASE_URL=http://localhost:3000 API_KEY=<key> EXPECTED_LIMIT=100 CONCURRENT_REQUESTS=1000 k6 run load-tests/rate-limit-concurrency.js` |
 | `ingest-soak.sh` | Sustained ingest volume (contract mint loop) + Go API / Rust indexer resource sampling over time | `LOCAL_RPC_URL=http://localhost:8000/rpc SOAK_DURATION_SECONDS=1800 ./load-tests/ingest-soak.sh` |
+| `launch-soak.sh` | Combined 24-hour launch soak: ingest volume plus events, batch, stats, and SSE load running together (issue #440) | `BASE_URL=https://staging.example.com API_KEY=<key> ./load-tests/launch-soak.sh` |
+| `chaos-launch.sh` | Launch chaos verification for Postgres, Redis, and optional RPC faults with before/during/after readiness probes (issue #439) | `BASE_URL=http://localhost:3000 COMPOSE_FILE=docker/docker-compose.yml RPC_SERVICE=<rpc-service> ./load-tests/chaos-launch.sh` |
 
 `API_KEY` is optional for the k6 scripts — every script's checks accept
 either `200` or `401`, so they still validate the server doesn't error/crash
@@ -51,6 +53,48 @@ allows more than that limit, does not reject the excess, or returns any status
 other than 200/429. Run it against an otherwise idle key so earlier requests in
 the same sliding window do not affect the expected boundary.
 
+## Launch Verification Runs
+
+### Combined launch soak (`launch-soak.sh`)
+
+`launch-soak.sh` is the orchestration harness for the projected-launch soak in
+issue #440. It runs the existing k6 read/write/stat/SSE scripts while the ingest
+soak keeps contract events flowing. By default, it uses a 24-hour k6 duration
+and an 86,400 second ingest duration:
+
+```bash
+BASE_URL=https://staging.example.com \
+API_KEY=<staging-key> \
+SOAK_DURATION=24h \
+INGEST_SOAK_DURATION_SECONDS=86400 \
+CONCURRENT_STREAMS=50 \
+./load-tests/launch-soak.sh
+```
+
+Results are written under `load-tests/launch-soak-results/<timestamp>/` with one
+log per workload plus `run-metadata.env` and `summary.txt`. Copy the relevant
+latency, failure-rate, memory, connection, cursor, and restart observations into
+[`docs/performance.md`](../docs/performance.md) after the run.
+
+### Launch chaos verification (`chaos-launch.sh`)
+
+`chaos-launch.sh` is the fault-injection harness for issue #439. It records
+`/v1/ready` before, during, and after each induced dependency fault:
+
+```bash
+BASE_URL=http://localhost:3000 \
+COMPOSE_FILE=docker/docker-compose.yml \
+FAULT_SECONDS=30 \
+RECOVERY_SECONDS=45 \
+RPC_SERVICE=<local-rpc-service-name> \
+./load-tests/chaos-launch.sh
+```
+
+The script covers Postgres down/slow, Redis down/evicted, and RPC down/slow when
+`RPC_SERVICE` points at a compose-managed RPC service. Results are written under
+`load-tests/chaos-results/<timestamp>/`. Treat unexpected hangs, missing
+recovery, data loss, cursor corruption, or unbounded retry loops as follow-up
+issues.
 ## Interpreting Results
 
 ### k6 scripts (`events-load.js`, `batch-load.js`, `stats-load.js`, `stream-load.js`)
