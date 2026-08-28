@@ -37,6 +37,7 @@ scripts to match rather than the other way around.
 | `ingest-soak.sh` | Sustained ingest volume (contract mint loop) + Go API / Rust indexer resource sampling over time | `LOCAL_RPC_URL=http://localhost:8000/rpc SOAK_DURATION_SECONDS=1800 ./load-tests/ingest-soak.sh` |
 | `launch-soak.sh` | Combined 24-hour launch soak: ingest volume plus events, batch, stats, and SSE load running together (issue #440) | `BASE_URL=https://staging.example.com API_KEY=<key> ./load-tests/launch-soak.sh` |
 | `chaos-launch.sh` | Launch chaos verification for Postgres, Redis, and optional RPC faults with before/during/after readiness probes (issue #439) | `BASE_URL=http://localhost:3000 COMPOSE_FILE=docker/docker-compose.yml RPC_SERVICE=<rpc-service> ./load-tests/chaos-launch.sh` |
+| `graceful-shutdown-launch.sh` | Rolling SIGTERM verification for API request drain, SSE reconnect behavior, and indexer cursor safety (issue #442) | `BASE_URL=http://localhost:3000 COMPOSE_FILE=docker/docker-compose.yml ./load-tests/graceful-shutdown-launch.sh` |
 
 `API_KEY` is optional for the k6 scripts — every script's checks accept
 either `200` or `401`, so they still validate the server doesn't error/crash
@@ -58,7 +59,7 @@ the same sliding window do not affect the expected boundary.
 ### Combined launch soak (`launch-soak.sh`)
 
 `launch-soak.sh` is the orchestration harness for the projected-launch soak in
-issue #440. It runs the existing k6 read/write/stat/SSE scripts while the ingest
+issue #440. It runs the existing k6 read/write/stat/SSE scripts, PgBouncer pool validation, and the ingest
 soak keeps contract events flowing. By default, it uses a 24-hour k6 duration
 and an 86,400 second ingest duration:
 
@@ -76,6 +77,23 @@ log per workload plus `run-metadata.env` and `summary.txt`. Copy the relevant
 latency, failure-rate, memory, connection, cursor, and restart observations into
 [`docs/performance.md`](../docs/performance.md) after the run.
 
+### Rolling shutdown verification (`graceful-shutdown-launch.sh`)
+
+`graceful-shutdown-launch.sh` covers issue #442 by running API read load and SSE
+stream load while sending SIGTERM to the API and indexer services:
+
+```bash
+BASE_URL=http://localhost:3000 \
+COMPOSE_FILE=docker/docker-compose.yml \
+DRAIN_SECONDS=30 \
+RECOVERY_SECONDS=45 \
+./load-tests/graceful-shutdown-launch.sh
+```
+
+Results are written under `load-tests/shutdown-results/<timestamp>/`. Use the
+ready probes, k6 logs, and service logs to confirm API requests drain, SSE
+clients do not hang silently, the indexer exits at a safe cursor boundary, and
+Kubernetes termination settings exceed the measured drain time.
 ### Launch chaos verification (`chaos-launch.sh`)
 
 `chaos-launch.sh` is the fault-injection harness for issue #439. It records
