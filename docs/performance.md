@@ -192,6 +192,131 @@ LIMIT 50;
 
 Expected output should show `Index Scan`, not `Seq Scan` or `Bitmap Heap Scan`.
 
+## Storage Capacity and Disk Growth
+
+`soroban_events` grows without bound. Partitioning landed in
+`0017_soroban_events_partitioning.sql`, which makes retention cheap, but that
+does not answer how fast the volume fills or when it runs out (issue #432).
+
+### Measured cost per event
+
+Measured, not estimated: 500,000 synthetic events were inserted into a database
+built from the full migration chain on PostgreSQL 16, then `VACUUM ANALYZE`d
+and sized with `pg_total_relation_size` across every partition.
+
+| | Bytes | Per event |
+|---|---|---|
+| Heap | 240,943,104 | **482 B** |
+| Indexes | 204,070,912 | **408 B** |
+| **Total** | **445,177,856** | **890 B** |
+
+Indexes are 46% of the footprint — close to the heap itself. The largest single
+index is `contract_id, ledger_sequence DESC` at 81 MB per 500k rows, which is
+the index migration 0026 restored after #437. Dropping indexes to save space
+would trade a bounded storage cost for the unbounded query cost that issue
+documents.
+
+The synthetic rows model a realistic event: a 56-character contract ID, a
+64-character transaction hash, three topics, and a small JSON body. A workload
+with larger event payloads will exceed this figure — remeasure rather than
+assuming, using the query in "Remeasuring" below.
+
+### Projections
+
+Stellar closes a ledger about every 5 seconds — 17,280 ledgers/day.
+
+**Current testnet rate (~4 events/ledger, 69,120 events/day):**
+
+| Horizon | Events | Storage |
+|---|---|---|
+| 1 month | 2.1 M | **1.7 GiB** |
+| 3 months | 6.2 M | **5.2 GiB** |
+| 12 months | 25.2 M | **20.9 GiB** |
+
+**10x rate (~40 events/ledger, 691,200 events/day):**
+
+| Horizon | Events | Storage |
+|---|---|---|
+| 1 month | 20.7 M | **17.2 GiB** |
+| 3 months | 62.2 M | **51.6 GiB** |
+| 12 months | 252.3 M | **209.2 GiB** |
+
+These cover `soroban_events` only. Budget separately for WAL, the projection
+tables (`token_events`, `contract_invocation_metrics`), and `audit_log`, which
+grows with API traffic rather than chain activity.
+
+### Recommended provisioning
+
+**100 GiB for a testnet launch**, which is deliberate headroom rather than a
+tight fit:
+
+- 12 months at the current rate is 21 GiB — roughly 5x headroom.
+- 12 months at 10x is 209 GiB, which this does *not* cover. That is intentional:
+  sustained 10x testnet traffic is a signal to enable partition retention, not
+  to pre-buy a year of disk for traffic that may never arrive.
+- 3 months at 10x is 52 GiB, so even an unexpected order-of-magnitude jump
+  leaves about a quarter to react in.
+
+Resize when a projection alert fires, not on a schedule.
+
+### Retention
+
+Because the table is RANGE-partitioned by `ledger_sequence`, dropping old data
+is a metadata operation rather than a bulk `DELETE` that would leave the table
+bloated until vacuum:
+
+```sql
+DROP TABLE soroban_events_p0_1999999;
+```
+
+Each partition spans 2,000,000 ledgers — about 115 days of chain time. There is
+no automated retention job; this is a deliberate manual step, since dropping a
+partition destroys those events irreversibly.
+
+### Alerting
+
+Three rules in `monitoring/alerts.yml`, under `trident.storage.capacity`:
+
+| Alert | Fires when | Severity |
+|---|---|---|
+| `TridentDiskFillingWithin14Days` | 6h trend projects exhaustion in 14 days | warning |
+| `TridentDiskFillingWithin48Hours` | same projection, inside 48 hours | critical |
+| `TridentDiskSpaceLow` | under 15% free, regardless of trend | warning |
+
+The first two use `predict_linear` rather than a static percentage, because a
+"90% full" alert gives about a day of warning at the 10x rate — not enough to
+provision and migrate. Alerting on projected exhaustion buys the lead time that
+a level threshold cannot.
+
+`TridentDiskSpaceLow` is the backstop for what a 6-hour trend cannot see: a step
+change from a backfill, or WAL pinned by a stalled replication slot. Runbooks
+for all three are in
+[`docs/runbooks/alerts.md`](runbooks/alerts.md#tridentdiskfillingwithin14days).
+
+These rules read `node_filesystem_*` from node_exporter on the database host. On
+managed Postgres without those series, substitute the provider's disk metric —
+the thresholds carry over.
+
+### Remeasuring
+
+The figure above is workload-dependent. To recheck against real data:
+
+```sql
+SELECT
+  (SELECT count(*) FROM soroban_events) AS rows,
+  pg_size_pretty(sum(pg_total_relation_size(c.oid))) AS total,
+  sum(pg_total_relation_size(c.oid)) / NULLIF((SELECT count(*) FROM soroban_events), 0)
+    AS bytes_per_event
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'public'
+  AND c.relname LIKE 'soroban_events%'
+  AND c.relkind = 'r';
+```
+
+Run it after a `VACUUM ANALYZE`; dead tuples from an unvacuumed table inflate
+the result.
+
 ## Future Improvements
 
 1. **Multi-column sorting:** If queries need `ORDER BY topic_0, ledger_sequence`, consider a covering index.
