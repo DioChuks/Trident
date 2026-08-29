@@ -399,20 +399,3 @@ groups:
             immediately: `SELECT create_soroban_partition(<last_upper>,
             <last_upper + 2000000>);` — see the runbook for the exact values.
           runbook_url: "docs/runbooks/alerts.md#tridentpartitionexhausted"
-      - alert: TridentDiskSpaceLow
-        expr: >
-          node_filesystem_avail_bytes{mountpoint="/var/lib/postgresql",fstype!~"tmpfs|overlay"}
-            / node_filesystem_size_bytes{mountpoint="/var/lib/postgresql",fstype!~"tmpfs|overlay"}
-            < 0.15
-        for: 15m
-        labels:
-          severity: warning
-          service: database
-        annotations:
-          summary: "Postgres volume below 15% free ({{ $value | humanizePercentage }})"
-          description: >
-            Less than 15% of the Postgres data volume remains on
-            {{ $labels.instance }}. Unlike the predictive alerts above this
-            fires regardless of trend, so it also catches a sudden step in
-            usage such as a backfill or a WAL pileup.
-          runbook_url: "docs/runbooks/alerts.md#tridentdiskspacelow"

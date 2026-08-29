@@ -794,47 +794,43 @@ pub async fn load_indexed_contracts(
 /// The query selects the maximum `confreljoin` exclusion boundary, which
 /// Postgres stores as the `FROM … TO (upper_bound)` value of every range
 /// partition constraint on the parent table.
-pub async fn last_named_partition_upper_bound(pool: &PgPool) -> Result<Option<i64>, TridentError> {
-    // pg_get_expr renders the partition constraint as a SQL string like
-    //   "((ledger_sequence >= 58000000) AND (ledger_sequence < 60000000))"
-    // Extracting the upper bound with a regex is fragile; instead we join
-    // pg_partitioned_table → pg_class (child) → pg_constraint to get the
-    // range boundary directly from the system catalogue.
-    //
-    // The DEFAULT partition has a NULL range_datum_raw, so `IS NOT NULL`
-    // excludes it; we only want the explicitly-bounded named partitions.
-    let row: Option<(i64,)> = sqlx::query_as(
+/// Returns the `[lower, upper)` bounds of every named `soroban_events`
+/// partition, ascending.
+///
+/// A single MAX(upper_bound) is not sufficient: migration 0017 seeds
+/// partitions for 0–6M and then 50M–60M, leaving a 44-million-ledger hole. A
+/// max-only guard reports 60M and happily accepts a ledger at 20M, which then
+/// falls through to `soroban_events_default` — precisely the silent overflow
+/// this check exists to prevent (issue #525).
+pub async fn named_partition_ranges(pool: &PgPool) -> Result<Vec<(i64, i64)>, TridentError> {
+    // The DEFAULT partition has no FROM/TO clause, so both captures are NULL
+    // and it is filtered out below; we only want explicitly-bounded partitions.
+    let rows: Vec<(i64, i64)> = sqlx::query_as(
         r#"
-        SELECT MAX(upper_bound)
+        SELECT lower_bound, upper_bound
         FROM (
-            SELECT (pg_catalog.pg_get_partition_constraintdef(child.oid)
-                        ~* 'ledger_sequence < (\d+)')::boolean AS has_upper,
-                   -- Extract the numeric upper bound from the constraint text.
-                   -- NULLIF guards the DEFAULT partition (no upper bound clause).
-                   NULLIF(
-                       (regexp_match(
-                           pg_catalog.pg_get_partition_constraintdef(child.oid),
-                           'ledger_sequence < (\d+)'
-                       ))[1],
-                       ''
-                   )::bigint AS upper_bound
+            SELECT (regexp_match(
+                        pg_catalog.pg_get_partition_constraintdef(child.oid),
+                        'ledger_sequence >= (\d+)'
+                    ))[1]::bigint AS lower_bound,
+                   (regexp_match(
+                        pg_catalog.pg_get_partition_constraintdef(child.oid),
+                        'ledger_sequence < (\d+)'
+                    ))[1]::bigint AS upper_bound
             FROM   pg_catalog.pg_inherits    inh
             JOIN   pg_catalog.pg_class       parent ON parent.oid = inh.inhparent
             JOIN   pg_catalog.pg_class       child  ON child.oid  = inh.inhrelid
             WHERE  parent.relname = 'soroban_events'
         ) sub
-        WHERE upper_bound IS NOT NULL
+        WHERE lower_bound IS NOT NULL AND upper_bound IS NOT NULL
+        ORDER BY lower_bound
         "#,
     )
-    .fetch_optional(pool)
+    .fetch_all(pool)
     .await
-    .map_err(|e| {
-        TridentError::storage(
-            anyhow::Error::new(e).context("last_named_partition_upper_bound"),
-        )
-    })?;
+    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("named_partition_ranges")))?;
 
-    Ok(row.and_then(|(v,)| Some(v)))
+    Ok(rows)
 }
 
 /// Verify that none of the `ledger_sequences` in `batch` are destined for the
@@ -852,21 +848,27 @@ pub async fn last_named_partition_upper_bound(pool: &PgPool) -> Result<Option<i6
 /// `last_upper` is the value returned by [`last_named_partition_upper_bound`];
 /// the caller caches it per poll cycle so this is a pure, zero-round-trip
 /// check.
+/// Fails if any ledger in `batch` is not covered by a named partition.
+///
+/// Checks containment against every range rather than only the highest upper
+/// bound: a ledger can fall into a *gap* between named partitions and still be
+/// below the maximum, in which case it silently lands in
+/// `soroban_events_default` (issue #525).
 pub fn assert_no_default_partition_overflow(
     batch: &[i64],
-    last_upper: i64,
+    ranges: &[(i64, i64)],
 ) -> Result<(), TridentError> {
-    if let Some(&overflow) = batch.iter().find(|&&seq| seq >= last_upper) {
+    let covered = |seq: i64| ranges.iter().any(|&(lo, hi)| seq >= lo && seq < hi);
+
+    if let Some(&uncovered) = batch.iter().find(|&&seq| !covered(seq)) {
+        let highest = ranges.iter().map(|&(_, hi)| hi).max().unwrap_or(0);
+        let suggested_lo = uncovered - (uncovered % 2_000_000);
         return Err(TridentError::config(anyhow::anyhow!(
-            "partition exhaustion: ledger_sequence {} is beyond the last named \
-             soroban_events partition boundary (upper bound {}). \
-             Events for this ledger would land in soroban_events_default. \
-             Run `SELECT create_soroban_partition({}, {});` to add the next partition \
-             before resuming the indexer (issue #525).",
-            overflow,
-            last_upper,
-            last_upper,
-            last_upper + 2_000_000,
+            "partition exhaustion: ledger_sequence {} is not covered by any named              soroban_events partition (highest known upper bound {}).              Events for this ledger would land in soroban_events_default.              Run `SELECT create_soroban_partition({}, {});` to create the              covering partition before resuming the indexer (issue #525).",
+            uncovered,
+            highest,
+            suggested_lo,
+            suggested_lo + 2_000_000,
         )));
     }
     Ok(())
@@ -1558,7 +1560,7 @@ mod tests {
     fn overflow_check_passes_when_all_sequences_within_bound() {
         let sequences = vec![0i64, 1_000_000, 1_999_999];
         assert!(
-            assert_no_default_partition_overflow(&sequences, 2_000_000).is_ok(),
+            assert_no_default_partition_overflow(&sequences, &[(0, 2_000_000)]).is_ok(),
             "sequences strictly below upper bound must not trigger overflow"
         );
     }
@@ -1569,7 +1571,7 @@ mod tests {
     #[test]
     fn overflow_check_fails_when_sequence_equals_upper_bound() {
         let sequences = vec![1_999_998i64, 2_000_000];
-        let err = assert_no_default_partition_overflow(&sequences, 2_000_000)
+        let err = assert_no_default_partition_overflow(&sequences, &[(0, 2_000_000)])
             .expect_err("sequence == upper_bound should trigger overflow");
         // Must be a ConfigError so the poll loop treats it as Fatal.
         assert!(
@@ -1586,7 +1588,7 @@ mod tests {
     #[test]
     fn overflow_check_fails_when_sequence_exceeds_upper_bound() {
         let sequences = vec![58_000_001i64, 60_000_001];
-        let err = assert_no_default_partition_overflow(&sequences, 60_000_000)
+        let err = assert_no_default_partition_overflow(&sequences, &[(0, 60_000_000)])
             .expect_err("sequence > upper_bound should trigger overflow");
         assert!(matches!(err, TridentError::ConfigError { .. }));
         // Error message must carry the create_soroban_partition hint so on-call
@@ -1598,12 +1600,50 @@ mod tests {
         );
     }
 
+    /// Regression: a ledger that falls in a *gap* between named partitions is
+    /// below the highest upper bound but covered by nothing, so it lands in
+    /// soroban_events_default. Migration 0017 seeds exactly this shape —
+    /// partitions for 0-6M and 50M-60M, with a 44M-ledger hole between them —
+    /// so a guard that only compares against MAX(upper_bound) accepts ledger
+    /// 20_000_000 and silently corrupts the dataset (issue #525).
+    #[test]
+    fn overflow_check_fails_for_sequence_in_gap_between_partitions() {
+        let migration_0017_shape = &[
+            (0i64, 2_000_000i64),
+            (2_000_000, 4_000_000),
+            (4_000_000, 6_000_000),
+            (50_000_000, 52_000_000),
+            (52_000_000, 54_000_000),
+            (54_000_000, 56_000_000),
+            (56_000_000, 58_000_000),
+            (58_000_000, 60_000_000),
+        ];
+        // Below MAX(upper_bound) = 60_000_000, but inside the 6M-50M hole.
+        let err = assert_no_default_partition_overflow(&[20_000_000i64], migration_0017_shape)
+            .expect_err("a ledger inside a partition gap must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("20000000"),
+            "error must name the uncovered sequence, got: {msg}"
+        );
+        assert!(
+            msg.contains("create_soroban_partition"),
+            "error must include the remediation hint, got: {msg}"
+        );
+        // Sequences that ARE covered by the same shape must still pass.
+        assert!(
+            assert_no_default_partition_overflow(&[5_999_999i64, 50_000_000], migration_0017_shape)
+                .is_ok(),
+            "covered sequences must not be flagged"
+        );
+    }
+
     /// An empty batch must never trigger the overflow check regardless of the
     /// partition boundary value.
     #[test]
     fn overflow_check_passes_for_empty_batch() {
         assert!(
-            assert_no_default_partition_overflow(&[], 0).is_ok(),
+            assert_no_default_partition_overflow(&[], &[]).is_ok(),
             "empty batch must never trigger overflow"
         );
     }
@@ -1613,7 +1653,7 @@ mod tests {
     #[test]
     fn overflow_error_is_fatal_not_retryable() {
         use trident_common::errors::Severity;
-        let err = assert_no_default_partition_overflow(&[60_000_001i64], 60_000_000)
+        let err = assert_no_default_partition_overflow(&[60_000_001i64], &[(0, 60_000_000)])
             .expect_err("should overflow");
         assert_eq!(
             err.severity(),
@@ -1624,32 +1664,39 @@ mod tests {
         assert!(!err.retryable());
     }
 
-    /// Integration test: `last_named_partition_upper_bound` returns a positive
-    /// value against a real database seeded with the standard migration chain
-    /// (which creates partitions up to ledger 60,000,000).
+    /// Integration test: `named_partition_ranges` returns the seeded partition
+    /// ranges against a real database using the standard migration chain, and
+    /// those ranges expose the gap that migration 0017 leaves behind.
     #[tokio::test]
-    async fn last_named_partition_upper_bound_returns_migration_seed_value() {
-        let Some(db_url) = test_db_url("last_named_partition_upper_bound_returns_migration_seed_value")
+    async fn named_partition_ranges_returns_migration_seed_values() {
+        let Some(db_url) = test_db_url("named_partition_ranges_returns_migration_seed_values")
         else {
             return;
         };
         let pool = PgPool::connect(&db_url).await.unwrap();
 
-        let upper = last_named_partition_upper_bound(&pool)
+        let ranges = named_partition_ranges(&pool)
             .await
             .expect("query must not fail");
 
-        let upper = upper.expect("migrations seed named partitions; result must be Some");
         assert!(
-            upper > 0,
-            "upper bound must be positive (got {upper})"
+            !ranges.is_empty(),
+            "migrations seed named partitions; ranges must not be empty"
         );
-        // Migration 0017 seeds mainnet partitions up to 60,000,000. The exact
-        // value may be higher if additional partitions were added, but it must
-        // be at least the seeded maximum.
+        for (lo, hi) in &ranges {
+            assert!(hi > lo, "each range must be non-empty, got ({lo}, {hi})");
+        }
+        let highest = ranges.iter().map(|&(_, hi)| hi).max().unwrap();
         assert!(
-            upper >= 60_000_000,
-            "upper bound must be at least 60,000,000 (the migration seed value), got {upper}"
+            highest >= 60_000_000,
+            "highest upper bound must be at least 60,000,000, got {highest}"
+        );
+        // The seeded schema is deliberately non-contiguous (0-6M then 50M-60M).
+        // The guard must therefore reject a ledger inside that hole, which a
+        // MAX(upper_bound) check would have accepted.
+        assert!(
+            assert_no_default_partition_overflow(&[20_000_000i64], &ranges).is_err(),
+            "a ledger inside the 6M-50M gap must be rejected"
         );
     }
 
@@ -1667,16 +1714,17 @@ mod tests {
         };
         let pool = PgPool::connect(&db_url).await.unwrap();
 
-        // Get the actual boundary from the DB so this test stays correct even
+        // Get the actual ranges from the DB so this test stays correct even
         // after additional partitions are added.
-        let last_upper = last_named_partition_upper_bound(&pool)
+        let ranges = named_partition_ranges(&pool)
             .await
-            .expect("query must not fail")
-            .expect("seeded partitions must exist");
+            .expect("query must not fail");
+        assert!(!ranges.is_empty(), "seeded partitions must exist");
+        let last_upper = ranges.iter().map(|&(_, hi)| hi).max().unwrap();
 
-        // A sequence exactly at the upper bound would land in DEFAULT.
+        // A sequence exactly at the highest upper bound would land in DEFAULT.
         let overflow_seq = last_upper;
-        let err = assert_no_default_partition_overflow(&[overflow_seq], last_upper)
+        let err = assert_no_default_partition_overflow(&[overflow_seq], &ranges)
             .expect_err("overflow at boundary must be caught");
 
         assert!(

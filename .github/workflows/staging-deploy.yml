@@ -13,7 +13,12 @@ name: Staging Deploy
 on:
   push:
     branches: [dev]
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Skip the deploy instead of failing when staging credentials are absent"
+        type: boolean
+        default: false
 
 concurrency:
   group: staging-deploy
@@ -128,6 +133,7 @@ jobs:
         env:
           HAS_KUBECONFIG: ${{ secrets.STAGING_KUBECONFIG != '' }}
           HAS_DATABASE_URL: ${{ vars.STAGING_DATABASE_URL != '' }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
         run: |
           missing=()
 
@@ -140,11 +146,24 @@ jobs:
           fi
 
           if [ ${#missing[@]} -gt 0 ]; then
-            echo "::notice::Staging deploy skipped — missing credentials: ${missing[*]}. Add them under Settings → Secrets and variables → Actions to enable staging deploys. See docs/deployment.md#staging."
-            echo "configured=false" >> "$GITHUB_OUTPUT"
+            # Issue #395: a deploy that did not happen must not report green.
+            # Skipping silently is only acceptable when a human explicitly asked
+            # for it via the workflow_dispatch dry_run input.
+            if [ "${DRY_RUN}" = "true" ]; then
+              echo "::notice::Staging deploy skipped (dry_run) — missing credentials: ${missing[*]}."
+              echo "configured=false" >> "$GITHUB_OUTPUT"
+              echo "Staging deploy SKIPPED (dry_run): missing ${missing[*]}" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "::error::Required staging credentials are missing: ${missing[*]}"
+              echo "::error::Add them under Settings → Secrets and variables → Actions. See docs/deployment.md#staging."
+              echo "::error::To skip intentionally, re-run via workflow_dispatch with dry_run=true."
+              echo "Staging deploy FAILED: missing ${missing[*]}" >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
           else
             echo "configured=true" >> "$GITHUB_OUTPUT"
             echo "✓ All required staging secrets are configured"
+            echo "Staging deploy PROCEEDING: all required credentials present" >> "$GITHUB_STEP_SUMMARY"
           fi
 
   # ---------------------------------------------------------------------------

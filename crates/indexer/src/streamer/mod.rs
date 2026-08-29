@@ -510,32 +510,30 @@ impl Streamer {
         let cursor_at_start = *cursor;
         let lag_at_start = self.last_chain_tip.saturating_sub(cursor_at_start) as i64;
 
-        // Query the last named partition boundary once per poll cycle so every
-        // insert in this cycle can check whether it would overflow into the
-        // DEFAULT catch-all partition (issue #525). Failure here is fatal:
-        // if we cannot determine the partition boundary we must not ingest.
-        let last_partition_upper = match db::last_named_partition_upper_bound(&self.db).await {
-            Ok(Some(upper)) => {
-                let lookahead = upper.saturating_sub(*cursor as i64);
-                metrics::set_partition_lookahead(lookahead);
-                upper
+        // Query the named partition ranges once per poll cycle so every insert
+        // in this cycle can check whether it would fall outside them and land
+        // in the DEFAULT catch-all partition (issue #525).
+        let partition_ranges = match db::named_partition_ranges(&self.db).await {
+            Ok(ranges) if !ranges.is_empty() => {
+                let highest = ranges.iter().map(|&(_, hi)| hi).max().unwrap_or(0);
+                metrics::set_partition_lookahead(highest.saturating_sub(*cursor as i64));
+                ranges
             }
-            Ok(None) => {
-                // No named partitions exist at all — every insert would land in
-                // DEFAULT. Treat this as fatal: the table is misconfigured.
+            Ok(_) => {
+                // No named partitions at all — every insert would land in
+                // DEFAULT. This is a real misconfiguration, not a blip.
                 return Err(TridentError::config(anyhow::anyhow!(
-                    "partition exhaustion: soroban_events has no named range partitions. \
-                     All inserts would land in soroban_events_default. \
-                     Run `SELECT create_soroban_partition(0, 2000000);` to create the \
-                     first partition (issue #525)."
+                    "partition exhaustion: soroban_events has no named range partitions.                      All inserts would land in soroban_events_default.                      Run `SELECT create_soroban_partition(0, 2000000);` to create the                      first partition (issue #525)."
                 )));
             }
             Err(e) => {
-                return Err(TridentError::config(
-                    anyhow::Error::new(e).context(
-                        "could not query soroban_events partition boundary (issue #525)",
-                    ),
-                ));
+                // A failed catalogue query is usually a transient connection
+                // problem. Returning a config error here would classify it as
+                // Fatal and halt ingestion permanently, so surface it as the
+                // storage error it is and let the caller's retry path handle it.
+                return Err(TridentError::storage(anyhow::Error::new(e).context(
+                    "could not query soroban_events partition ranges (issue #525)",
+                )));
             }
         };
         let retry_strategy = ExponentialBackoff::from_millis(200)
@@ -797,7 +795,7 @@ impl Streamer {
                     .iter()
                     .map(|e| e.ledger_sequence as i64)
                     .collect();
-                db::assert_no_default_partition_overflow(&ledger_sequences, last_partition_upper)?;
+                db::assert_no_default_partition_overflow(&ledger_sequences, &partition_ranges)?;
             }
 
             // One transaction for the whole page: events, cursor, and ledger

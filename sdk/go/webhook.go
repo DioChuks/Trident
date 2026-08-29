@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -54,8 +55,11 @@ func (e *WebhookVerificationError) Error() string {
 // both during rotation so you have time to swap your key.
 func VerifyWebhookSignature(body []byte, signature, timestamp, secret string, toleranceSecs int64) error {
 	// 1. Parse and range-check the timestamp.
-	var ts int64
-	if _, err := fmt.Sscanf(timestamp, "%d", &ts); err != nil || ts <= 0 {
+	// strconv.ParseInt, not fmt.Sscanf: Sscanf stops at the first non-digit and
+	// reports success, so "1700000000junk" would parse as 1700000000. The other
+	// SDKs reject trailing garbage, and this one must agree with them.
+	ts, err := strconv.ParseInt(timestamp, 10, 64)
+	if err != nil || ts <= 0 {
 		return &WebhookVerificationError{Reason: "X-Trident-Timestamp is missing or not a valid Unix second"}
 	}
 	if toleranceSecs > 0 {

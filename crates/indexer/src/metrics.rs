@@ -222,9 +222,12 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     gauge!(HEARTBEAT_TIMESTAMP).set(0.0);
     gauge!(DB_POOL_SIZE).set(0.0);
     gauge!(DB_POOL_IDLE_CONNECTIONS).set(0.0);
-    // Seed with i64::MAX so the gauge is always present from the first scrape.
-    // The real value is written after the first poll cycle.
-    gauge!(PARTITION_LOOKAHEAD_LEDGERS).set(i64::MAX as f64);
+    // Seed at 0 so the gauge is present from the first scrape and fails safe.
+    // Seeding at i64::MAX would report infinite headroom, so an indexer that
+    // crash-loops before its first successful poll would leave both partition
+    // alerts resolved — silence in exactly the case that needs paging. The
+    // real value is written after the first poll cycle.
+    gauge!(PARTITION_LOOKAHEAD_LEDGERS).set(0.0);
 
     // Histograms render nothing at all until they observe a value — not even
     // a HELP/TYPE header — so an indexer that has not yet made an RPC call

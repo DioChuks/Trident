@@ -33,12 +33,12 @@ import (
 const maxWebhookAttempts = 5
 
 type webhookSubscription struct {
-	ID              string     `json:"id"`
-	APIKeyID        string     `json:"apiKeyId,omitempty"`
-	ContractID      string     `json:"contractId"`
-	Topic0          *string    `json:"topic0,omitempty"`
-	TargetURL       string     `json:"targetUrl"`
-	Secret          string     `json:"secret,omitempty"`
+	ID         string  `json:"id"`
+	APIKeyID   string  `json:"apiKeyId,omitempty"`
+	ContractID string  `json:"contractId"`
+	Topic0     *string `json:"topic0,omitempty"`
+	TargetURL  string  `json:"targetUrl"`
+	Secret     string  `json:"secret,omitempty"`
 	// SecondarySecret is the previous secret kept during a rotation overlap
 	// window (issue #452). Deliveries signed with either the primary Secret or
 	// this field verify successfully, allowing receivers to drain their queue
@@ -127,18 +127,30 @@ func signWebhookPayload(timestamp int64, body string, secret string) string {
 // with either the new or the previous secret until they have rotated their
 // verification key (issue #452).
 func verifyWebhookSignature(timestamp int64, body string, signature string, secret string) bool {
-	if !strings.Contains(signature, "sha256=") {
+	// At most two signatures are ever sent: the current secret and, during a
+	// rotation overlap, the previous one. Bounding the token count stops a
+	// caller from forcing an unbounded number of HMAC comparisons per request.
+	const maxSignatureTokens = 2
+
+	tokens := strings.Fields(signature)
+	if len(tokens) == 0 || len(tokens) > maxSignatureTokens {
 		return false
 	}
+
 	expected := "sha256=" + signWebhookPayload(timestamp, body, secret)
-	// Compare each space-separated token; use ConstantTimeCompare on each to
-	// avoid leaking timing information about which token matched.
-	for _, token := range strings.Fields(signature) {
+	matched := false
+	for _, token := range tokens {
+		// Every token must be well-formed; a junk prefix is not a signature.
+		if !strings.HasPrefix(token, "sha256=") {
+			return false
+		}
+		// No early return: comparing all tokens keeps the work independent of
+		// which one matched.
 		if subtle.ConstantTimeCompare([]byte(token), []byte(expected)) == 1 {
-			return true
+			matched = true
 		}
 	}
-	return false
+	return matched
 }
 
 func newDB() (*sql.DB, error) {
@@ -236,10 +248,30 @@ func startWebhookWorker(ctx context.Context, db *sql.DB, redisClient *redis.Clie
 	}()
 }
 
+// webhookSecretOverlapHours returns how long a rotated (secondary) webhook
+// secret stays valid, from WEBHOOK_SECRET_OVERLAP_HOURS. Defaults to 24 hours;
+// a non-positive or unparseable value falls back to the default rather than
+// disabling expiry, since never expiring is the unsafe direction.
+func webhookSecretOverlapHours() int {
+	const defaultOverlapHours = 24
+	raw := os.Getenv("WEBHOOK_SECRET_OVERLAP_HOURS")
+	if raw == "" {
+		return defaultOverlapHours
+	}
+	hours, err := strconv.Atoi(raw)
+	if err != nil || hours <= 0 {
+		slog.Warn("invalid WEBHOOK_SECRET_OVERLAP_HOURS; using default",
+			"value", raw, "default", defaultOverlapHours)
+		return defaultOverlapHours
+	}
+	return hours
+}
+
 func startWebhookCleanupJob(ctx context.Context, db *sql.DB) {
 	if db == nil {
 		return
 	}
+	overlapHours := webhookSecretOverlapHours()
 	go func() {
 		ticker := time.NewTicker(1 * time.Hour)
 		defer ticker.Stop()
@@ -250,6 +282,18 @@ func startWebhookCleanupJob(ctx context.Context, db *sql.DB) {
 			case <-ticker.C:
 				if _, err := db.ExecContext(ctx, `DELETE FROM webhook_deliveries WHERE delivered_at < NOW() - INTERVAL '7 days'`); err != nil {
 					slog.Warn("webhook cleanup failed", "err", err)
+				}
+				// Expire rotated secrets once the overlap window has passed
+				// (issue #452). Without this the previous secret stays valid
+				// forever, so rotating a compromised secret never actually
+				// revokes it and the rotation provides no security benefit.
+				if _, err := db.ExecContext(ctx, `
+					UPDATE webhook_subscriptions
+					SET secondary_secret = NULL
+					WHERE secondary_secret IS NOT NULL
+					  AND updated_at < NOW() - make_interval(hours => $1)
+				`, overlapHours); err != nil {
+					slog.Warn("webhook secret overlap expiry failed", "err", err)
 				}
 			}
 		}
@@ -526,9 +570,11 @@ func listWebhooksHandler(db *sql.DB) http.HandlerFunc {
 			if pausedAt.Valid {
 				sub.PausedAt = &pausedAt.Time
 			}
-			if secondarySecret.Valid {
-				sub.SecondarySecret = &secondarySecret.String
-			}
+			// secondary_secret is deliberately not copied onto the response.
+			// It is only needed by the delivery worker to sign during a
+			// rotation overlap; returning it here would republish a secret the
+			// caller is meant to be retiring. The rotate endpoint returns it
+			// once, at rotation time.
 			subscriptions = append(subscriptions, sub)
 		}
 		writeJSON(w, http.StatusOK, subscriptions)
@@ -864,12 +910,20 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 func rotateWebhookSecretHandler(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("id")
-		if id == "" {
-			http.Error(w, "missing webhook id", http.StatusBadRequest)
+		if verr := validation.ValidateUUID("id", id); verr != nil {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
 			return
 		}
 		if db == nil {
-			http.Error(w, "database unavailable", http.StatusServiceUnavailable)
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "database unavailable")
+			return
+		}
+		// Rotation must be scoped to the caller's API key. Without this an
+		// authenticated caller could rotate any other tenant's webhook secret
+		// and read both the old and new values back.
+		apiKeyID, err := resolveAPIKeyID(r.Context(), db, r)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 		newSecret, err := generateWebhookSecret()
@@ -877,34 +931,25 @@ func rotateWebhookSecretHandler(db *sql.DB) http.HandlerFunc {
 			http.Error(w, "failed to generate new secret", http.StatusInternalServerError)
 			return
 		}
-		// Demote current primary to secondary, promote new secret to primary.
+		// Demote the current primary to secondary and promote the new secret in
+		// one statement. RETURNING secondary_secret reads the post-update value,
+		// which is exactly the secret that was primary before this call.
 		var previousSecret string
 		err = db.QueryRowContext(r.Context(), `
 			UPDATE webhook_subscriptions
 			SET secondary_secret = secret,
-			    secret           = $2,
+			    secret           = $3,
 			    updated_at       = NOW()
-			WHERE id = $1
-			RETURNING (SELECT secret FROM webhook_subscriptions WHERE id = $1)
-		`, id, newSecret).Scan(&previousSecret)
+			WHERE id = $1 AND api_key_id = $2
+			RETURNING secondary_secret
+		`, id, apiKeyID, newSecret).Scan(&previousSecret)
 		if errors.Is(err, sql.ErrNoRows) {
 			http.NotFound(w, r)
 			return
 		}
 		if err != nil {
-			// Fallback: fetch then update (handles databases without RETURNING on UPDATE).
-			if err2 := db.QueryRowContext(r.Context(), `SELECT secret FROM webhook_subscriptions WHERE id = $1`, id).Scan(&previousSecret); err2 != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			if _, err2 := db.ExecContext(r.Context(), `
-				UPDATE webhook_subscriptions
-				SET secondary_secret = $2, secret = $3, updated_at = NOW()
-				WHERE id = $1
-			`, id, previousSecret, newSecret); err2 != nil {
-				http.Error(w, err2.Error(), http.StatusInternalServerError)
-				return
-			}
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"id":             id,
