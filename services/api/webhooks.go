@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"database/sql"
@@ -32,15 +33,20 @@ import (
 const maxWebhookAttempts = 5
 
 type webhookSubscription struct {
-	ID         string     `json:"id"`
-	APIKeyID   string     `json:"apiKeyId,omitempty"`
-	ContractID string     `json:"contractId"`
-	Topic0     *string    `json:"topic0,omitempty"`
-	TargetURL  string     `json:"targetUrl"`
-	Secret     string     `json:"secret,omitempty"`
-	CreatedAt  time.Time  `json:"createdAt"`
-	PausedAt   *time.Time `json:"pausedAt,omitempty"`
-	Network    string     `json:"network"`
+	ID              string     `json:"id"`
+	APIKeyID        string     `json:"apiKeyId,omitempty"`
+	ContractID      string     `json:"contractId"`
+	Topic0          *string    `json:"topic0,omitempty"`
+	TargetURL       string     `json:"targetUrl"`
+	Secret          string     `json:"secret,omitempty"`
+	// SecondarySecret is the previous secret kept during a rotation overlap
+	// window (issue #452). Deliveries signed with either the primary Secret or
+	// this field verify successfully, allowing receivers to drain their queue
+	// and swap their verification key before the old one expires.
+	SecondarySecret *string    `json:"secondarySecret,omitempty"`
+	CreatedAt       time.Time  `json:"createdAt"`
+	PausedAt        *time.Time `json:"pausedAt,omitempty"`
+	Network         string     `json:"network"`
 }
 
 type webhookEvent struct {
@@ -113,12 +119,26 @@ func signWebhookPayload(timestamp int64, body string, secret string) string {
 
 // verifyWebhookSignature checks the HMAC-SHA256 signature over
 // "${timestamp}.${body}" against the X-Trident-Signature header value.
+//
+// The header may contain a single signature ("sha256=<hex>") or two
+// space-separated signatures during a rotation overlap window
+// ("sha256=<new> sha256=<old>"). The verification passes if ANY of the
+// supplied signatures matches — this lets receivers accept deliveries signed
+// with either the new or the previous secret until they have rotated their
+// verification key (issue #452).
 func verifyWebhookSignature(timestamp int64, body string, signature string, secret string) bool {
-	if !strings.HasPrefix(signature, "sha256=") {
+	if !strings.Contains(signature, "sha256=") {
 		return false
 	}
 	expected := "sha256=" + signWebhookPayload(timestamp, body, secret)
-	return subtle.ConstantTimeCompare([]byte(signature), []byte(expected)) == 1
+	// Compare each space-separated token; use ConstantTimeCompare on each to
+	// avoid leaking timing information about which token matched.
+	for _, token := range strings.Fields(signature) {
+		if subtle.ConstantTimeCompare([]byte(token), []byte(expected)) == 1 {
+			return true
+		}
+	}
+	return false
 }
 
 func newDB() (*sql.DB, error) {
@@ -270,7 +290,7 @@ func processWebhookEvent(ctx context.Context, db *sql.DB, event webhookEvent) er
 		return nil
 	}
 	rows, err := db.QueryContext(ctx, `
-		SELECT id, api_key_id, contract_id, topic0, target_url, secret, created_at, paused_at, network
+		SELECT id, api_key_id, contract_id, topic0, target_url, secret, secondary_secret, created_at, paused_at, network
 		FROM webhook_subscriptions
 		WHERE contract_id = $1
 		  AND paused_at IS NULL
@@ -287,7 +307,8 @@ func processWebhookEvent(ctx context.Context, db *sql.DB, event webhookEvent) er
 		var sub webhookSubscription
 		var topic0 sql.NullString
 		var pausedAt sql.NullTime
-		if err := rows.Scan(&sub.ID, &sub.APIKeyID, &sub.ContractID, &topic0, &sub.TargetURL, &sub.Secret, &sub.CreatedAt, &pausedAt, &sub.Network); err != nil {
+		var secondarySecret sql.NullString
+		if err := rows.Scan(&sub.ID, &sub.APIKeyID, &sub.ContractID, &topic0, &sub.TargetURL, &sub.Secret, &secondarySecret, &sub.CreatedAt, &pausedAt, &sub.Network); err != nil {
 			return err
 		}
 		if topic0.Valid {
@@ -295,6 +316,9 @@ func processWebhookEvent(ctx context.Context, db *sql.DB, event webhookEvent) er
 		}
 		if pausedAt.Valid {
 			sub.PausedAt = &pausedAt.Time
+		}
+		if secondarySecret.Valid {
+			sub.SecondarySecret = &secondarySecret.String
 		}
 		subs = append(subs, sub)
 	}
@@ -405,6 +429,15 @@ func performWebhookDelivery(ctx context.Context, sub webhookSubscription, event 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Trident-Timestamp", strconv.FormatInt(now, 10))
 	req.Header.Set("X-Trident-Signature", "sha256="+signWebhookPayload(now, string(payload), sub.Secret))
+	// During a rotation overlap window both the new primary and the old
+	// secondary signature are sent, space-separated. Receivers MUST accept
+	// either one, allowing them to drain in-flight deliveries while they swap
+	// their verification key to the new primary (issue #452).
+	if sub.SecondarySecret != nil && *sub.SecondarySecret != "" {
+		primary := "sha256=" + signWebhookPayload(now, string(payload), sub.Secret)
+		secondary := "sha256=" + signWebhookPayload(now, string(payload), *sub.SecondarySecret)
+		req.Header.Set("X-Trident-Signature", primary+" "+secondary)
+	}
 
 	client := newWebhookDeliveryHTTPClient()
 	resp, err := client.Do(req)
@@ -466,7 +499,7 @@ func listWebhooksHandler(db *sql.DB) http.HandlerFunc {
 			return
 		}
 		rows, err := db.QueryContext(r.Context(), `
-			SELECT id, api_key_id, contract_id, topic0, target_url, secret, created_at, paused_at, network
+			SELECT id, api_key_id, contract_id, topic0, target_url, secret, secondary_secret, created_at, paused_at, network
 			FROM webhook_subscriptions
 			WHERE api_key_id = $1
 			ORDER BY created_at DESC
@@ -482,7 +515,8 @@ func listWebhooksHandler(db *sql.DB) http.HandlerFunc {
 			var sub webhookSubscription
 			var topic0 sql.NullString
 			var pausedAt sql.NullTime
-			if err := rows.Scan(&sub.ID, &sub.APIKeyID, &sub.ContractID, &topic0, &sub.TargetURL, &sub.Secret, &sub.CreatedAt, &pausedAt, &sub.Network); err != nil {
+			var secondarySecret sql.NullString
+			if err := rows.Scan(&sub.ID, &sub.APIKeyID, &sub.ContractID, &topic0, &sub.TargetURL, &sub.Secret, &secondarySecret, &sub.CreatedAt, &pausedAt, &sub.Network); err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
@@ -491,6 +525,9 @@ func listWebhooksHandler(db *sql.DB) http.HandlerFunc {
 			}
 			if pausedAt.Valid {
 				sub.PausedAt = &pausedAt.Time
+			}
+			if secondarySecret.Valid {
+				sub.SecondarySecret = &secondarySecret.String
 			}
 			subscriptions = append(subscriptions, sub)
 		}
@@ -529,7 +566,11 @@ func createWebhookHandler(db *sql.DB) http.HandlerFunc {
 		if req.Network == "" {
 			req.Network = "testnet"
 		}
-		secret := generateWebhookSecret()
+		secret, err := generateWebhookSecret()
+		if err != nil {
+			http.Error(w, "failed to generate webhook secret", http.StatusInternalServerError)
+			return
+		}
 		apiKeyID, err := resolveAPIKeyID(r.Context(), db, r)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -740,10 +781,11 @@ func replayDeadLetterHandler(db *sql.DB) http.HandlerFunc {
 		var sub webhookSubscription
 		var topic0 sql.NullString
 		var pausedAt sql.NullTime
+		var secondarySecret sql.NullString
 		err = db.QueryRowContext(r.Context(), `
-			SELECT id, api_key_id, contract_id, topic0, target_url, secret, created_at, paused_at, network
+			SELECT id, api_key_id, contract_id, topic0, target_url, secret, secondary_secret, created_at, paused_at, network
 			FROM webhook_subscriptions WHERE id = $1
-		`, subID).Scan(&sub.ID, &sub.APIKeyID, &sub.ContractID, &topic0, &sub.TargetURL, &sub.Secret, &sub.CreatedAt, &pausedAt, &sub.Network)
+		`, subID).Scan(&sub.ID, &sub.APIKeyID, &sub.ContractID, &topic0, &sub.TargetURL, &sub.Secret, &secondarySecret, &sub.CreatedAt, &pausedAt, &sub.Network)
 		if errors.Is(err, sql.ErrNoRows) {
 			http.NotFound(w, r)
 			return
@@ -754,6 +796,9 @@ func replayDeadLetterHandler(db *sql.DB) http.HandlerFunc {
 		}
 		if topic0.Valid {
 			sub.Topic0 = &topic0.String
+		}
+		if secondarySecret.Valid {
+			sub.SecondarySecret = &secondarySecret.String
 		}
 
 		// Load the original event.
@@ -789,14 +834,84 @@ func replayDeadLetterHandler(db *sql.DB) http.HandlerFunc {
 	}
 }
 
-func generateWebhookSecret() string {
-	return fmt.Sprintf("whsec_%d", time.Now().UnixNano())
+func generateWebhookSecret() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generateWebhookSecret: %w", err)
+	}
+	return "whsec_" + hex.EncodeToString(b), nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(payload)
+}
+
+// rotateWebhookSecretHandler handles POST /v1/webhooks/{id}/rotate-secret.
+//
+// Issues a new primary secret, demoting the current one to secondary_secret
+// for the overlap window (issue #452). During the overlap window deliveries
+// are signed with the new primary secret, but receivers may verify against
+// either secret. The secondary is cleared automatically after
+// WEBHOOK_SECRET_OVERLAP_HOURS (default 24) hours by the cleanup job, or on
+// the next rotation.
+//
+// The response body includes both secrets so the caller can record the
+// secondary during the transition:
+//
+//	{"id":"...", "secret":"whsec_<new>", "previousSecret":"whsec_<old>"}
+func rotateWebhookSecretHandler(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+		if id == "" {
+			http.Error(w, "missing webhook id", http.StatusBadRequest)
+			return
+		}
+		if db == nil {
+			http.Error(w, "database unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		newSecret, err := generateWebhookSecret()
+		if err != nil {
+			http.Error(w, "failed to generate new secret", http.StatusInternalServerError)
+			return
+		}
+		// Demote current primary to secondary, promote new secret to primary.
+		var previousSecret string
+		err = db.QueryRowContext(r.Context(), `
+			UPDATE webhook_subscriptions
+			SET secondary_secret = secret,
+			    secret           = $2,
+			    updated_at       = NOW()
+			WHERE id = $1
+			RETURNING (SELECT secret FROM webhook_subscriptions WHERE id = $1)
+		`, id, newSecret).Scan(&previousSecret)
+		if errors.Is(err, sql.ErrNoRows) {
+			http.NotFound(w, r)
+			return
+		}
+		if err != nil {
+			// Fallback: fetch then update (handles databases without RETURNING on UPDATE).
+			if err2 := db.QueryRowContext(r.Context(), `SELECT secret FROM webhook_subscriptions WHERE id = $1`, id).Scan(&previousSecret); err2 != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			if _, err2 := db.ExecContext(r.Context(), `
+				UPDATE webhook_subscriptions
+				SET secondary_secret = $2, secret = $3, updated_at = NOW()
+				WHERE id = $1
+			`, id, previousSecret, newSecret); err2 != nil {
+				http.Error(w, err2.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"id":             id,
+			"secret":         newSecret,
+			"previousSecret": previousSecret,
+		})
+	}
 }
 
 var deliverWebhook = func(ctx context.Context, sub webhookSubscription, event webhookEvent) error {

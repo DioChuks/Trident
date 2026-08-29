@@ -509,6 +509,35 @@ impl Streamer {
         // refreshes it, but the deficit we were working against is this one.
         let cursor_at_start = *cursor;
         let lag_at_start = self.last_chain_tip.saturating_sub(cursor_at_start) as i64;
+
+        // Query the last named partition boundary once per poll cycle so every
+        // insert in this cycle can check whether it would overflow into the
+        // DEFAULT catch-all partition (issue #525). Failure here is fatal:
+        // if we cannot determine the partition boundary we must not ingest.
+        let last_partition_upper = match db::last_named_partition_upper_bound(&self.db).await {
+            Ok(Some(upper)) => {
+                let lookahead = upper.saturating_sub(*cursor as i64);
+                metrics::set_partition_lookahead(lookahead);
+                upper
+            }
+            Ok(None) => {
+                // No named partitions exist at all — every insert would land in
+                // DEFAULT. Treat this as fatal: the table is misconfigured.
+                return Err(TridentError::config(anyhow::anyhow!(
+                    "partition exhaustion: soroban_events has no named range partitions. \
+                     All inserts would land in soroban_events_default. \
+                     Run `SELECT create_soroban_partition(0, 2000000);` to create the \
+                     first partition (issue #525)."
+                )));
+            }
+            Err(e) => {
+                return Err(TridentError::config(
+                    anyhow::Error::new(e).context(
+                        "could not query soroban_events partition boundary (issue #525)",
+                    ),
+                ));
+            }
+        };
         let retry_strategy = ExponentialBackoff::from_millis(200)
             .max_delay(Duration::from_secs(2))
             .take(5);
@@ -753,6 +782,23 @@ impl Streamer {
             // only, so the positional indices in `page_tokens` stay valid
             // (issue #388).
             crate::parser::assign_unique_event_indexes(&mut page_events);
+
+            // Partition boundary guard (issue #525): verify no event in this
+            // page would overflow into soroban_events_default before we touch
+            // the database. Uses the boundary queried at the top of this cycle
+            // so there is no extra round-trip per page.
+            //
+            // This returns TridentError::ConfigError (Severity::Fatal), which
+            // causes the poll loop to halt and log an ERROR rather than
+            // silently retrying — the intended loud-failure behaviour for
+            // partition exhaustion.
+            if !page_events.is_empty() {
+                let ledger_sequences: Vec<i64> = page_events
+                    .iter()
+                    .map(|e| e.ledger_sequence as i64)
+                    .collect();
+                db::assert_no_default_partition_overflow(&ledger_sequences, last_partition_upper)?;
+            }
 
             // One transaction for the whole page: events, cursor, and ledger
             // metadata land together or not at all, so a crash can never leave
