@@ -126,6 +126,29 @@ groups:
             recognise yet.
           runbook_url: "docs/runbooks/alerts.md#tridentindexerparseerrorratehigh"
 
+      # Unexpected ScVal variants (#506). The decoder matches every ScVal
+      # variant exhaustively — a new XDR variant fails compilation, so this
+      # cannot fire for "unknown" types. It fires when a structurally valid
+      # variant that should never appear in an event payload
+      # (ContractInstance / LedgerKeyContractInstance / LedgerKeyNonce) is
+      # decoded from live traffic: the value is stored faithfully, but the
+      # emitting contract deserves a look.
+      - alert: TridentIndexerUnexpectedScValVariant
+        expr: increase(trident_scval_unexpected_variant_total[1h]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: indexer
+        annotations:
+          summary: "Trident decoded {{ $value | humanize }} anomalous ScVal variant(s) in the last hour"
+          description: >
+            An event payload contained an ScVal variant that no well-behaved
+            contract emits (ContractInstance or a ledger-key form). The value
+            was decoded and stored faithfully — never coerced — and the
+            indexer logs name the variant and context. Identify the emitting
+            contract from the logs and review what it is publishing.
+          runbook_url: "docs/runbooks/alerts.md#tridentindexerunexpectedscvalvariant"
+
   # ---------------------------------------------------------------------------
   # Stellar RPC health (#297).
   # ---------------------------------------------------------------------------
