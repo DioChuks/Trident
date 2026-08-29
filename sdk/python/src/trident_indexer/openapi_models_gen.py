@@ -415,7 +415,7 @@ class ContractStorageResponse:
 @dataclass
 class Error:
     code: str
-    """Error code (e.g., INVALID_ARGUMENT, INTERNAL, UNAVAILABLE)"""
+    """Error code (e.g., INVALID_ARGUMENT, INTERNAL, UNAVAILABLE, CONFLICT)"""
 
     message: str
     """Human-readable error message"""
@@ -626,6 +626,31 @@ class IndexerStatsResponse:
         return result
 
 
+@dataclass
+class ListAPIKeysResponse:
+    api_keys: list[APIKeyResponse]
+    has_more: bool
+    """Whether another page is available."""
+
+    next_cursor: str
+    """Opaque cursor for the next page (null if has_more is false)."""
+
+    @staticmethod
+    def from_dict(obj: Any) -> 'ListAPIKeysResponse':
+        assert isinstance(obj, dict)
+        api_keys = from_list(APIKeyResponse.from_dict, obj.get("api_keys"))
+        has_more = from_bool(obj.get("has_more"))
+        next_cursor = from_str(obj.get("next_cursor"))
+        return ListAPIKeysResponse(api_keys, has_more, next_cursor)
+
+    def to_dict(self) -> dict:
+        result: dict = {}
+        result["api_keys"] = from_list(lambda x: to_class(APIKeyResponse, x), self.api_keys)
+        result["has_more"] = from_bool(self.has_more)
+        result["next_cursor"] = from_str(self.next_cursor)
+        return result
+
+
 class LivenessResponseStatus(Enum):
     """Always "ok" while the process is up — no dependency checks."""
 
@@ -814,6 +839,7 @@ class OpenAPIModels:
     error_response: ErrorResponse | None = None
     event_list_response: EventListResponse | None = None
     indexer_stats_response: IndexerStatsResponse | None = None
+    list_api_keys_response: ListAPIKeysResponse | None = None
     liveness_response: LivenessResponse | None = None
     ready_checks: ReadyChecks | None = None
     ready_response: ReadyResponse | None = None
@@ -837,13 +863,14 @@ class OpenAPIModels:
         error_response = from_union([ErrorResponse.from_dict, from_none], obj.get("ErrorResponse"))
         event_list_response = from_union([EventListResponse.from_dict, from_none], obj.get("EventListResponse"))
         indexer_stats_response = from_union([IndexerStatsResponse.from_dict, from_none], obj.get("IndexerStatsResponse"))
+        list_api_keys_response = from_union([ListAPIKeysResponse.from_dict, from_none], obj.get("ListAPIKeysResponse"))
         liveness_response = from_union([LivenessResponse.from_dict, from_none], obj.get("LivenessResponse"))
         ready_checks = from_union([ReadyChecks.from_dict, from_none], obj.get("ReadyChecks"))
         ready_response = from_union([ReadyResponse.from_dict, from_none], obj.get("ReadyResponse"))
         soroban_event = from_union([SorobanEvent.from_dict, from_none], obj.get("SorobanEvent"))
         token_metadata_response = from_union([TokenMetadataResponse.from_dict, from_none], obj.get("TokenMetadataResponse"))
         version_response = from_union([VersionResponse.from_dict, from_none], obj.get("VersionResponse"))
-        return OpenAPIModels(api_key_response, contract_event_field_schema, contract_event_schema, contract_event_schema_response, contract_spec_function, contract_spec_response, contract_stats, contract_stats_response, contract_storage_response, contract_storage_value, error_response, event_list_response, indexer_stats_response, liveness_response, ready_checks, ready_response, soroban_event, token_metadata_response, version_response)
+        return OpenAPIModels(api_key_response, contract_event_field_schema, contract_event_schema, contract_event_schema_response, contract_spec_function, contract_spec_response, contract_stats, contract_stats_response, contract_storage_response, contract_storage_value, error_response, event_list_response, indexer_stats_response, list_api_keys_response, liveness_response, ready_checks, ready_response, soroban_event, token_metadata_response, version_response)
 
     def to_dict(self) -> dict:
         result: dict = {}
@@ -873,6 +900,8 @@ class OpenAPIModels:
             result["EventListResponse"] = from_union([lambda x: to_class(EventListResponse, x), from_none], self.event_list_response)
         if self.indexer_stats_response is not None:
             result["IndexerStatsResponse"] = from_union([lambda x: to_class(IndexerStatsResponse, x), from_none], self.indexer_stats_response)
+        if self.list_api_keys_response is not None:
+            result["ListAPIKeysResponse"] = from_union([lambda x: to_class(ListAPIKeysResponse, x), from_none], self.list_api_keys_response)
         if self.liveness_response is not None:
             result["LivenessResponse"] = from_union([lambda x: to_class(LivenessResponse, x), from_none], self.liveness_response)
         if self.ready_checks is not None:
