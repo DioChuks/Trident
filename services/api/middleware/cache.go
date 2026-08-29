@@ -4,12 +4,27 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/sync/singleflight"
 )
+
+// cacheHandlerTimeout bounds a handler running detached from the winning
+// request's context, so a stalled upstream cannot hold the singleflight key
+// (and every waiter on it) open indefinitely.
+const cacheHandlerTimeout = 30 * time.Second
+
+// cachedResponse is the stored form of a cacheable response. The body alone
+// is not enough: replaying without the handler's headers and status makes the
+// same URL answer differently depending on whether the entry is warm.
+type cachedResponse struct {
+	Status int         `json:"status"`
+	Header http.Header `json:"header"`
+	Body   []byte      `json:"body"`
+}
 
 // cacheStreamEntry mirrors ws.streamEntry: the JSON structure the indexer
 // writes as the "data" field of each Redis Stream message. Duplicated
@@ -116,10 +131,33 @@ func ResponseCache(rdb *redis.Client, ttl time.Duration, keyFn CacheKeyFunc) fun
 			fullKey := fmt.Sprintf("respcache:v%s:%s", version, key)
 
 			if cached, err := rdb.Get(r.Context(), fullKey).Result(); err == nil {
-				w.Header().Set("Content-Type", "application/json")
-				w.Header().Set("X-Cache", "HIT")
-				_, _ = w.Write([]byte(cached))
-				return
+				// Replay the stored headers and status, not just the body.
+				// Storing the body alone meant every header the handler set
+				// (Cache-Control, ETag, anything route-specific) appeared on
+				// the MISS and was silently gone once the entry was warm — the
+				// same URL answering differently depending on cache state.
+				var rec cachedResponse
+				if jsonErr := json.Unmarshal([]byte(cached), &rec); jsonErr == nil {
+					for k, vv := range rec.Header {
+						for _, v := range vv {
+							w.Header().Add(k, v)
+						}
+					}
+					if w.Header().Get("Content-Type") == "" {
+						w.Header().Set("Content-Type", "application/json")
+					}
+					w.Header().Set("X-Cache", "HIT")
+					status := rec.Status
+					if status == 0 {
+						status = http.StatusOK
+					}
+					w.WriteHeader(status)
+					_, _ = w.Write(rec.Body)
+					return
+				}
+				// A malformed entry is treated as a miss: re-executing costs
+				// a query, serving garbage costs correctness.
+				slog.WarnContext(r.Context(), "responsecache: malformed cache entry; re-executing", "key", fullKey)
 			}
 
 			// singleflight.Do's function runs on whichever goroutine's call
@@ -127,13 +165,34 @@ func ResponseCache(rdb *redis.Client, ttl time.Duration, keyFn CacheKeyFunc) fun
 			// its return value directly, never re-executing next.
 			result, _, _ := group.Do(fullKey, func() (any, error) {
 				capture := newCaptureWriter()
-				next.ServeHTTP(capture, r)
+
+				// Run the handler on a context detached from the winning
+				// request's cancellation. Without this, if the goroutine that
+				// happened to win the race has its client disconnect
+				// mid-flight, the handler aborts and EVERY waiter receives
+				// that aborted response — unrelated healthy clients failing
+				// because a stranger hung up. Only the values (auth, request
+				// id, network) are carried over, not the cancellation.
+				//
+				// The 30s ceiling keeps a detached handler from outliving the
+				// request set that is waiting on it.
+				runCtx, cancel := context.WithTimeout(
+					context.WithoutCancel(r.Context()), cacheHandlerTimeout)
+				defer cancel()
+
+				next.ServeHTTP(capture, r.WithContext(runCtx))
 				if capture.statusCode == http.StatusOK {
 					// context.Background(): this write must complete even if
 					// the request that happened to win the singleflight race
 					// has its own context cancelled (client disconnect)
 					// before the waiting callers have read the result.
-					_ = rdb.Set(context.Background(), fullKey, capture.body.Bytes(), ttl).Err()
+					if data, err := json.Marshal(cachedResponse{
+						Status: capture.statusCode,
+						Header: capture.header,
+						Body:   capture.body.Bytes(),
+					}); err == nil {
+						_ = rdb.Set(context.Background(), fullKey, data, ttl).Err()
+					}
 				}
 				return capture, nil
 			})
