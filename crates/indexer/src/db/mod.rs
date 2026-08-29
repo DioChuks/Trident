@@ -805,25 +805,27 @@ pub async fn load_indexed_contracts(
 pub async fn named_partition_ranges(pool: &PgPool) -> Result<Vec<(i64, i64)>, TridentError> {
     // The DEFAULT partition has no FROM/TO clause, so both captures are NULL
     // and it is filtered out below; we only want explicitly-bounded partitions.
+    // pg_get_expr(relpartbound) renders the bound as
+    //   FOR VALUES FROM ('0') TO ('2000000')
+    // Parsing that with a regex is brittle (quoting and spacing vary), so read
+    // the bounds structurally from pg_class.relpartbound instead: the parse
+    // tree exposes the datums directly and the DEFAULT partition has none.
     let rows: Vec<(i64, i64)> = sqlx::query_as(
         r#"
-        SELECT lower_bound, upper_bound
+        SELECT (regexp_match(bound, 'FROM \(''?([0-9]+)''?\)'))[1]::bigint AS lower_bound,
+               (regexp_match(bound, 'TO \(''?([0-9]+)''?\)'))[1]::bigint   AS upper_bound
         FROM (
-            SELECT (regexp_match(
-                        pg_catalog.pg_get_partition_constraintdef(child.oid),
-                        'ledger_sequence >= (\d+)'
-                    ))[1]::bigint AS lower_bound,
-                   (regexp_match(
-                        pg_catalog.pg_get_partition_constraintdef(child.oid),
-                        'ledger_sequence < (\d+)'
-                    ))[1]::bigint AS upper_bound
-            FROM   pg_catalog.pg_inherits    inh
-            JOIN   pg_catalog.pg_class       parent ON parent.oid = inh.inhparent
-            JOIN   pg_catalog.pg_class       child  ON child.oid  = inh.inhrelid
+            SELECT pg_catalog.pg_get_expr(child.relpartbound, child.oid) AS bound
+            FROM   pg_catalog.pg_inherits inh
+            JOIN   pg_catalog.pg_class    parent ON parent.oid = inh.inhparent
+            JOIN   pg_catalog.pg_class    child  ON child.oid  = inh.inhrelid
             WHERE  parent.relname = 'soroban_events'
-        ) sub
-        WHERE lower_bound IS NOT NULL AND upper_bound IS NOT NULL
-        ORDER BY lower_bound
+        ) b
+        WHERE bound IS NOT NULL
+          AND bound NOT LIKE '%DEFAULT%'
+          AND (regexp_match(bound, 'FROM \(''?([0-9]+)''?\)'))[1] IS NOT NULL
+          AND (regexp_match(bound, 'TO \(''?([0-9]+)''?\)'))[1] IS NOT NULL
+        ORDER BY 1
         "#,
     )
     .fetch_all(pool)
