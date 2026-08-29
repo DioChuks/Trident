@@ -4,6 +4,10 @@ info:
   description: |
     Real-time indexing and event querying for Soroban contract events.
 
+    ## API Stability & Compatibility Promise
+
+    The `/v1/` REST API surface is **frozen and stable**. For the complete backward-compatibility guarantees, deprecation lifecycle, and versioning rules, see the [API Stability Policy](https://github.com/Telocel-Labs/Trident/blob/dev/docs/API_STABILITY.md).
+
     ## Request validation
 
     Every endpoint validates its parameters before doing any work and answers a
