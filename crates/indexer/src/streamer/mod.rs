@@ -503,6 +503,12 @@ impl Streamer {
     /// Returns the total number of events processed in this cycle.
     async fn poll_once(&mut self, cursor: &mut u64) -> Result<usize, TridentError> {
         let poll_start = Instant::now();
+        // Cursor and lag as this cycle begins, so catch-up throughput can be
+        // measured over the cycle (issue #420). `last_chain_tip` is the tip
+        // observed by the previous cycle; the current cycle's first RPC page
+        // refreshes it, but the deficit we were working against is this one.
+        let cursor_at_start = *cursor;
+        let lag_at_start = self.last_chain_tip.saturating_sub(cursor_at_start) as i64;
         let retry_strategy = ExponentialBackoff::from_millis(200)
             .max_delay(Duration::from_secs(2))
             .take(5);
@@ -671,19 +677,38 @@ impl Streamer {
                             "value": &raw.value,
                         }))
                         .unwrap_or_else(|_| "{}".to_string());
-                        if let Err(db_err) = db::insert_parse_error(
-                            &self.db,
-                            ledger_seq,
-                            event_idx,
-                            &raw_payload,
-                            &e.to_string(),
-                        )
+                        // Retry dead-letter insert with bounded backoff so a
+                        // transient DB hiccup does not lose the audit record
+                        // (issue #414).
+                        let db = self.db.clone();
+                        let payload = raw_payload.clone();
+                        let errmsg = e.to_string();
+                        let dead_letter_strategy = ExponentialBackoff::from_millis(100)
+                            .max_delay(Duration::from_secs(1))
+                            .take(3);
+                        if let Err(db_err) = Retry::start(dead_letter_strategy, || {
+                            let db = db.clone();
+                            let payload = payload.clone();
+                            let errmsg = errmsg.clone();
+                            async move {
+                                db::insert_parse_error(
+                                    &db, ledger_seq, event_idx, &payload, &errmsg,
+                                )
+                                .await
+                            }
+                        })
                         .await
                         {
                             tracing::error!(
                                 error = %db_err,
-                                "Failed to record parse error in database"
+                                "Failed to record parse error in database after retries"
                             );
+                        } else {
+                            // Only count a dead-letter once the row is durably
+                            // recorded (issue #414). Incrementing on the failure
+                            // path instead would make the alert fire for events
+                            // that were never actually captured for replay.
+                            metrics::record_dead_lettered();
                         }
                         skipped_in_page += 1;
                     }
@@ -920,6 +945,16 @@ impl Streamer {
         // Non-fatal: log on failure so a bad health write doesn't stop indexing.
         let poll_duration = poll_start.elapsed();
         metrics::record_poll_duration(poll_duration.as_secs_f64());
+
+        // Catch-up throughput for this cycle (issue #420). Published only while
+        // meaningfully behind the tip — see `set_catchup_rates` — so the gauges
+        // describe backfill speed rather than steady-state tip-following.
+        metrics::set_catchup_rates(
+            cursor.saturating_sub(cursor_at_start),
+            total as u64,
+            poll_duration.as_secs_f64(),
+            lag_at_start,
+        );
         if let Err(e) =
             db::update_health_stats(&self.db, *cursor as i64, total as i32, poll_duration).await
         {

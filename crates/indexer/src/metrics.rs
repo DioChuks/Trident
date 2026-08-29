@@ -26,6 +26,13 @@ pub const LEDGER_LAG_SECONDS_ESTIMATED: &str = "trident_indexer_ledger_lag_secon
 pub const EVENTS_TOTAL: &str = "trident_indexer_events_total";
 pub const EVENTS_SKIPPED_TOTAL: &str = "trident_indexer_events_skipped_total";
 pub const PARSE_ERRORS_TOTAL: &str = "trident_indexer_parse_errors_total";
+
+/// Incremented when an event exhausts its retry budget and is written to the
+/// parse-error (dead-letter) table so the poll can advance past it (issue
+/// #414). Distinct from PARSE_ERRORS_TOTAL, which counts every parse failure
+/// including ones that later succeed on retry: this counter only moves when an
+/// event is actually abandoned, which is what an alert should fire on.
+pub const DEAD_LETTERED_TOTAL: &str = "trident_indexer_dead_lettered_total";
 pub const POLL_DURATION_SECONDS: &str = "trident_indexer_poll_duration_seconds";
 pub const POLL_ERRORS_TOTAL: &str = "trident_indexer_poll_errors_total";
 pub const RPC_RETRIES_TOTAL: &str = "trident_indexer_rpc_retries_total";
@@ -33,6 +40,10 @@ pub const EFFECTIVE_POLL_INTERVAL_MS: &str = "trident_indexer_effective_poll_int
 pub const RPC_TIMEOUTS_TOTAL: &str = "trident_indexer_rpc_timeouts_total";
 pub const RPC_ACTIVE_ENDPOINT: &str = "trident_indexer_rpc_active_endpoint";
 pub const RPC_FAILOVERS_TOTAL: &str = "trident_indexer_rpc_failovers_total";
+/// Count of ScVal values that hit the catch-all / debug-format fallback in
+/// `scval_to_string` or `scval_to_json` (issue #415). A high rate means the
+/// indexer is encountering Soroban types it cannot render as structured data.
+pub const UNHANDLED_SCVARIANT_TOTAL: &str = "trident_indexer_unhandled_scvariant_total";
 pub const OUTBOX_BACKLOG: &str = "trident_indexer_outbox_backlog";
 pub const OUTBOX_PUBLISHED_TOTAL: &str = "trident_indexer_outbox_published_total";
 pub const OUTBOX_PUBLISH_FAILURES_TOTAL: &str = "trident_indexer_outbox_publish_failures_total";
@@ -58,6 +69,20 @@ pub const RPC_HEALTH_SCORE: &str = "trident_rpc_health_score";
 /// Indexer's own Postgres pool, documented in docs/metrics-catalog.md.
 pub const DB_POOL_SIZE: &str = "trident_indexer_db_pool_size";
 pub const DB_POOL_IDLE_CONNECTIONS: &str = "trident_indexer_db_pool_idle_connections";
+/// Backfill rate in ledgers per second, measured over each poll cycle that
+/// made forward progress while behind the chain tip (issue #420).
+///
+/// This is the production-observable form of the catch-up benchmark: a cold
+/// start or a recovery from an outage can be watched live rather than only
+/// reproduced offline. It is published only while catching up — see
+/// [`set_catchup_rates`] — so a caught-up indexer polling one ledger every few
+/// seconds does not drag the reported rate toward zero and make a healthy
+/// indexer look slow.
+pub const CATCHUP_LEDGERS_PER_SECOND: &str = "trident_indexer_catchup_ledgers_per_second";
+/// Backfill rate in events per second, measured over the same window as
+/// [`CATCHUP_LEDGERS_PER_SECOND`] (issue #420). Ledgers/sec alone hides the
+/// binding constraint: a sparse range moves fast in ledgers and slow in events.
+pub const CATCHUP_EVENTS_PER_SECOND: &str = "trident_indexer_catchup_events_per_second";
 
 /// Install the global Prometheus recorder and start serving `/metrics` on
 /// `port`. Must be called once, before the streamer starts recording.
@@ -122,6 +147,10 @@ pub fn install(port: u16) -> Result<(), TridentError> {
         OUTBOX_PUBLISH_FAILURES_TOTAL,
         "Outbox publish attempts that failed (issue #200)"
     );
+    describe_counter!(
+        UNHANDLED_SCVARIANT_TOTAL,
+        "ScVal values that hit the debug-format fallback (issue #415)"
+    );
     describe_gauge!(
         HEARTBEAT_TIMESTAMP,
         "Unix timestamp (seconds) of the most recent completed poll cycle (#218)"
@@ -146,6 +175,14 @@ pub fn install(port: u16) -> Result<(), TridentError> {
         RPC_HEALTH_SCORE,
         "Health score (0-100) for each RPC endpoint (multi-RPC failover)"
     );
+    describe_gauge!(
+        CATCHUP_LEDGERS_PER_SECOND,
+        "Backfill rate in ledgers/sec while behind the chain tip (issue #420)"
+    );
+    describe_gauge!(
+        CATCHUP_EVENTS_PER_SECOND,
+        "Backfill rate in events/sec while behind the chain tip (issue #420)"
+    );
 
     // Counters only render in the scrape output once touched at least once;
     // seed them at zero so /metrics is complete from the very first scrape.
@@ -158,6 +195,7 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     counter!(RPC_FAILOVERS_TOTAL).increment(0);
     counter!(OUTBOX_PUBLISHED_TOTAL).increment(0);
     counter!(OUTBOX_PUBLISH_FAILURES_TOTAL).increment(0);
+    counter!(UNHANDLED_SCVARIANT_TOTAL).increment(0);
     gauge!(RPC_ACTIVE_ENDPOINT).set(0.0);
     gauge!(OUTBOX_BACKLOG).set(0.0);
     gauge!(LEDGER_LAG).set(0.0);
@@ -166,6 +204,24 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     gauge!(HEARTBEAT_TIMESTAMP).set(0.0);
     gauge!(DB_POOL_SIZE).set(0.0);
     gauge!(DB_POOL_IDLE_CONNECTIONS).set(0.0);
+
+    // Histograms render nothing at all until they observe a value — not even
+    // a HELP/TYPE header — so an indexer that has not yet made an RPC call
+    // exports no `trident_indexer_rpc_call_duration_seconds_*` series. Any
+    // alert dividing by `..._count` then evaluates against an empty vector
+    // and silently never fires, which is exactly the class of dead alert the
+    // metric-name check exists to catch. Seeding a zero observation makes the
+    // series exist from the first scrape, matching the counters above.
+    //
+    // The cost is one bucketed sample of 0.0 per histogram, which shifts the
+    // reported minimum but not the alerting ratios these feed.
+    histogram!(POLL_DURATION_SECONDS).record(0.0);
+    histogram!(EVENT_DECODE_DURATION_SECONDS).record(0.0);
+    // Labelled, so seed the methods the poll loop actually calls — the RPC
+    // alerts `sum()` across labels, so the series just has to exist.
+    for method in ["getEvents", "getLedgers"] {
+        histogram!(RPC_CALL_DURATION_SECONDS, "method" => method, "endpoint" => "0").record(0.0);
+    }
 
     tracing::info!(port, "Metrics endpoint listening");
     Ok(())
@@ -206,6 +262,38 @@ pub fn set_db_pool_stats(size: u32, idle: u32) {
     gauge!(DB_POOL_IDLE_CONNECTIONS).set(idle as f64);
 }
 
+/// Minimum ledger lag before a poll cycle counts as "catching up" (issue #420).
+///
+/// At the chain tip the indexer polls faster than ledgers close, so cycles
+/// advance 0-1 ledgers and the instantaneous rate is dominated by the poll
+/// interval rather than by throughput. Only cycles with a real deficit behind
+/// them describe backfill speed.
+pub const CATCHUP_LAG_THRESHOLD_LEDGERS: i64 = 10;
+
+/// Publish catch-up throughput for one poll cycle (issue #420).
+///
+/// Called after a cycle that advanced the cursor. `lag_before` is the ledger
+/// deficit at the start of the cycle; the rates are published only when that
+/// deficit exceeds [`CATCHUP_LAG_THRESHOLD_LEDGERS`], so the gauges describe
+/// backfill speed rather than steady-state tip-following.
+///
+/// Gauges rather than counters: the question these answer is "how fast is it
+/// going right now", which is what sizes a recovery window. Cumulative totals
+/// are already available from `EVENTS_TOTAL`.
+pub fn set_catchup_rates(
+    ledgers_advanced: u64,
+    events_processed: u64,
+    elapsed_secs: f64,
+    lag_before: i64,
+) {
+    if lag_before <= CATCHUP_LAG_THRESHOLD_LEDGERS || elapsed_secs <= 0.0 {
+        return;
+    }
+
+    gauge!(CATCHUP_LEDGERS_PER_SECOND).set(ledgers_advanced as f64 / elapsed_secs);
+    gauge!(CATCHUP_EVENTS_PER_SECOND).set(events_processed as f64 / elapsed_secs);
+}
+
 pub fn record_events_processed(count: u64) {
     if count > 0 {
         counter!(EVENTS_TOTAL).increment(count);
@@ -220,6 +308,14 @@ pub fn record_events_skipped(count: u64) {
 
 pub fn record_parse_error() {
     counter!(PARSE_ERRORS_TOTAL).increment(1);
+}
+
+pub fn record_dead_lettered() {
+    counter!(DEAD_LETTERED_TOTAL).increment(1);
+}
+
+pub fn record_unhandled_scvariant() {
+    counter!(UNHANDLED_SCVARIANT_TOTAL).increment(1);
 }
 
 pub fn record_poll_duration(seconds: f64) {
