@@ -316,7 +316,30 @@ impl Streamer {
                             return Err(e);
                         }
                         Severity::Retryable => {
-                            tracing::warn!(error = %e, "Transient poll failure, will retry next interval");
+                            // A fresh index anchors at ledger 1, but the RPC
+                            // prunes old ledgers, so on a network whose retained
+                            // window has moved past 1 every poll is rejected
+                            // identically and the cursor never advances —
+                            // retrying alone can never clear it (issue #388).
+                            // Adopt the floor the error reports so the next poll
+                            // starts inside the retained window.
+                            match parse_retained_floor(&e.to_string()) {
+                                Some(floor) if cursor < floor.saturating_sub(1) => {
+                                    // page_request_params sends `cursor + 1`, so
+                                    // store floor - 1 to make the next request
+                                    // anchor exactly at the oldest retained ledger.
+                                    cursor = floor.saturating_sub(1);
+                                    tracing::warn!(
+                                        error = %e,
+                                        retained_floor = floor,
+                                        cursor,
+                                        "startLedger predates the RPC's retained history; advancing to the oldest retained ledger"
+                                    );
+                                }
+                                _ => {
+                                    tracing::warn!(error = %e, "Transient poll failure, will retry next interval");
+                                }
+                            }
                         }
                         Severity::Skip => {
                             tracing::warn!(error = %e, "Non-retryable poll failure, skipping cycle");
@@ -480,6 +503,12 @@ impl Streamer {
     /// Returns the total number of events processed in this cycle.
     async fn poll_once(&mut self, cursor: &mut u64) -> Result<usize, TridentError> {
         let poll_start = Instant::now();
+        // Cursor and lag as this cycle begins, so catch-up throughput can be
+        // measured over the cycle (issue #420). `last_chain_tip` is the tip
+        // observed by the previous cycle; the current cycle's first RPC page
+        // refreshes it, but the deficit we were working against is this one.
+        let cursor_at_start = *cursor;
+        let lag_at_start = self.last_chain_tip.saturating_sub(cursor_at_start) as i64;
         let retry_strategy = ExponentialBackoff::from_millis(200)
             .max_delay(Duration::from_secs(2))
             .take(5);
@@ -550,7 +579,7 @@ impl Streamer {
                 break;
             }
 
-            let last_paging_token = page.events.last().map(|e| e.paging_token.clone());
+            let last_paging_token = page.events.last().map(|e| e.page_cursor());
 
             let mut events_in_page: i32 = 0;
             let mut skipped_in_page: u64 = 0;
@@ -635,12 +664,9 @@ impl Streamer {
                         );
                         metrics::record_parse_error();
                         let ledger_seq: u64 = raw.ledger.parse().unwrap_or(0);
-                        let event_idx: u32 = raw
-                            .id
-                            .split('-')
-                            .next_back()
-                            .and_then(|s| s.parse().ok())
-                            .unwrap_or(0);
+                        // Same derivation as the happy path so a parse_errors
+                        // row points at the event it actually came from.
+                        let event_idx: u32 = crate::parser::raw_event_index(raw);
                         let raw_payload = serde_json::to_string(&serde_json::json!({
                             "type": &raw.event_type,
                             "ledger": &raw.ledger,
@@ -651,19 +677,38 @@ impl Streamer {
                             "value": &raw.value,
                         }))
                         .unwrap_or_else(|_| "{}".to_string());
-                        if let Err(db_err) = db::insert_parse_error(
-                            &self.db,
-                            ledger_seq,
-                            event_idx,
-                            &raw_payload,
-                            &e.to_string(),
-                        )
+                        // Retry dead-letter insert with bounded backoff so a
+                        // transient DB hiccup does not lose the audit record
+                        // (issue #414).
+                        let db = self.db.clone();
+                        let payload = raw_payload.clone();
+                        let errmsg = e.to_string();
+                        let dead_letter_strategy = ExponentialBackoff::from_millis(100)
+                            .max_delay(Duration::from_secs(1))
+                            .take(3);
+                        if let Err(db_err) = Retry::start(dead_letter_strategy, || {
+                            let db = db.clone();
+                            let payload = payload.clone();
+                            let errmsg = errmsg.clone();
+                            async move {
+                                db::insert_parse_error(
+                                    &db, ledger_seq, event_idx, &payload, &errmsg,
+                                )
+                                .await
+                            }
+                        })
                         .await
                         {
                             tracing::error!(
                                 error = %db_err,
-                                "Failed to record parse error in database"
+                                "Failed to record parse error in database after retries"
                             );
+                        } else {
+                            // Only count a dead-letter once the row is durably
+                            // recorded (issue #414). Incrementing on the failure
+                            // path instead would make the alert fire for events
+                            // that were never actually captured for replay.
+                            metrics::record_dead_lettered();
                         }
                         skipped_in_page += 1;
                     }
@@ -702,6 +747,12 @@ impl Streamer {
                     };
                 }
             }
+
+            // Guarantee the natural key from migration 0025 holds across this
+            // batch before it reaches Postgres. Mutates event_index in place
+            // only, so the positional indices in `page_tokens` stay valid
+            // (issue #388).
+            crate::parser::assign_unique_event_indexes(&mut page_events);
 
             // One transaction for the whole page: events, cursor, and ledger
             // metadata land together or not at all, so a crash can never leave
@@ -894,6 +945,16 @@ impl Streamer {
         // Non-fatal: log on failure so a bad health write doesn't stop indexing.
         let poll_duration = poll_start.elapsed();
         metrics::record_poll_duration(poll_duration.as_secs_f64());
+
+        // Catch-up throughput for this cycle (issue #420). Published only while
+        // meaningfully behind the tip — see `set_catchup_rates` — so the gauges
+        // describe backfill speed rather than steady-state tip-following.
+        metrics::set_catchup_rates(
+            cursor.saturating_sub(cursor_at_start),
+            total as u64,
+            poll_duration.as_secs_f64(),
+            lag_at_start,
+        );
         if let Err(e) =
             db::update_health_stats(&self.db, *cursor as i64, total as i32, poll_duration).await
         {
@@ -982,6 +1043,44 @@ fn page_request_params(cursor: u64, page_cursor: Option<&str>) -> (Option<u64>, 
     }
 }
 
+/// Extract the oldest retained ledger from an out-of-range `getEvents` error.
+///
+/// The Soroban RPC only keeps a recent window of ledgers. Asking for one it has
+/// already pruned fails with, verbatim:
+///
+/// ```text
+/// getEvents: RPC error -32600: startLedger must be within the ledger range: 7 - 457
+/// ```
+///
+/// There is no machine-readable field for the retained range — the same
+/// limitation noted for out-of-range cursors in `RpcClient::execute` — so the
+/// message is the only place the floor is available. Returns the lower bound
+/// (`7` above), or `None` when this is some other error.
+///
+/// Matching is deliberately narrow: both the `ledger range` phrase and a
+/// `<low> - <high>` pair must be present, so an unrelated RPC error can never
+/// be mistaken for a retention signal and silently move the cursor.
+fn parse_retained_floor(message: &str) -> Option<u64> {
+    let lower = message.to_lowercase();
+    if !lower.contains("ledger range") {
+        return None;
+    }
+    let after = &lower[lower.find("ledger range")? + "ledger range".len()..];
+    let (low, high) = after
+        .split_once('-')
+        .map(|(l, r)| (l.trim_matches(|c: char| !c.is_ascii_digit()), r))?;
+    let high: String = high
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    let low: u64 = low.parse().ok()?;
+    let high: u64 = high.parse().ok()?;
+    // A well-formed range only; anything inverted means the message shape
+    // changed and the value should not be trusted.
+    (low <= high).then_some(low)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1036,6 +1135,53 @@ mod tests {
             page_request_params(100, Some("100-5")),
             (None, Some("100-5".to_string()))
         );
+    }
+
+    #[test]
+    fn retained_floor_parsed_from_the_real_rpc_message() {
+        // Verbatim from the E2E contract events job (issue #388): a fresh index
+        // anchored at ledger 1 against a network retaining only 7 onwards.
+        assert_eq!(
+            parse_retained_floor(
+                "getEvents: RPC error -32600: startLedger must be within the ledger range: 7 - 457"
+            ),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn retained_floor_ignores_unrelated_rpc_errors() {
+        // Anything that is not a retention complaint must not move the cursor.
+        assert_eq!(
+            parse_retained_floor("getEvents: RPC error -32602: invalid cursor"),
+            None
+        );
+        assert_eq!(parse_retained_floor("getEvents: empty result"), None);
+        assert_eq!(parse_retained_floor(""), None);
+    }
+
+    #[test]
+    fn retained_floor_rejects_a_malformed_range() {
+        // An inverted or truncated range means the message shape changed; the
+        // value must not be trusted rather than silently skipping ledgers.
+        assert_eq!(
+            parse_retained_floor("startLedger must be within the ledger range: 500 - 7"),
+            None
+        );
+        assert_eq!(
+            parse_retained_floor("startLedger must be within the ledger range: 7"),
+            None
+        );
+    }
+
+    #[test]
+    fn retained_floor_maps_to_a_cursor_that_anchors_on_the_floor() {
+        // The recovery stores floor - 1 because page_request_params sends
+        // cursor + 1; the next request must land exactly on the floor, not
+        // one past it (which would skip the oldest retained ledger).
+        let floor =
+            parse_retained_floor("startLedger must be within the ledger range: 7 - 457").unwrap();
+        assert_eq!(page_request_params(floor - 1, None), (Some(7), None));
     }
 
     fn sym_xdr(s: &str) -> String {
