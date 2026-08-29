@@ -189,6 +189,16 @@ impl Config {
             2_592_000,
         );
         let db_pool_size = parse_pool_size("INDEXER_DB_POOL_SIZE", DEFAULT_DB_POOL_SIZE);
+        // #215 names redis_stream_maxlen among the knobs that must be
+        // range-checked. These three previously used
+        // `.ok().and_then(|s| s.parse().ok()).unwrap_or(default)`, which
+        // silently swallows a malformed or out-of-range value and boots on the
+        // default — the exact "silently wrong defaults" the issue calls out.
+        // Ports are capped at 65535; a maxlen of 0 would disable trimming and
+        // let the stream grow unbounded.
+        let redis_stream_maxlen = parse_bounded_u64("REDIS_STREAM_MAXLEN", 10_000, 1, 100_000_000);
+        let metrics_port = parse_bounded_u64("METRICS_PORT", 9090, 1, 65_535);
+        let health_port = parse_bounded_u64("HEALTH_PORT", 8080, 1, 65_535);
 
         // Collect all parse/range errors at once.
         for (key, result) in [
@@ -235,6 +245,9 @@ impl Config {
                 "TOKEN_METADATA_REFRESH_INTERVAL_SECS",
                 token_metadata_refresh_interval_secs.as_ref(),
             ),
+            ("REDIS_STREAM_MAXLEN", redis_stream_maxlen.as_ref()),
+            ("METRICS_PORT", metrics_port.as_ref()),
+            ("HEALTH_PORT", health_port.as_ref()),
         ] {
             if let Err(e) = result {
                 errors.push(format!("[indexer] {key}: {e}"));
@@ -290,6 +303,9 @@ impl Config {
         }
 
         // Unwrap is safe: all errors were collected above and we bailed.
+        let redis_stream_maxlen = redis_stream_maxlen.unwrap();
+        let metrics_port = metrics_port.unwrap() as u16;
+        let health_port = health_port.unwrap() as u16;
         let poll_interval_ms = poll_interval_ms.unwrap();
         let max_events_per_poll = max_events_per_poll.unwrap();
         let db_batch_size = db_batch_size.unwrap();
@@ -340,18 +356,9 @@ impl Config {
             topic_filters,
             max_events_per_poll: max_events_per_poll as u32,
             db_batch_size: db_batch_size as usize,
-            redis_stream_maxlen: std::env::var("REDIS_STREAM_MAXLEN")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(10_000),
-            metrics_port: std::env::var("METRICS_PORT")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(9090),
-            health_port: std::env::var("HEALTH_PORT")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(8080),
+            redis_stream_maxlen,
+            metrics_port,
+            health_port,
             alert_webhook_url,
             alert_lag_threshold,
             alert_cooldown_minutes,
@@ -406,13 +413,24 @@ impl Config {
 /// a startup log line is otherwise the easiest way for a secret to leak into
 /// log aggregation (issue #215).
 fn redact_url(url: &str) -> String {
-    if let Some(scheme_end) = url.find("://") {
-        let (scheme, rest) = url.split_at(scheme_end + 3);
-        if let Some(at) = rest.find('@') {
-            return format!("{scheme}***@{}", &rest[at + 1..]);
-        }
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let (scheme, rest) = url.split_at(scheme_end + 3);
+
+    // Credentials live only in the authority segment, which ends at the first
+    // '/', '?' or '#'. Bounding the search there stops a later '@' — in a path
+    // or query string — from being mistaken for the credential delimiter.
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+
+    // rfind, not find: '@' is legal inside a password and common in generated
+    // secrets. Splitting on the FIRST '@' in "user:p@ssw0rd@host" yields
+    // "***@ssw0rd@host" — the tail of the password logged in plaintext.
+    match authority.rfind('@') {
+        Some(at) => format!("{scheme}***@{}{tail}", &authority[at + 1..]),
+        None => url.to_string(),
     }
-    url.to_string()
 }
 
 /// Well-known Stellar network passphrases (issue #262). Any network name
@@ -1142,5 +1160,31 @@ mod tests {
     #[test]
     fn redact_url_leaves_non_url_unchanged() {
         assert_eq!(redact_url("not-a-url"), "not-a-url");
+    }
+
+    /// '@' is legal in a URL password and common in generated secrets.
+    /// Splitting on the first '@' leaked the password's tail in plaintext.
+    #[test]
+    fn redact_url_handles_at_sign_inside_password() {
+        let redacted = redact_url("postgres://user:p@ssw0rd@localhost:5432/trident");
+        assert_eq!(redacted, "postgres://***@localhost:5432/trident");
+        assert!(
+            !redacted.contains("ssw0rd"),
+            "password tail must not survive redaction: {redacted}"
+        );
+    }
+
+    /// An '@' after the authority (in a path or query) is not a credential
+    /// delimiter and must not be treated as one.
+    #[test]
+    fn redact_url_ignores_at_sign_outside_authority() {
+        assert_eq!(
+            redact_url("postgres://localhost:5432/db?user=a@b"),
+            "postgres://localhost:5432/db?user=a@b"
+        );
+        assert_eq!(
+            redact_url("postgres://user:secret@localhost:5432/db?opt=x@y"),
+            "postgres://***@localhost:5432/db?opt=x@y"
+        );
     }
 }
