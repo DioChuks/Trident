@@ -59,14 +59,78 @@ fn record_unexpected_variant(context: &str, variant: &str) {
     metrics::counter!(UNEXPECTED_SCVAL_VARIANT_TOTAL).increment(1);
 }
 
+/// Maximum XDR reader recursion depth accepted when decoding event XDR
+/// (issue #507).
+///
+/// This bounds `stellar-xdr` READER FRAMES, not container levels: each
+/// nested container holds several concurrently-active `read_xdr` frames
+/// (a Vec level ~4, a Map level ~5), so a frame budget of 500 admits
+/// roughly 100+ nested container levels. That is deliberate: the Soroban
+/// host itself permits contract values up to 100 container levels
+/// (`DEFAULT_HOST_DEPTH_LIMIT`) and pairs that with an XDR read/write
+/// depth of 500 (`DEFAULT_XDR_RW_LIMITS`) for exactly this frame
+/// multiplier — mirroring those numbers means every protocol-legal event
+/// decodes while a hostile payload nested beyond anything the chain can
+/// produce still yields a handled error instead of a stack-overflow abort
+/// (the failure mode `Limits::depth` exists to prevent). Rendering
+/// recursion in `scval_to_json` is bounded by the same value, since a
+/// decoded value cannot be deeper than its wire form.
+pub const MAX_SCVAL_DEPTH: u32 = 500;
+
+/// Maximum decoded size in bytes of a single event XDR value (issue #507).
+/// Real Soroban event payloads are a few hundred bytes; 2 MiB is orders of
+/// magnitude of headroom while bounding what a hostile length claim can
+/// make the decoder allocate or scan.
+pub const MAX_SCVAL_BYTES: usize = 2 * 1024 * 1024;
+
+// Base64 expands 3 bytes to 4 characters; anything longer than this cannot
+// decode to an in-budget payload, so it is rejected before the base64
+// decoder allocates for it.
+const MAX_SCVAL_B64_LEN: usize = MAX_SCVAL_BYTES.div_ceil(3) * 4 + 4;
+
 /// Decode a base64-encoded XDR `ScVal` as returned by Soroban RPC.
+///
+/// Hardened against hostile input (issue #507): input size and container
+/// depth are bounded (see [`MAX_SCVAL_BYTES`], [`MAX_SCVAL_DEPTH`]), the
+/// byte-length limit handed to the XDR reader is the actual input length so
+/// a lying length prefix cannot make it read past the payload, and trailing
+/// bytes after the value are rejected — a value that decodes but leaves
+/// bytes behind is malformed, and accepting it here while the
+/// testnet-correctness reference path (`ScVal::from_xdr`) rejects it would
+/// let production and verification disagree about the same wire bytes.
 pub fn decode_scval(b64: &str) -> Result<ScVal, TridentError> {
+    if b64.len() > MAX_SCVAL_B64_LEN {
+        return Err(TridentError::parse(anyhow::anyhow!(
+            "event XDR too large: {} base64 chars (limit {MAX_SCVAL_B64_LEN})",
+            b64.len()
+        )));
+    }
     let bytes = STANDARD
         .decode(b64)
         .map_err(|e| TridentError::parse(anyhow::Error::new(e).context("base64 decode")))?;
+    if bytes.len() > MAX_SCVAL_BYTES {
+        return Err(TridentError::parse(anyhow::anyhow!(
+            "event XDR too large: {} bytes (limit {MAX_SCVAL_BYTES})",
+            bytes.len()
+        )));
+    }
+    let len = bytes.len();
     let mut cursor = std::io::Cursor::new(bytes);
-    ScVal::read_xdr(&mut Limited::new(&mut cursor, Limits::none()))
-        .map_err(|e| TridentError::parse(anyhow::Error::new(e).context("XDR decode ScVal")))
+    let val = ScVal::read_xdr(&mut Limited::new(
+        &mut cursor,
+        Limits {
+            depth: MAX_SCVAL_DEPTH,
+            len,
+        },
+    ))
+    .map_err(|e| TridentError::parse(anyhow::Error::new(e).context("XDR decode ScVal")))?;
+    let consumed = cursor.position() as usize;
+    if consumed != len {
+        return Err(TridentError::parse(anyhow::anyhow!(
+            "trailing bytes after ScVal: consumed {consumed} of {len}"
+        )));
+    }
+    Ok(val)
 }
 
 /// Convert a topic `ScVal` to a compact string representation.
@@ -466,6 +530,93 @@ mod tests {
             let json = scval_to_json(&roundtrip(&ScVal::Address(addr)));
             assert_eq!(json, Json::String(s));
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Hostile input (issue #507). Deterministic boundary cases; the
+    // randomized battery lives in the indexer's parser::tests so it rides
+    // the CI fuzz pass (PROPTEST_CASES=50000).
+    // -----------------------------------------------------------------------
+
+    /// Wire bytes for a Vec nested `depth` levels around a U32, built
+    /// directly as bytes so tests can exceed any depth the in-memory
+    /// constructors could safely build (encoding a deep value recurses too).
+    fn nested_vec_wire(depth: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        for _ in 0..depth {
+            out.extend_from_slice(&16u32.to_be_bytes()); // ScValType::Vec
+            out.extend_from_slice(&1u32.to_be_bytes()); // Option: Some
+            out.extend_from_slice(&1u32.to_be_bytes()); // one element
+        }
+        out.extend_from_slice(&3u32.to_be_bytes()); // ScValType::U32
+        out.extend_from_slice(&7u32.to_be_bytes());
+        out
+    }
+
+    fn decode_wire(wire: &[u8]) -> Result<ScVal, TridentError> {
+        decode_scval(&base64::engine::general_purpose::STANDARD.encode(wire))
+    }
+
+    #[test]
+    fn plausible_nesting_decodes_and_renders() {
+        // 100 container levels — the Soroban host's own DEFAULT_HOST_DEPTH_LIMIT,
+        // i.e. the deepest value a contract can legally emit. Must decode, and
+        // rendering the decoded value (which recurses to the same depth) must
+        // succeed too. This is the regression guard against a frame budget
+        // set below what the protocol permits.
+        let val = decode_wire(&nested_vec_wire(100)).expect("host-legal nesting must decode");
+        let _ = scval_to_string(&val);
+        let _ = scval_to_json(&val);
+    }
+
+    #[test]
+    fn hostile_nesting_depth_errors_instead_of_overflowing_the_stack() {
+        // Far past the budget: a handled error, never a SIGABRT. Without the
+        // depth limit this input recurses ~50k frames and kills the process.
+        let result = decode_wire(&nested_vec_wire(50_000));
+        assert!(result.is_err(), "hostile nesting must be rejected");
+    }
+
+    #[test]
+    fn trailing_bytes_after_the_value_are_rejected() {
+        // A value that decodes but leaves bytes behind is malformed. The
+        // testnet-correctness reference path (ScVal::from_xdr) already
+        // rejects it; production must agree about the same wire bytes.
+        let mut wire = Vec::new();
+        ScVal::U32(7)
+            .write_xdr(&mut Limited::new(&mut wire, Limits::none()))
+            .expect("encode");
+        wire.extend_from_slice(&[0xDE, 0xAD]);
+        let err = decode_wire(&wire).expect_err("trailing bytes must be rejected");
+        assert!(
+            format!("{err}").contains("trailing"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn lying_length_prefix_is_a_handled_error() {
+        // Bytes value claiming u32::MAX length with 4 real bytes: must fail
+        // within the input-length budget, not scan or allocate 4 GiB.
+        let mut wire = 13u32.to_be_bytes().to_vec(); // ScValType::Bytes
+        wire.extend_from_slice(&u32::MAX.to_be_bytes());
+        wire.extend_from_slice(&[0xAA; 4]);
+        assert!(decode_wire(&wire).is_err());
+    }
+
+    #[test]
+    fn oversized_input_is_rejected_before_base64_decode() {
+        let huge = "A".repeat(MAX_SCVAL_B64_LEN + 1);
+        let err = decode_scval(&huge).expect_err("oversized input must be rejected");
+        assert!(
+            format!("{err}").contains("too large"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn empty_input_is_a_handled_error() {
+        assert!(decode_scval("").is_err());
     }
 
     #[test]
