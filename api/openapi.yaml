@@ -499,6 +499,19 @@ paths:
           schema:
             type: string
           description: Storage key to fetch history for, as returned by the storage/spec endpoints
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+          description: Maximum number of history entries to return
+        - name: cursor
+          in: query
+          schema:
+            type: string
+          description: Opaque pagination cursor from previous response's next_cursor (for next page)
       responses:
         "200":
           description: Recorded changes for the requested storage key
@@ -512,7 +525,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ContractStorageResponse"
+                $ref: "#/components/schemas/ContractStorageHistoryResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -581,6 +594,11 @@ paths:
             maximum: 100
             default: 50
           description: Number of top contracts to return
+        - name: cursor
+          in: query
+          schema:
+            type: string
+          description: Opaque pagination cursor from previous response's next_cursor (for next page)
       responses:
         "200":
           description: >-
@@ -664,21 +682,35 @@ paths:
 
     get:
       summary: List API keys
-      description: List all API keys (admin only)
+      description: List all API keys (admin only), using keyset pagination consistent with GET /v1/events
       operationId: listApiKeys
       tags:
         - API Keys
       security:
         - AdminKey: []
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+          description: Maximum number of API keys to return
+        - name: cursor
+          in: query
+          schema:
+            type: string
+          description: Opaque pagination cursor from previous response's next_cursor (for next page)
       responses:
         "200":
-          description: List of API keys
+          description: List of API keys with pagination metadata
           content:
             application/json:
               schema:
                 type: object
                 properties:
-                  keys:
+                  api_keys:
                     type: array
                     items:
                       type: object
@@ -702,6 +734,15 @@ paths:
                         created_at:
                           type: string
                           format: date-time
+                  has_more:
+                    type: boolean
+                    description: Whether more pages are available
+                  next_cursor:
+                    type: string
+                    nullable: true
+                    description: Opaque cursor to pass as the cursor parameter for the next page
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "429":
@@ -1119,6 +1160,29 @@ components:
             $ref: "#/components/schemas/ContractStorageValue"
           description: Storage snapshot values (latest, or full history when queried via /storage/history)
 
+    ContractStorageHistoryResponse:
+      type: object
+      required:
+        - storage_key
+        - values
+        - has_more
+      properties:
+        storage_key:
+          type: string
+          description: The storage key whose history was queried
+        values:
+          type: array
+          items:
+            $ref: "#/components/schemas/ContractStorageValue"
+          description: Storage history entries, oldest first
+        has_more:
+          type: boolean
+          description: Whether more pages are available
+        next_cursor:
+          type: string
+          nullable: true
+          description: Opaque cursor to pass as the cursor parameter for the next page
+
     ContractStorageValue:
       type: object
       required:
@@ -1151,6 +1215,7 @@ components:
         - to_ledger
         - network
         - generated_at
+        - has_more
       properties:
         contracts:
           type: array
@@ -1173,6 +1238,13 @@ components:
           type: string
           format: date-time
           description: Timestamp when response was generated
+        has_more:
+          type: boolean
+          description: Whether more pages are available
+        next_cursor:
+          type: string
+          nullable: true
+          description: Opaque cursor to pass as the cursor parameter for the next page
 
     ContractStats:
       type: object

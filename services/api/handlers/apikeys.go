@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/Depo-dev/trident/services/api/cursor"
 	"github.com/Depo-dev/trident/services/api/internal/httputil"
 	"github.com/Depo-dev/trident/services/api/middleware"
 	"github.com/Depo-dev/trident/services/api/validation"
@@ -151,32 +152,76 @@ func CreateAPIKey(cfg APIKeyConfig) http.HandlerFunc {
 	}
 }
 
+// ListAPIKeysResponse is the response envelope for GET /v1/api-keys.
+type ListAPIKeysResponse struct {
+	APIKeys    []*APIKeyResponse `json:"api_keys"`
+	HasMore    bool              `json:"has_more"`
+	NextCursor *string           `json:"next_cursor"`
+}
+
 // ListAPIKeys handles GET /v1/api-keys (admin-only).
 //
-// Returns all keys with key_prefix, last_used_at, and request_count.
-// The full plaintext key and hash are never returned.
+// Returns keys with key_prefix, last_used_at, and request_count, using
+// keyset pagination consistent with GET /v1/events. The full plaintext key
+// and hash are never returned.
 func ListAPIKeys(cfg APIKeyConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !requireAdmin(cfg, w, r) {
 			return
 		}
 
+		q := r.URL.Query()
+		if verr := validation.RejectUnknownParams(q, "limit", "cursor"); verr != nil {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
+			return
+		}
+
+		limit, verr := validation.ValidateLimit("limit", q.Get("limit"), 1, 100, 50)
+		if verr != nil {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
+			return
+		}
+
+		pagingToken, verr := validation.ValidateCursor("cursor", q.Get("cursor"))
+		if verr != nil {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
+			return
+		}
+
 		ctx, cancel := context.WithTimeout(r.Context(), apiKeyQueryTimeout)
 		defer cancel()
 
-		rows, err := cfg.DB.Query(ctx,
-			`SELECT id, key_prefix, label, network, rate_limit_tier, created_by,
-			        last_used_at, request_count, revoked_at, created_at
-			 FROM api_keys
-			 ORDER BY created_at DESC`,
-		)
+		// Keyset pagination: filter by created_at < token's timestamp when
+		// a cursor is provided, otherwise start from the most recent.
+		var rows pgx.Rows
+		var err error
+		if pagingToken != "" {
+			rows, err = cfg.DB.Query(ctx,
+				`SELECT id, key_prefix, label, network, rate_limit_tier, created_by,
+				        last_used_at, request_count, revoked_at, created_at
+				 FROM api_keys
+				 WHERE created_at < $1
+				 ORDER BY created_at DESC
+				 LIMIT $2`,
+				pagingToken, limit+1,
+			)
+		} else {
+			rows, err = cfg.DB.Query(ctx,
+				`SELECT id, key_prefix, label, network, rate_limit_tier, created_by,
+				        last_used_at, request_count, revoked_at, created_at
+				 FROM api_keys
+				 ORDER BY created_at DESC
+				 LIMIT $1`,
+				limit+1,
+			)
+		}
 		if err != nil {
 			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "failed to list api keys")
 			return
 		}
 		defer rows.Close()
 
-		keys := []APIKeyResponse{}
+		keys := []*APIKeyResponse{}
 		for rows.Next() {
 			var k APIKeyResponse
 			var lastUsedAt, revokedAt *time.Time
@@ -196,14 +241,29 @@ func ListAPIKeys(cfg APIKeyConfig) http.HandlerFunc {
 				s := revokedAt.UTC().Format(time.RFC3339)
 				k.RevokedAt = &s
 			}
-			keys = append(keys, k)
+			keys = append(keys, &k)
 		}
 		if rows.Err() != nil {
 			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "query error")
 			return
 		}
 
-		writeJSON(w, http.StatusOK, map[string]any{"api_keys": keys})
+		hasMore := len(keys) > int(limit)
+		if hasMore {
+			keys = keys[:limit]
+		}
+
+		var nextCursor *string
+		if hasMore && len(keys) > 0 {
+			encoded := cursor.Encode(keys[len(keys)-1].CreatedAt)
+			nextCursor = &encoded
+		}
+
+		writeJSON(w, http.StatusOK, ListAPIKeysResponse{
+			APIKeys:    keys,
+			HasMore:    hasMore,
+			NextCursor: nextCursor,
+		})
 	}
 }
 

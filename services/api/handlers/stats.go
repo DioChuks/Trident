@@ -441,6 +441,8 @@ type ContractsStatsResponse struct {
 	ToLedger    int64            `json:"to_ledger"`
 	Network     string           `json:"network"`
 	GeneratedAt string           `json:"generated_at"`
+	HasMore     bool             `json:"has_more"`
+	NextCursor  *string          `json:"next_cursor"`
 }
 
 // ContractsStats handles GET /v1/stats/contracts (analytics endpoint).
@@ -450,9 +452,10 @@ type ContractsStatsResponse struct {
 //   - to_ledger (optional): upper bound, inclusive. Default: latest indexed ledger
 //   - network (optional): "testnet" or "mainnet". Default: "testnet"
 //   - limit (optional): 1-100, number of contracts to return. Default: 50
+//   - cursor (optional): opaque pagination cursor from previous response's next_cursor
 //
 // Response is cached in Redis for 60 seconds using key:
-// stats:contracts:{network}:{from}:{to}:{limit}
+// stats:contracts:{network}:{from}:{to}:{limit}:{cursor}
 //
 // Returns results ordered by event_count DESC (highest volume first).
 func ContractsStats(db DBPool, rdb *redis.Client) http.HandlerFunc {
@@ -464,7 +467,7 @@ func ContractsStats(db DBPool, rdb *redis.Client) http.HandlerFunc {
 
 		q := r.URL.Query()
 		if verr := validation.RejectUnknownParams(
-			q, "from_ledger", "to_ledger", "network", "limit",
+			q, "from_ledger", "to_ledger", "network", "limit", "cursor",
 		); verr != nil {
 			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
 			return
@@ -482,8 +485,18 @@ func ContractsStats(db DBPool, rdb *redis.Client) http.HandlerFunc {
 			return
 		}
 
+		pagingToken, verr := validation.ValidateCursor("cursor", q.Get("cursor"))
+		if verr != nil {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
+			return
+		}
+
 		// Build cache key
-		cacheKey := fmt.Sprintf("stats:contracts:%s:%d:%d:%d", params.Network, params.FromLedger, params.ToLedger, params.Limit)
+		cursorKey := ""
+		if pagingToken != "" {
+			cursorKey = pagingToken
+		}
+		cacheKey := fmt.Sprintf("stats:contracts:%s:%d:%d:%d:%s", params.Network, params.FromLedger, params.ToLedger, params.Limit, cursorKey)
 
 		// Try Redis cache first
 		if cached, err := rdb.Get(r.Context(), cacheKey).Result(); err == nil {
@@ -505,7 +518,7 @@ func ContractsStats(db DBPool, rdb *redis.Client) http.HandlerFunc {
 		// unfiltered event history per contract, so it can only answer the
 		// default "all time" query. Any explicit ledger-range filter falls
 		// back to the live aggregate below, which the rollup cannot cover.
-		isDefaultRange := q.Get("from_ledger") == "" && q.Get("to_ledger") == ""
+		isDefaultRange := q.Get("from_ledger") == "" && q.Get("to_ledger") == "" && pagingToken == ""
 
 		var stats []*ContractStats
 		var err error
@@ -526,6 +539,21 @@ func ContractsStats(db DBPool, rdb *redis.Client) http.HandlerFunc {
 			}
 		}
 
+		// Keyset pagination: filter by event_count < cursor's count when a
+		// cursor is provided (contracts are ordered by event_count DESC).
+		if pagingToken != "" {
+			var cursorCount int64
+			if _, scanErr := fmt.Sscanf(pagingToken, "%d", &cursorCount); scanErr == nil {
+				filtered := make([]*ContractStats, 0, len(stats))
+				for _, cs := range stats {
+					if cs.EventCount < cursorCount {
+						filtered = append(filtered, cs)
+					}
+				}
+				stats = filtered
+			}
+		}
+
 		// Get the latest ledger for the response metadata if to_ledger was not explicitly set
 		toLedger := params.ToLedger
 		if q.Get("to_ledger") == "" {
@@ -538,12 +566,25 @@ func ContractsStats(db DBPool, rdb *redis.Client) http.HandlerFunc {
 			toLedger = latestLedger
 		}
 
+		hasMore := len(stats) > int(params.Limit)
+		if hasMore {
+			stats = stats[:params.Limit]
+		}
+
+		var nextCursor *string
+		if hasMore && len(stats) > 0 {
+			encoded := cursor.Encode(fmt.Sprintf("%d", stats[len(stats)-1].EventCount))
+			nextCursor = &encoded
+		}
+
 		response := &ContractsStatsResponse{
 			Contracts:   stats,
 			FromLedger:  params.FromLedger,
 			ToLedger:    toLedger,
 			Network:     params.Network,
 			GeneratedAt: time.Now().UTC().Format(time.RFC3339),
+			HasMore:     hasMore,
+			NextCursor:  nextCursor,
 		}
 
 		// Marshal to JSON for caching and response
