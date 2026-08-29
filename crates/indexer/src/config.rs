@@ -86,7 +86,22 @@ impl Config {
 
         // ── Required env vars ───────────────────────────────────────────────
         let database_url = collect_required("DATABASE_URL", &mut errors);
+        if let Some(url) = &database_url {
+            if let Err(e) = check_url_scheme("DATABASE_URL", url, &["postgres://", "postgresql://"])
+            {
+                errors.push(e);
+            }
+        }
         let redis_url = collect_required("REDIS_URL", &mut errors);
+        if let Some(url) = &redis_url {
+            if let Err(e) = check_url_scheme(
+                "REDIS_URL",
+                url,
+                &["redis://", "rediss://", "redis+unix://"],
+            ) {
+                errors.push(e);
+            }
+        }
 
         // Endpoint list for failover (issue #213). STELLAR_RPC_URLS is the
         // prioritised, comma-separated form; STELLAR_RPC_URL remains valid as a
@@ -349,6 +364,55 @@ impl Config {
             tracked_sac_assets,
         })
     }
+
+    /// Log the effective configuration once at startup, with credentials
+    /// redacted from `DATABASE_URL`/`REDIS_URL` and the webhook URL reduced to
+    /// a boolean. Misconfiguration is otherwise invisible until it surfaces as
+    /// a connection failure or a knob silently defaulting; a single log line
+    /// naming every value actually in effect makes that diagnosable from logs
+    /// alone (issue #215).
+    pub fn log_effective_config(&self) {
+        tracing::info!(
+            database_url = %redact_url(&self.database_url),
+            redis_url = %redact_url(&self.redis_url),
+            stellar_rpc_urls = ?self.stellar_rpc_urls,
+            network = %self.network,
+            network_passphrase_configured = !self.network_passphrase.is_empty(),
+            poll_interval_ms = self.poll_interval.as_millis() as u64,
+            poll_interval_floor_ms = self.poll_interval_floor.as_millis() as u64,
+            poll_interval_ceiling_ms = self.poll_interval_ceiling.as_millis() as u64,
+            lag_high_watermark = self.lag_high_watermark,
+            max_events_per_poll = self.max_events_per_poll,
+            db_batch_size = self.db_batch_size,
+            db_pool_size = self.db_pool_size,
+            redis_stream_maxlen = self.redis_stream_maxlen,
+            metrics_port = self.metrics_port,
+            health_port = self.health_port,
+            alert_webhook_configured = self.alert_webhook_url.is_some(),
+            alert_lag_threshold = self.alert_lag_threshold,
+            alert_cooldown_minutes = self.alert_cooldown_minutes,
+            index_diagnostic = self.index_diagnostic,
+            topic_filters_count = self.topic_filters.len(),
+            tracked_sac_assets_count = self.tracked_sac_assets.len(),
+            statement_timeout_ms = self.statement_timeout_ms,
+            idle_in_transaction_timeout_ms = self.idle_in_transaction_timeout_ms,
+            "Effective configuration"
+        );
+    }
+}
+
+/// Strip `user:pass@` userinfo from a connection URL before it is ever
+/// logged. `DATABASE_URL`/`REDIS_URL` commonly embed credentials directly, and
+/// a startup log line is otherwise the easiest way for a secret to leak into
+/// log aggregation (issue #215).
+fn redact_url(url: &str) -> String {
+    if let Some(scheme_end) = url.find("://") {
+        let (scheme, rest) = url.split_at(scheme_end + 3);
+        if let Some(at) = rest.find('@') {
+            return format!("{scheme}***@{}", &rest[at + 1..]);
+        }
+    }
+    url.to_string()
 }
 
 /// Well-known Stellar network passphrases (issue #262). Any network name
@@ -398,6 +462,21 @@ fn parse_tracked_sac_assets(
         });
     }
     Ok(assets)
+}
+
+/// Validate that a required URL-shaped env var starts with one of the
+/// accepted schemes. Catches the common misconfiguration of pasting a bare
+/// host/port or the wrong service's connection string (e.g. a Redis URL in
+/// `DATABASE_URL`) at boot instead of surfacing it as an opaque connection
+/// failure once the pool starts (issue #215).
+fn check_url_scheme(key: &str, value: &str, accepted_schemes: &[&str]) -> Result<(), String> {
+    if accepted_schemes.iter().any(|s| value.starts_with(s)) {
+        Ok(())
+    } else {
+        Err(format!(
+            "[indexer] {key} must start with one of {accepted_schemes:?}, got {value:?}"
+        ))
+    }
 }
 
 /// Read a required env var. Returns `Some(value)` on success, or pushes
@@ -980,5 +1059,88 @@ mod tests {
         std::env::set_var("TEST_POOL_BAD", "abc");
         assert!(parse_pool_size("TEST_POOL_BAD", 3).is_err());
         std::env::remove_var("TEST_POOL_BAD");
+    }
+
+    #[test]
+    fn database_url_wrong_scheme_is_rejected() {
+        let mut vars = required_vars();
+        vars.push(("DATABASE_URL", "redis://localhost/test"));
+        with_env(&vars, || {
+            let err = Config::from_env().unwrap_err();
+            assert!(err.to_string().contains("DATABASE_URL"));
+        });
+    }
+
+    #[test]
+    fn database_url_bare_host_is_rejected() {
+        let mut vars = required_vars();
+        vars.push(("DATABASE_URL", "localhost:5432/test"));
+        with_env(&vars, || {
+            let err = Config::from_env().unwrap_err();
+            assert!(err.to_string().contains("DATABASE_URL"));
+        });
+    }
+
+    #[test]
+    fn database_url_accepts_postgresql_scheme() {
+        let mut vars = required_vars();
+        vars.push(("DATABASE_URL", "postgresql://localhost/test"));
+        with_env(&vars, || {
+            let cfg = Config::from_env().unwrap();
+            assert_eq!(cfg.database_url, "postgresql://localhost/test");
+        });
+    }
+
+    #[test]
+    fn redis_url_wrong_scheme_is_rejected() {
+        let mut vars = required_vars();
+        vars.push(("REDIS_URL", "postgres://localhost/test"));
+        with_env(&vars, || {
+            let err = Config::from_env().unwrap_err();
+            assert!(err.to_string().contains("REDIS_URL"));
+        });
+    }
+
+    #[test]
+    fn redis_url_accepts_rediss_scheme() {
+        let mut vars = required_vars();
+        vars.push(("REDIS_URL", "rediss://localhost:6380"));
+        with_env(&vars, || {
+            let cfg = Config::from_env().unwrap();
+            assert_eq!(cfg.redis_url, "rediss://localhost:6380");
+        });
+    }
+
+    #[test]
+    fn check_url_scheme_accepts_listed_scheme() {
+        assert!(check_url_scheme("X", "postgres://h/d", &["postgres://"]).is_ok());
+    }
+
+    #[test]
+    fn check_url_scheme_rejects_unlisted_scheme() {
+        let err =
+            check_url_scheme("X", "ftp://h/d", &["postgres://", "postgresql://"]).unwrap_err();
+        assert!(err.contains('X'));
+    }
+
+    #[test]
+    fn redact_url_strips_credentials() {
+        assert_eq!(
+            redact_url("postgres://user:secret@localhost:5432/trident"),
+            "postgres://***@localhost:5432/trident"
+        );
+    }
+
+    #[test]
+    fn redact_url_leaves_credential_free_url_unchanged() {
+        assert_eq!(
+            redact_url("redis://localhost:6379"),
+            "redis://localhost:6379"
+        );
+    }
+
+    #[test]
+    fn redact_url_leaves_non_url_unchanged() {
+        assert_eq!(redact_url("not-a-url"), "not-a-url");
     }
 }

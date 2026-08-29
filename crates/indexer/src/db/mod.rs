@@ -848,6 +848,46 @@ pub async fn insert_parse_error(
     Ok(())
 }
 
+/// Dead-letter a well-formed event that repeatedly failed to persist into
+/// `soroban_events` (issue #208).
+///
+/// Unlike `insert_parse_error`, `event` here decoded successfully — the
+/// failure is in the storage layer, not the XDR. The full event is stored as
+/// JSONB so it can be inspected and replayed once the underlying cause (a
+/// constraint violation, an outage that outlasted the retry budget, etc.) is
+/// understood, without needing to re-fetch it from Stellar RPC.
+pub async fn insert_failed_event(
+    pool: &PgPool,
+    event: &SorobanEvent,
+    error_message: &str,
+    attempts: u32,
+) -> Result<(), TridentError> {
+    let payload = serde_json::to_value(event).map_err(|e| {
+        TridentError::storage(anyhow::Error::new(e).context("failed_events serialise"))
+    })?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO failed_events
+            (ledger_sequence, contract_id, transaction_hash, event_index,
+             event_payload, error_message, attempts)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        "#,
+    )
+    .bind(event.ledger_sequence as i64)
+    .bind(&event.contract_id)
+    .bind(&event.transaction_hash)
+    .bind(event.event_index as i32)
+    .bind(payload)
+    .bind(error_message)
+    .bind(attempts as i32)
+    .execute(pool)
+    .await
+    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("insert_failed_event")))?;
+
+    Ok(())
+}
+
 /// Contracts among `contract_ids` whose `token_metadata` row is still fresh
 /// (resolved or refreshed since `cutoff`), for either a positive or a cached
 /// negative ("not a token") result (issue #263). Contracts absent from this
@@ -1454,6 +1494,61 @@ mod tests {
         sqlx::query("DELETE FROM soroban_events WHERE contract_id = $1")
             .bind(&contract_id)
             .execute(&setup)
+            .await
+            .unwrap();
+    }
+
+    /// A dead-lettered event must land in `failed_events` with its full
+    /// payload and error message intact, so it can be inspected and replayed
+    /// later (issue #208).
+    #[tokio::test]
+    async fn insert_failed_event_persists_payload_and_error() {
+        let db_url = match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) if std::env::var("REQUIRE_TEST_SERVICES").is_ok() => {
+                panic!("TEST_DATABASE_URL must be set when REQUIRE_TEST_SERVICES is set");
+            }
+            Err(_) => {
+                eprintln!("SKIP: TEST_DATABASE_URL not set");
+                return;
+            }
+        };
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        let contract_id = format!("CFAILED_{}", Uuid::new_v4());
+        let event = make_event(&contract_id, 999, 0);
+
+        sqlx::query("DELETE FROM failed_events WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        insert_failed_event(&pool, &event, "simulated persistent failure", 3)
+            .await
+            .expect("insert_failed_event must succeed");
+
+        let row: (String, String, i32, serde_json::Value) = sqlx::query_as(
+            "SELECT error_message, transaction_hash, attempts, event_payload
+             FROM failed_events WHERE contract_id = $1",
+        )
+        .bind(&contract_id)
+        .fetch_one(&pool)
+        .await
+        .expect("row must exist");
+
+        assert_eq!(row.0, "simulated persistent failure");
+        assert_eq!(row.1, event.transaction_hash);
+        assert_eq!(row.2, 3);
+        assert_eq!(
+            row.3.get("contract_id").and_then(|v| v.as_str()),
+            Some(contract_id.as_str()),
+            "event_payload must round-trip the full event"
+        );
+
+        sqlx::query("DELETE FROM failed_events WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&pool)
             .await
             .unwrap();
     }

@@ -1,6 +1,6 @@
 -- Trident PostgreSQL Schema
 -- Convenience full-schema snapshot for local/dev bootstrap and documentation.
--- The migration chain in ./migrations/ (0001-0025) is the source of truth and is
+-- The migration chain in ./migrations/ (0001-0027) is the source of truth and is
 -- what CI and production apply; this file must mirror the end state of that chain.
 -- Keep in sync whenever a migration is added.
 
@@ -509,3 +509,25 @@ ALTER TABLE contract_storage_snapshots ADD CONSTRAINT contract_storage_snapshots
 
 CREATE UNIQUE INDEX IF NOT EXISTS contract_storage_snapshots_contract_id_network_storage_key__key ON contract_storage_snapshots USING btree (contract_id, network, storage_key, ledger_sequence);
 CREATE INDEX IF NOT EXISTS idx_contract_storage_snapshots_latest ON contract_storage_snapshots USING btree (contract_id, network, storage_key, ledger_sequence DESC);
+
+-- ---------------------------------------------------------------------------
+-- failed_events  (migration 0027)
+-- Dead-letter queue for well-formed events that repeatedly failed to persist.
+-- Distinct from parse_errors above: this is for events that decoded fine but
+-- whose INSERT kept failing after bounded retries.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS failed_events (
+    id               UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    ledger_sequence  BIGINT      NOT NULL,
+    contract_id      TEXT        NOT NULL,
+    transaction_hash TEXT        NOT NULL,
+    event_index      INT         NOT NULL,
+    event_payload    JSONB       NOT NULL,
+    error_message    TEXT        NOT NULL,
+    attempts         INT         NOT NULL DEFAULT 1,
+    occurred_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    replayed_at      TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_failed_events_occurred_at ON failed_events (occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_failed_events_pending ON failed_events (occurred_at) WHERE replayed_at IS NULL;
