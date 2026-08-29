@@ -1565,7 +1565,11 @@ mod tests {
         let server = MockServer::start().await;
 
         let contract_id = format!("CPOISON_{}", uuid::Uuid::new_v4());
-        let ledger = 9_000_000u64;
+        // Must fall inside a named partition. Migration 0017 creates 0-6M and
+        // 50M-60M with a gap between, and the #525 exhaustion guard rejects
+        // any ledger that gap would send to soroban_events_default — so 9M
+        // failed here for a reason unrelated to what this test asserts.
+        let ledger = 5_000_000u64;
         let page = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
