@@ -34,6 +34,7 @@ type OpenAPIModels struct {
 	ErrorResponse               *ErrorResponse               `json:"ErrorResponse,omitempty"`
 	EventListResponse           *EventListResponse           `json:"EventListResponse,omitempty"`
 	IndexerStatsResponse        *IndexerStatsResponse        `json:"IndexerStatsResponse,omitempty"`
+	ListAPIKeysResponse         *ListAPIKeysResponse         `json:"ListAPIKeysResponse,omitempty"`
 	LivenessResponse            *LivenessResponse            `json:"LivenessResponse,omitempty"`
 	ReadyChecks                 *ReadyChecks                 `json:"ReadyChecks,omitempty"`
 	ReadyResponse               *ReadyResponse               `json:"ReadyResponse,omitempty"`
@@ -161,12 +162,12 @@ type ErrorResponse struct {
 }
 
 type Error struct {
-	// Error code (e.g., INVALID_ARGUMENT, INTERNAL, UNAVAILABLE)        
-	Code                                                         string  `json:"code"`
-	// Human-readable error message                                      
-	Message                                                      string  `json:"message"`
-	// Request ID for debugging                                          
-	RequestID                                                    *string `json:"request_id,omitempty"`
+	// Error code (e.g., INVALID_ARGUMENT, INTERNAL, UNAVAILABLE, CONFLICT)        
+	Code                                                                   string  `json:"code"`
+	// Human-readable error message                                                
+	Message                                                                string  `json:"message"`
+	// Request ID for debugging                                                    
+	RequestID                                                              *string `json:"request_id,omitempty"`
 }
 
 type EventListResponse struct {
@@ -225,6 +226,14 @@ type IndexerStatsResponse struct {
 	Network                                                                                   string                     `json:"network"`
 	// Indexer health status                                                                                             
 	Status                                                                                    IndexerStatsResponseStatus `json:"status"`
+}
+
+type ListAPIKeysResponse struct {
+	APIKeys                                                        []APIKeyResponse `json:"api_keys"`
+	// Whether another page is available.                                           
+	HasMore                                                        bool             `json:"has_more"`
+	// Opaque cursor for the next page (null if has_more is false).                 
+	NextCursor                                                     string           `json:"next_cursor"`
 }
 
 type LivenessResponse struct {
