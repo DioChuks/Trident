@@ -90,9 +90,12 @@ pub fn verify_signature(
     tolerance_secs: u64,
 ) -> Result<(), WebhookVerificationError> {
     // 1. Parse and range-check the timestamp.
-    let ts: i64 = timestamp.trim().parse().map_err(|_| WebhookVerificationError {
-        reason: "X-Trident-Timestamp is missing or not a valid Unix second".into(),
-    })?;
+    let ts: i64 = timestamp
+        .trim()
+        .parse()
+        .map_err(|_| WebhookVerificationError {
+            reason: "X-Trident-Timestamp is missing or not a valid Unix second".into(),
+        })?;
     if ts <= 0 {
         return Err(WebhookVerificationError {
             reason: "X-Trident-Timestamp must be a positive Unix second".into(),
@@ -159,16 +162,28 @@ mod tests {
     fn valid_signature_accepted() {
         let ts = now_ts();
         let sig = compute_signature(ts, BODY, SECRET);
-        verify_signature(BODY, &sig, &ts.to_string(), SECRET, DEFAULT_TOLERANCE_SECONDS).unwrap();
+        verify_signature(
+            BODY,
+            &sig,
+            &ts.to_string(),
+            SECRET,
+            DEFAULT_TOLERANCE_SECONDS,
+        )
+        .unwrap();
     }
 
     #[test]
     fn wrong_secret_rejected() {
         let ts = now_ts();
         let sig = compute_signature(ts, BODY, SECRET);
-        let err =
-            verify_signature(BODY, &sig, &ts.to_string(), "whsec_wrong", DEFAULT_TOLERANCE_SECONDS)
-                .unwrap_err();
+        let err = verify_signature(
+            BODY,
+            &sig,
+            &ts.to_string(),
+            "whsec_wrong",
+            DEFAULT_TOLERANCE_SECONDS,
+        )
+        .unwrap_err();
         assert!(err.reason.contains("does not match"), "{}", err.reason);
     }
 
@@ -176,9 +191,14 @@ mod tests {
     fn altered_body_rejected() {
         let ts = now_ts();
         let sig = compute_signature(ts, b"original", SECRET);
-        let err =
-            verify_signature(b"altered", &sig, &ts.to_string(), SECRET, DEFAULT_TOLERANCE_SECONDS)
-                .unwrap_err();
+        let err = verify_signature(
+            b"altered",
+            &sig,
+            &ts.to_string(),
+            SECRET,
+            DEFAULT_TOLERANCE_SECONDS,
+        )
+        .unwrap_err();
         assert!(err.reason.contains("does not match"), "{}", err.reason);
     }
 
@@ -186,9 +206,14 @@ mod tests {
     fn stale_timestamp_rejected() {
         let stale_ts = now_ts() - 600; // 10 minutes ago
         let sig = compute_signature(stale_ts, BODY, SECRET);
-        let err =
-            verify_signature(BODY, &sig, &stale_ts.to_string(), SECRET, DEFAULT_TOLERANCE_SECONDS)
-                .unwrap_err();
+        let err = verify_signature(
+            BODY,
+            &sig,
+            &stale_ts.to_string(),
+            SECRET,
+            DEFAULT_TOLERANCE_SECONDS,
+        )
+        .unwrap_err();
         assert!(err.reason.contains("replay"), "{}", err.reason);
     }
 
@@ -201,9 +226,14 @@ mod tests {
 
     #[test]
     fn invalid_timestamp_rejected() {
-        let err =
-            verify_signature(BODY, "sha256=abc", "not-a-number", SECRET, DEFAULT_TOLERANCE_SECONDS)
-                .unwrap_err();
+        let err = verify_signature(
+            BODY,
+            "sha256=abc",
+            "not-a-number",
+            SECRET,
+            DEFAULT_TOLERANCE_SECONDS,
+        )
+        .unwrap_err();
         assert!(err.reason.contains("not a valid"), "{}", err.reason);
     }
 
@@ -217,8 +247,14 @@ mod tests {
         let sig_old = compute_signature(ts, body, old);
         let combined = format!("{sig_new} {sig_old}");
         // Receiver still on old secret must pass.
-        verify_signature(body, &combined, &ts.to_string(), old, DEFAULT_TOLERANCE_SECONDS)
-            .unwrap();
+        verify_signature(
+            body,
+            &combined,
+            &ts.to_string(),
+            old,
+            DEFAULT_TOLERANCE_SECONDS,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -231,8 +267,14 @@ mod tests {
         let sig_old = compute_signature(ts, body, old);
         let combined = format!("{sig_new} {sig_old}");
         // Receiver already on new secret must also pass.
-        verify_signature(body, &combined, &ts.to_string(), new, DEFAULT_TOLERANCE_SECONDS)
-            .unwrap();
+        verify_signature(
+            body,
+            &combined,
+            &ts.to_string(),
+            new,
+            DEFAULT_TOLERANCE_SECONDS,
+        )
+        .unwrap();
     }
 
     #[test]
