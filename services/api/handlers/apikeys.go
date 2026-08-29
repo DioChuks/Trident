@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/Depo-dev/trident/services/api/cursor"
@@ -191,8 +192,20 @@ func ListAPIKeys(cfg APIKeyConfig) http.HandlerFunc {
 		ctx, cancel := context.WithTimeout(r.Context(), apiKeyQueryTimeout)
 		defer cancel()
 
-		// Keyset pagination: filter by created_at < token's timestamp when
-		// a cursor is provided, otherwise start from the most recent.
+		// Keyset pagination over (created_at, id). The id tiebreaker is
+		// required: created_at is not unique, and ordering on it alone would
+		// skip or repeat keys created within the same timestamp.
+		var afterTS string
+		var afterID string
+		if pagingToken != "" {
+			idx := strings.LastIndexByte(pagingToken, '|')
+			if idx <= 0 || idx == len(pagingToken)-1 {
+				httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, "cursor is not a valid pagination cursor")
+				return
+			}
+			afterTS, afterID = pagingToken[:idx], pagingToken[idx+1:]
+		}
+
 		var rows pgx.Rows
 		var err error
 		if pagingToken != "" {
@@ -200,17 +213,17 @@ func ListAPIKeys(cfg APIKeyConfig) http.HandlerFunc {
 				`SELECT id, key_prefix, label, network, rate_limit_tier, created_by,
 				        last_used_at, request_count, revoked_at, created_at
 				 FROM api_keys
-				 WHERE created_at < $1
-				 ORDER BY created_at DESC
-				 LIMIT $2`,
-				pagingToken, limit+1,
+				 WHERE (created_at, id) < ($1::TIMESTAMPTZ, $2::UUID)
+				 ORDER BY created_at DESC, id DESC
+				 LIMIT $3`,
+				afterTS, afterID, limit+1,
 			)
 		} else {
 			rows, err = cfg.DB.Query(ctx,
 				`SELECT id, key_prefix, label, network, rate_limit_tier, created_by,
 				        last_used_at, request_count, revoked_at, created_at
 				 FROM api_keys
-				 ORDER BY created_at DESC
+				 ORDER BY created_at DESC, id DESC
 				 LIMIT $1`,
 				limit+1,
 			)
@@ -255,7 +268,8 @@ func ListAPIKeys(cfg APIKeyConfig) http.HandlerFunc {
 
 		var nextCursor *string
 		if hasMore && len(keys) > 0 {
-			encoded := cursor.Encode(keys[len(keys)-1].CreatedAt)
+			last := keys[len(keys)-1]
+			encoded := cursor.Encode(last.CreatedAt + "|" + last.ID)
 			nextCursor = &encoded
 		}
 

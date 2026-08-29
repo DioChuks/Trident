@@ -9,10 +9,13 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/Depo-dev/trident/services/api/cursor"
 	apigrpc "github.com/Depo-dev/trident/services/api/grpc"
 	"github.com/Depo-dev/trident/services/api/internal/httputil"
 	"github.com/Depo-dev/trident/services/api/middleware"
@@ -434,6 +437,35 @@ type ContractStats struct {
 	AvgWriteBytes      *float64 `json:"avg_write_bytes"`
 }
 
+// statsKeyset is the decoded pagination position for GET /v1/stats/contracts.
+// Contracts are ordered by (event_count DESC, contract_id DESC); both parts are
+// required because event_count alone is not unique and a tie would otherwise
+// skip or repeat rows across pages.
+type statsKeyset struct {
+	EventCount int64
+	ContractID string
+}
+
+// encodeStatsCursor renders a keyset position as an opaque cursor token.
+func encodeStatsCursor(k statsKeyset) string {
+	return cursor.Encode(fmt.Sprintf("%d:%s", k.EventCount, k.ContractID))
+}
+
+// decodeStatsKeyset parses a pagingToken previously produced by
+// encodeStatsCursor. A malformed token is an error, not a silent reset to
+// page one.
+func decodeStatsKeyset(pagingToken string) (*statsKeyset, error) {
+	idx := strings.IndexByte(pagingToken, ':')
+	if idx <= 0 || idx == len(pagingToken)-1 {
+		return nil, fmt.Errorf("malformed stats cursor")
+	}
+	count, err := strconv.ParseInt(pagingToken[:idx], 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("malformed stats cursor: %w", err)
+	}
+	return &statsKeyset{EventCount: count, ContractID: pagingToken[idx+1:]}, nil
+}
+
 // ContractsStatsResponse is the JSON response for GET /v1/stats/contracts
 type ContractsStatsResponse struct {
 	Contracts   []*ContractStats `json:"contracts"`
@@ -491,6 +523,16 @@ func ContractsStats(db DBPool, rdb *redis.Client) http.HandlerFunc {
 			return
 		}
 
+		var afterKey *statsKeyset
+		if pagingToken != "" {
+			decoded, decErr := decodeStatsKeyset(pagingToken)
+			if decErr != nil {
+				httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, "cursor is not a valid pagination cursor")
+				return
+			}
+			afterKey = decoded
+		}
+
 		// Build cache key
 		cursorKey := ""
 		if pagingToken != "" {
@@ -531,26 +573,11 @@ func ContractsStats(db DBPool, rdb *redis.Client) http.HandlerFunc {
 			}
 		}
 		if !usedRollup {
-			stats, err = queryContractStats(ctx, db, params)
+			stats, err = queryContractStats(ctx, db, params, afterKey)
 			if err != nil {
 				slog.ErrorContext(r.Context(), "database query failed", "err", err)
 				httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "failed to fetch statistics")
 				return
-			}
-		}
-
-		// Keyset pagination: filter by event_count < cursor's count when a
-		// cursor is provided (contracts are ordered by event_count DESC).
-		if pagingToken != "" {
-			var cursorCount int64
-			if _, scanErr := fmt.Sscanf(pagingToken, "%d", &cursorCount); scanErr == nil {
-				filtered := make([]*ContractStats, 0, len(stats))
-				for _, cs := range stats {
-					if cs.EventCount < cursorCount {
-						filtered = append(filtered, cs)
-					}
-				}
-				stats = filtered
 			}
 		}
 
@@ -573,7 +600,8 @@ func ContractsStats(db DBPool, rdb *redis.Client) http.HandlerFunc {
 
 		var nextCursor *string
 		if hasMore && len(stats) > 0 {
-			encoded := cursor.Encode(fmt.Sprintf("%d", stats[len(stats)-1].EventCount))
+			last := stats[len(stats)-1]
+			encoded := encodeStatsCursor(statsKeyset{EventCount: last.EventCount, ContractID: last.ContractID})
 			nextCursor = &encoded
 		}
 
@@ -619,11 +647,25 @@ func ContractsStats(db DBPool, rdb *redis.Client) http.HandlerFunc {
 // when a ledger range is supplied; the GROUP BY + ORDER BY event_count DESC is
 // a computed aggregate and is not index-backed — this is expected for an
 // aggregation query. The LIMIT cap prevents runaway result sets (#255).
-func queryContractStats(ctx context.Context, db DBPool, params *validation.QueryStatsParams) ([]*ContractStats, error) {
+func queryContractStats(ctx context.Context, db DBPool, params *validation.QueryStatsParams, after *statsKeyset) ([]*ContractStats, error) {
 	// Belt-and-suspenders: clamp limit even if the caller skips ValidateQueryStats.
 	limit := params.Limit
 	if limit <= 0 || limit > validation.StatsLimitMax {
 		limit = validation.StatsLimitDefault
+	}
+
+	// Fetch one extra row so the caller can detect whether another page exists.
+	fetch := limit + 1
+
+	// Keyset predicate applied to the aggregate via HAVING, since event_count
+	// is a computed column and cannot be referenced in WHERE.
+	having := ""
+	var afterCount int64
+	var afterContract string
+	if after != nil {
+		having = "HAVING (COUNT(*), e.contract_id) < ($5::BIGINT, $6::TEXT)"
+		afterCount = after.EventCount
+		afterContract = after.ContractID
 	}
 
 	query := `
@@ -662,11 +704,17 @@ func queryContractStats(ctx context.Context, db DBPool, params *validation.Query
 	GROUP BY
 		e.contract_id, m.invocation_count, m.total_fee_charged,
 		m.avg_fee_charged, m.avg_cpu_instructions, m.avg_read_bytes, m.avg_write_bytes
-	ORDER BY event_count DESC
+	` + having + `
+	ORDER BY event_count DESC, e.contract_id DESC
 	LIMIT $4
 	`
 
-	rows, err := db.Query(ctx, query, params.Network, params.FromLedgerPtr, params.ToLedgerPtr, limit)
+	args := []any{params.Network, params.FromLedgerPtr, params.ToLedgerPtr, fetch}
+	if after != nil {
+		args = append(args, afterCount, afterContract)
+	}
+
+	rows, err := db.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -745,11 +793,11 @@ func queryContractStatsFromRollup(ctx context.Context, db DBPool, params *valida
 		GROUP BY contract_id
 	) m ON m.contract_id = r.contract_id
 	WHERE r.network = $1
-	ORDER BY r.event_count DESC
+	ORDER BY r.event_count DESC, r.contract_id DESC
 	LIMIT $2
 	`
 
-	rows, err := db.Query(ctx, query, params.Network, params.Limit)
+	rows, err := db.Query(ctx, query, params.Network, params.Limit+1)
 	if err != nil {
 		return nil, false, err
 	}

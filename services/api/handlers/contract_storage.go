@@ -96,9 +96,14 @@ func ContractStorageLatest(db SchemaRegistryDB) http.HandlerFunc {
 }
 
 // ContractStorageHistoryResponse is the response envelope for GET /v1/contracts/{id}/storage/history.
+//
+// contract_id and network are retained from ContractStorageResponse so the
+// history endpoint stays wire-compatible with the shape clients already
+// consume; storage_key, has_more and next_cursor are additive.
 type ContractStorageHistoryResponse struct {
+	ContractID string                 `json:"contract_id"`
+	Network    string                 `json:"network"`
 	StorageKey string                 `json:"storage_key"`
-	Key        json.RawMessage        `json:"key"`
 	Values     []ContractStorageValue `json:"values"`
 	HasMore    bool                   `json:"has_more"`
 	NextCursor *string                `json:"next_cursor"`
@@ -211,8 +216,9 @@ func ContractStorageHistory(db SchemaRegistryDB) http.HandlerFunc {
 		}
 
 		writeJSON(w, http.StatusOK, ContractStorageHistoryResponse{
+			ContractID: contractID,
+			Network:    network,
 			StorageKey: storageKey,
-			Key:        nil,
 			Values:     values,
 			HasMore:    hasMore,
 			NextCursor: nextCursor,

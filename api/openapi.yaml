@@ -761,7 +761,6 @@ paths:
                     description: Opaque cursor to pass as the cursor parameter for the next page
         "400":
           $ref: "#/components/responses/BadRequest"
-                      $ref: "#/components/schemas/APIKeyResponse"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "429":
@@ -1271,10 +1270,18 @@ components:
     ContractStorageHistoryResponse:
       type: object
       required:
+        - contract_id
+        - network
         - storage_key
         - values
         - has_more
       properties:
+        contract_id:
+          type: string
+          description: The contract whose storage history was queried
+        network:
+          type: string
+          description: Network the contract is indexed on
         storage_key:
           type: string
           description: The storage key whose history was queried
