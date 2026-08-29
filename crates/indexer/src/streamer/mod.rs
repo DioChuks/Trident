@@ -1254,12 +1254,27 @@ async fn commit_page_with_fallback(
             match db::insert_failed_event(db, event, &e.to_string(), attempts).await {
                 Ok(()) => metrics::record_dead_lettered(),
                 Err(dl_err) => {
+                    // The dead-letter write goes to the same database the
+                    // event's own INSERT just failed against. Failing here is
+                    // therefore evidence that the *database* is unavailable,
+                    // not that this event is unpersistable — the inference the
+                    // isolation retry relies on does not hold.
+                    //
+                    // Swallowing this and letting the cursor advance below
+                    // would discard the event permanently: absent from
+                    // soroban_events, absent from failed_events, and the
+                    // cursor moved past it. Propagating instead leaves the
+                    // cursor where it is so the next poll retries the page —
+                    // duplicates are already absorbed downstream by the
+                    // deterministic UUIDv5 keys and ON CONFLICT DO NOTHING,
+                    // so a retry is safe in a way that data loss is not.
                     tracing::error!(
                         error = %dl_err,
                         contract_id = %event.contract_id,
                         tx_hash = %event.transaction_hash,
-                        "Failed to write failed_events row; event is lost from this page"
+                        "Failed to write failed_events row; refusing to advance the cursor past an unpersisted event"
                     );
+                    return Err(dl_err);
                 }
             }
         }
