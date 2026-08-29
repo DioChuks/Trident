@@ -41,6 +41,25 @@ pub const RPC_TIMEOUTS_TOTAL: &str = "trident_indexer_rpc_timeouts_total";
 pub const RPC_ACTIVE_ENDPOINT: &str = "trident_indexer_rpc_active_endpoint";
 pub const RPC_FAILOVERS_TOTAL: &str = "trident_indexer_rpc_failovers_total";
 pub const OUTBOX_BACKLOG: &str = "trident_indexer_outbox_backlog";
+
+/// Reconciliation loop (issue #511): passes that completed a full compare of
+/// a settled ledger window against the RPC source.
+pub const RECONCILE_PASSES_TOTAL: &str = "trident_indexer_reconcile_passes_total";
+/// Passes that aborted before producing a report (RPC or DB failure). A
+/// failing reconciler reports nothing — which must never read as clean.
+pub const RECONCILE_PASS_FAILURES_TOTAL: &str = "trident_indexer_reconcile_pass_failures_total";
+/// Events the RPC reports for reconciled windows that the database does not
+/// account for — the silent-under-indexing signal this loop exists to catch.
+pub const RECONCILE_MISSING_EVENTS_TOTAL: &str = "trident_indexer_reconcile_missing_events_total";
+/// Events the database holds that the RPC does not report for the window —
+/// over-indexing, as wrong as under-indexing.
+pub const RECONCILE_EXTRA_EVENTS_TOTAL: &str = "trident_indexer_reconcile_extra_events_total";
+/// Ledgers in the most recent pass whose counts disagreed. Stays non-zero on
+/// every pass until the discrepancy is resolved, which is what the alert
+/// fires on.
+pub const RECONCILE_DISCREPANT_LEDGERS: &str = "trident_indexer_reconcile_discrepant_ledgers";
+/// Highest ledger covered by the most recent completed pass.
+pub const RECONCILE_WINDOW_END_LEDGER: &str = "trident_indexer_reconcile_window_end_ledger";
 pub const OUTBOX_PUBLISHED_TOTAL: &str = "trident_indexer_outbox_published_total";
 pub const OUTBOX_PUBLISH_FAILURES_TOTAL: &str = "trident_indexer_outbox_publish_failures_total";
 /// RPC call latency in seconds, labelled by `method` (e.g. `getEvents`) and
@@ -157,6 +176,30 @@ pub fn install(port: u16) -> Result<(), TridentError> {
         OUTBOX_PUBLISH_FAILURES_TOTAL,
         "Outbox publish attempts that failed (issue #200)"
     );
+    describe_counter!(
+        RECONCILE_PASSES_TOTAL,
+        "Reconciliation passes that completed a full window compare (issue #511)"
+    );
+    describe_counter!(
+        RECONCILE_PASS_FAILURES_TOTAL,
+        "Reconciliation passes that aborted before producing a report (issue #511)"
+    );
+    describe_counter!(
+        RECONCILE_MISSING_EVENTS_TOTAL,
+        "Events on the RPC source that the database does not account for (issue #511)"
+    );
+    describe_counter!(
+        RECONCILE_EXTRA_EVENTS_TOTAL,
+        "Events in the database that the RPC source does not report (issue #511)"
+    );
+    describe_gauge!(
+        RECONCILE_DISCREPANT_LEDGERS,
+        "Ledgers in the most recent reconciliation pass with disagreeing counts (issue #511)"
+    );
+    describe_gauge!(
+        RECONCILE_WINDOW_END_LEDGER,
+        "Highest ledger covered by the most recent completed reconciliation pass (issue #511)"
+    );
     describe_gauge!(
         HEARTBEAT_TIMESTAMP,
         "Unix timestamp (seconds) of the most recent completed poll cycle (#218)"
@@ -205,6 +248,12 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     counter!(RPC_FAILOVERS_TOTAL).increment(0);
     counter!(OUTBOX_PUBLISHED_TOTAL).increment(0);
     counter!(OUTBOX_PUBLISH_FAILURES_TOTAL).increment(0);
+    counter!(RECONCILE_PASSES_TOTAL).increment(0);
+    counter!(RECONCILE_PASS_FAILURES_TOTAL).increment(0);
+    counter!(RECONCILE_MISSING_EVENTS_TOTAL).increment(0);
+    counter!(RECONCILE_EXTRA_EVENTS_TOTAL).increment(0);
+    gauge!(RECONCILE_DISCREPANT_LEDGERS).set(0.0);
+    gauge!(RECONCILE_WINDOW_END_LEDGER).set(0.0);
     gauge!(RPC_ACTIVE_ENDPOINT).set(0.0);
     gauge!(OUTBOX_BACKLOG).set(0.0);
     gauge!(LEDGER_LAG).set(0.0);
@@ -327,6 +376,30 @@ pub fn record_parse_error() {
 
 pub fn record_dead_lettered() {
     counter!(DEAD_LETTERED_TOTAL).increment(1);
+}
+
+pub fn record_reconcile_pass_completed() {
+    counter!(RECONCILE_PASSES_TOTAL).increment(1);
+}
+
+pub fn record_reconcile_pass_failed() {
+    counter!(RECONCILE_PASS_FAILURES_TOTAL).increment(1);
+}
+
+pub fn record_reconcile_missing_events(count: u64) {
+    counter!(RECONCILE_MISSING_EVENTS_TOTAL).increment(count);
+}
+
+pub fn record_reconcile_extra_events(count: u64) {
+    counter!(RECONCILE_EXTRA_EVENTS_TOTAL).increment(count);
+}
+
+pub fn set_reconcile_discrepant_ledgers(count: i64) {
+    gauge!(RECONCILE_DISCREPANT_LEDGERS).set(count as f64);
+}
+
+pub fn set_reconcile_window_end(ledger: u64) {
+    gauge!(RECONCILE_WINDOW_END_LEDGER).set(ledger as f64);
 }
 
 pub fn record_poll_duration(seconds: f64) {

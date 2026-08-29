@@ -127,6 +127,42 @@ groups:
           runbook_url: "docs/runbooks/alerts.md#tridentindexerparseerrorratehigh"
 
   # ---------------------------------------------------------------------------
+  # Ledger-range reconciliation against the RPC source (#511).
+  # ---------------------------------------------------------------------------
+  - name: trident.indexer.reconciliation
+    rules:
+      - alert: TridentIndexerReconciliationMismatch
+        expr: trident_indexer_reconcile_discrepant_ledgers > 0
+        for: 15m
+        labels:
+          severity: warning
+          service: indexer
+        annotations:
+          summary: "Trident indexed counts disagree with the RPC source for {{ $value }} ledger(s)"
+          description: >
+            The reconciliation loop compared indexed event counts per ledger
+            against getEvents over a settled window and found disagreement.
+            The indexer logs name the exact ledger ranges with both counts.
+            This is the silent-under-indexing signal: the API may be
+            returning confident, incomplete answers for these ledgers.
+          runbook_url: "docs/runbooks/alerts.md#tridentindexerreconciliationmismatch"
+
+      - alert: TridentIndexerReconciliationFailing
+        expr: increase(trident_indexer_reconcile_pass_failures_total[30m]) > 2
+        for: 30m
+        labels:
+          severity: warning
+          service: indexer
+        annotations:
+          summary: "Trident reconciliation passes are failing"
+          description: >
+            The reconciliation loop keeps aborting before producing a report
+            (RPC or database failures). While this fires, nothing is
+            verifying that indexed counts match the chain - treat the
+            mismatch alert's silence as unknown, not clean.
+          runbook_url: "docs/runbooks/alerts.md#tridentindexerreconciliationfailing"
+
+  # ---------------------------------------------------------------------------
   # Stellar RPC health (#297).
   # ---------------------------------------------------------------------------
   - name: trident.indexer.rpc
