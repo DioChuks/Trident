@@ -503,6 +503,39 @@ impl Streamer {
     /// Returns the total number of events processed in this cycle.
     async fn poll_once(&mut self, cursor: &mut u64) -> Result<usize, TridentError> {
         let poll_start = Instant::now();
+        // Cursor and lag as this cycle begins, so catch-up throughput can be
+        // measured over the cycle (issue #420). `last_chain_tip` is the tip
+        // observed by the previous cycle; the current cycle's first RPC page
+        // refreshes it, but the deficit we were working against is this one.
+        let cursor_at_start = *cursor;
+        let lag_at_start = self.last_chain_tip.saturating_sub(cursor_at_start) as i64;
+
+        // Query the named partition ranges once per poll cycle so every insert
+        // in this cycle can check whether it would fall outside them and land
+        // in the DEFAULT catch-all partition (issue #525).
+        let partition_ranges = match db::named_partition_ranges(&self.db).await {
+            Ok(ranges) if !ranges.is_empty() => {
+                let highest = ranges.iter().map(|&(_, hi)| hi).max().unwrap_or(0);
+                metrics::set_partition_lookahead(highest.saturating_sub(*cursor as i64));
+                ranges
+            }
+            Ok(_) => {
+                // No named partitions at all — every insert would land in
+                // DEFAULT. This is a real misconfiguration, not a blip.
+                return Err(TridentError::config(anyhow::anyhow!(
+                    "partition exhaustion: soroban_events has no named range partitions.                      All inserts would land in soroban_events_default.                      Run `SELECT create_soroban_partition(0, 2000000);` to create the                      first partition (issue #525)."
+                )));
+            }
+            Err(e) => {
+                // A failed catalogue query is usually a transient connection
+                // problem. Returning a config error here would classify it as
+                // Fatal and halt ingestion permanently, so surface it as the
+                // storage error it is and let the caller's retry path handle it.
+                return Err(TridentError::storage(anyhow::Error::new(e).context(
+                    "could not query soroban_events partition ranges (issue #525)",
+                )));
+            }
+        };
         let retry_strategy = ExponentialBackoff::from_millis(200)
             .max_delay(Duration::from_secs(2))
             .take(5);
@@ -671,19 +704,38 @@ impl Streamer {
                             "value": &raw.value,
                         }))
                         .unwrap_or_else(|_| "{}".to_string());
-                        if let Err(db_err) = db::insert_parse_error(
-                            &self.db,
-                            ledger_seq,
-                            event_idx,
-                            &raw_payload,
-                            &e.to_string(),
-                        )
+                        // Retry dead-letter insert with bounded backoff so a
+                        // transient DB hiccup does not lose the audit record
+                        // (issue #414).
+                        let db = self.db.clone();
+                        let payload = raw_payload.clone();
+                        let errmsg = e.to_string();
+                        let dead_letter_strategy = ExponentialBackoff::from_millis(100)
+                            .max_delay(Duration::from_secs(1))
+                            .take(3);
+                        if let Err(db_err) = Retry::start(dead_letter_strategy, || {
+                            let db = db.clone();
+                            let payload = payload.clone();
+                            let errmsg = errmsg.clone();
+                            async move {
+                                db::insert_parse_error(
+                                    &db, ledger_seq, event_idx, &payload, &errmsg,
+                                )
+                                .await
+                            }
+                        })
                         .await
                         {
                             tracing::error!(
                                 error = %db_err,
-                                "Failed to record parse error in database"
+                                "Failed to record parse error in database after retries"
                             );
+                        } else {
+                            // Only count a dead-letter once the row is durably
+                            // recorded (issue #414). Incrementing on the failure
+                            // path instead would make the alert fire for events
+                            // that were never actually captured for replay.
+                            metrics::record_dead_lettered();
                         }
                         skipped_in_page += 1;
                     }
@@ -728,6 +780,23 @@ impl Streamer {
             // only, so the positional indices in `page_tokens` stay valid
             // (issue #388).
             crate::parser::assign_unique_event_indexes(&mut page_events);
+
+            // Partition boundary guard (issue #525): verify no event in this
+            // page would overflow into soroban_events_default before we touch
+            // the database. Uses the boundary queried at the top of this cycle
+            // so there is no extra round-trip per page.
+            //
+            // This returns TridentError::ConfigError (Severity::Fatal), which
+            // causes the poll loop to halt and log an ERROR rather than
+            // silently retrying — the intended loud-failure behaviour for
+            // partition exhaustion.
+            if !page_events.is_empty() {
+                let ledger_sequences: Vec<i64> = page_events
+                    .iter()
+                    .map(|e| e.ledger_sequence as i64)
+                    .collect();
+                db::assert_no_default_partition_overflow(&ledger_sequences, &partition_ranges)?;
+            }
 
             // One transaction for the whole page: events, cursor, and ledger
             // metadata land together or not at all, so a crash can never leave
@@ -920,6 +989,16 @@ impl Streamer {
         // Non-fatal: log on failure so a bad health write doesn't stop indexing.
         let poll_duration = poll_start.elapsed();
         metrics::record_poll_duration(poll_duration.as_secs_f64());
+
+        // Catch-up throughput for this cycle (issue #420). Published only while
+        // meaningfully behind the tip — see `set_catchup_rates` — so the gauges
+        // describe backfill speed rather than steady-state tip-following.
+        metrics::set_catchup_rates(
+            cursor.saturating_sub(cursor_at_start),
+            total as u64,
+            poll_duration.as_secs_f64(),
+            lag_at_start,
+        );
         if let Err(e) =
             db::update_health_stats(&self.db, *cursor as i64, total as i32, poll_duration).await
         {
