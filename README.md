@@ -19,6 +19,8 @@
 
 ## Quick Start
 
+> ⚡ **Evaluating Trident?** Walk through the **[10-Minute Testnet Developer Quickstart](docs/QUICKSTART.md)** to get from zero to your first indexed event query with no prior setup.
+
 ### Prerequisites
 Before running Trident locally, make sure you have the following installed:
 - **Docker** with Compose v2
@@ -39,7 +41,7 @@ This command will:
 3. Apply all database migrations automatically.
 4. Compile and start the Rust indexer, the Rust gRPC API, and the Go REST API.
 
-Use `Ctrl+C` or `make stop` to cleanly shut down all services.
+Use `Ctrl+C` or `make stop` to cleanly shut down all services. For the full Docker-only flow, see [QUICKSTART.md](docs/QUICKSTART.md).
 
 ---
 
