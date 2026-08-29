@@ -509,6 +509,33 @@ impl Streamer {
         // refreshes it, but the deficit we were working against is this one.
         let cursor_at_start = *cursor;
         let lag_at_start = self.last_chain_tip.saturating_sub(cursor_at_start) as i64;
+
+        // Query the named partition ranges once per poll cycle so every insert
+        // in this cycle can check whether it would fall outside them and land
+        // in the DEFAULT catch-all partition (issue #525).
+        let partition_ranges = match db::named_partition_ranges(&self.db).await {
+            Ok(ranges) if !ranges.is_empty() => {
+                let highest = ranges.iter().map(|&(_, hi)| hi).max().unwrap_or(0);
+                metrics::set_partition_lookahead(highest.saturating_sub(*cursor as i64));
+                ranges
+            }
+            Ok(_) => {
+                // No named partitions at all — every insert would land in
+                // DEFAULT. This is a real misconfiguration, not a blip.
+                return Err(TridentError::config(anyhow::anyhow!(
+                    "partition exhaustion: soroban_events has no named range partitions.                      All inserts would land in soroban_events_default.                      Run `SELECT create_soroban_partition(0, 2000000);` to create the                      first partition (issue #525)."
+                )));
+            }
+            Err(e) => {
+                // A failed catalogue query is usually a transient connection
+                // problem. Returning a config error here would classify it as
+                // Fatal and halt ingestion permanently, so surface it as the
+                // storage error it is and let the caller's retry path handle it.
+                return Err(TridentError::storage(anyhow::Error::new(e).context(
+                    "could not query soroban_events partition ranges (issue #525)",
+                )));
+            }
+        };
         let retry_strategy = ExponentialBackoff::from_millis(200)
             .max_delay(Duration::from_secs(2))
             .take(5);
@@ -753,6 +780,23 @@ impl Streamer {
             // only, so the positional indices in `page_tokens` stay valid
             // (issue #388).
             crate::parser::assign_unique_event_indexes(&mut page_events);
+
+            // Partition boundary guard (issue #525): verify no event in this
+            // page would overflow into soroban_events_default before we touch
+            // the database. Uses the boundary queried at the top of this cycle
+            // so there is no extra round-trip per page.
+            //
+            // This returns TridentError::ConfigError (Severity::Fatal), which
+            // causes the poll loop to halt and log an ERROR rather than
+            // silently retrying — the intended loud-failure behaviour for
+            // partition exhaustion.
+            if !page_events.is_empty() {
+                let ledger_sequences: Vec<i64> = page_events
+                    .iter()
+                    .map(|e| e.ledger_sequence as i64)
+                    .collect();
+                db::assert_no_default_partition_overflow(&ledger_sequences, &partition_ranges)?;
+            }
 
             // One transaction for the whole page: events, cursor, and ledger
             // metadata land together or not at all, so a crash can never leave

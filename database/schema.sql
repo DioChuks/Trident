@@ -219,6 +219,8 @@ CREATE TABLE IF NOT EXISTS webhook_subscriptions (
     topic0       TEXT,
     target_url   TEXT        NOT NULL,
     secret       TEXT        NOT NULL,
+    -- Previous secret, retained during a rotation overlap window (issue #452).
+    secondary_secret TEXT,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     paused_at    TIMESTAMPTZ,
@@ -253,6 +255,11 @@ CREATE TRIGGER trg_webhook_subscriptions_updated_at
 
 CREATE INDEX IF NOT EXISTS idx_webhook_subscriptions_contract_id ON webhook_subscriptions (contract_id);
 CREATE INDEX IF NOT EXISTS idx_webhook_subscriptions_paused_at ON webhook_subscriptions (paused_at);
+-- Partial index over rows in a rotation overlap window, used by the cleanup
+-- job that expires secondary secrets (issue #452).
+CREATE INDEX IF NOT EXISTS idx_webhook_subscriptions_secondary_secret
+    ON webhook_subscriptions (updated_at)
+    WHERE secondary_secret IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_subscription_id ON webhook_deliveries (subscription_id);
 CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_dead_lettered ON webhook_deliveries (subscription_id, delivered_at DESC) WHERE (status = 'dead_lettered');
 
