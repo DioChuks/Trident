@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -39,6 +40,37 @@ type idempotencyRecord struct {
 	Status      int         `json:"status"`
 	Header      http.Header `json:"header"`
 	Body        []byte      `json:"body"`
+	// InFlight marks a reservation written before the handler runs, so a
+	// concurrent request carrying the same key can be told to retry instead
+	// of executing the handler a second time.
+	InFlight bool `json:"in_flight,omitempty"`
+}
+
+// inFlightTTL bounds how long a reservation survives if the process handling
+// it dies mid-request. Short enough that a crash doesn't lock a key out for
+// the full 24h record TTL, long enough to cover a slow create.
+const inFlightTTL = 60 * time.Second
+
+// idempotencyRedisKey scopes the client-supplied key to the authenticated
+// caller. Without the tenant component, the key namespace is entirely
+// client-chosen and shared: two tenants picking the same Idempotency-Key
+// (a UUID collision is unlikely, but "order-1" is not) with the same request
+// body would have the second replay the first's response — which for
+// POST /v1/webhooks contains that tenant's plaintext signing secret, and for
+// POST /v1/api-keys the plaintext API key.
+//
+// The id is hashed rather than interpolated so a key id can never be read
+// back out of a Redis key name, and so an exotic id cannot break the
+// delimiter structure.
+func idempotencyRedisKey(ctx context.Context, clientKey string) string {
+	tenant := APIKeyIDFromContext(ctx)
+	if tenant == "" {
+		// Admin-key and legacy env-var auth carry no per-key id. They share
+		// one namespace, kept distinct from any real tenant's.
+		tenant = "unscoped"
+	}
+	sum := sha256.Sum256([]byte(tenant + "\x00" + clientKey))
+	return "idempotency:" + hex.EncodeToString(sum[:])
 }
 
 // Idempotency returns middleware that honours an `Idempotency-Key` header on
@@ -95,11 +127,26 @@ func Idempotency(rdb *redis.Client, ttl time.Duration) func(http.Handler) http.H
 			r.Body = io.NopCloser(bytes.NewReader(body))
 
 			fingerprint := fingerprintIdempotentRequest(r.Method, r.URL.Path, body)
-			redisKey := "idempotency:" + key
+			redisKey := idempotencyRedisKey(r.Context(), key)
 
 			if cached, err := rdb.Get(r.Context(), redisKey).Result(); err == nil {
 				var rec idempotencyRecord
 				if jsonErr := json.Unmarshal([]byte(cached), &rec); jsonErr == nil {
+					if rec.InFlight {
+						// Another request holding this key is still executing.
+						// Replaying nothing and re-executing would double-create,
+						// which is the whole failure this middleware exists to
+						// prevent, so the retry is told to come back instead.
+						if rec.Fingerprint != fingerprint {
+							httputil.WriteErrorCtx(r.Context(), w, http.StatusConflict, httputil.CONFLICT,
+								"Idempotency-Key was already used with a different request")
+							return
+						}
+						w.Header().Set("Retry-After", "1")
+						httputil.WriteErrorCtx(r.Context(), w, http.StatusConflict, httputil.CONFLICT,
+							"a request with this Idempotency-Key is still in progress; retry shortly")
+						return
+					}
 					if rec.Fingerprint != fingerprint {
 						httputil.WriteErrorCtx(r.Context(), w, http.StatusConflict, httputil.CONFLICT,
 							"Idempotency-Key was already used with a different request")
@@ -116,9 +163,45 @@ func Idempotency(rdb *redis.Client, ttl time.Duration) func(http.Handler) http.H
 				slog.WarnContext(r.Context(), "idempotency: redis get failed; proceeding without replay", "err", err)
 			}
 
+			// Reserve the key before executing. Without this, N concurrent
+			// requests carrying the same key all miss the Get above and all
+			// run the handler — N resources created, which is exactly the
+			// double-create #225 exists to prevent. SET NX makes exactly one
+			// of them the winner; the losers take the InFlight branch above.
+			// A failed reservation is not fatal: Redis being down should
+			// degrade to today's behaviour, not reject the write.
+			reserved := true
+			if data, err := json.Marshal(idempotencyRecord{Fingerprint: fingerprint, InFlight: true}); err == nil {
+				ok, err := rdb.SetNX(r.Context(), redisKey, data, inFlightTTL).Result()
+				if err != nil {
+					slog.WarnContext(r.Context(), "idempotency: redis reservation failed; proceeding unreserved", "err", err)
+					reserved = false
+				} else if !ok {
+					// Lost the race between the Get and here. The winner owns
+					// the key; tell this caller to retry rather than execute.
+					w.Header().Set("Retry-After", "1")
+					httputil.WriteErrorCtx(r.Context(), w, http.StatusConflict, httputil.CONFLICT,
+						"a request with this Idempotency-Key is still in progress; retry shortly")
+					return
+				}
+			}
+
 			capture := newCaptureWriter()
 			next.ServeHTTP(capture, r)
 			capture.flushTo(w)
+
+			// Never persist a 5xx. Caching one would pin a transient failure
+			// for the full TTL: the client's retry — the exact scenario this
+			// feature serves — would replay the 500 instead of succeeding.
+			// Releasing the reservation lets that retry through.
+			if capture.statusCode >= 500 {
+				if reserved {
+					if err := rdb.Del(r.Context(), redisKey).Err(); err != nil {
+						slog.WarnContext(r.Context(), "idempotency: releasing reservation after 5xx failed", "err", err)
+					}
+				}
+				return
+			}
 
 			rec := idempotencyRecord{
 				Fingerprint: fingerprint,
