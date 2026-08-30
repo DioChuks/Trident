@@ -558,3 +558,8 @@ CREATE TABLE IF NOT EXISTS failed_events (
 
 CREATE INDEX IF NOT EXISTS idx_failed_events_occurred_at ON failed_events (occurred_at DESC);
 CREATE INDEX IF NOT EXISTS idx_failed_events_pending ON failed_events (occurred_at) WHERE replayed_at IS NULL;
+-- Pending rows are unique per event (migration 0030): redelivered failures
+-- update in place, so COUNT(*) of pending rows = distinct poisoned events.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_failed_events_pending
+    ON failed_events (contract_id, ledger_sequence, event_index)
+    WHERE replayed_at IS NULL;

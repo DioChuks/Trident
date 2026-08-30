@@ -686,3 +686,64 @@ those, so it fires on the level rather than the slope.
    gone: `SELECT pg_drop_replication_slot('<name>');`
 3. If it is ordinary growth, treat it as
    `TridentDiskFillingWithin48Hours` above.
+
+## TridentIndexerPersistDeadLetterBacklog
+
+**Means:** `failed_events` has pending rows — at least one event decoded
+fine but its database commit kept failing through the whole-page retry, the
+per-event isolation retry, and its backoff budget, so the streamer captured
+the failing event (full payload + error message), counted it on
+`trident_indexer_persist_dead_lettered_total`, and advanced the cursor past
+it (issues #208/#508). The data is safe but missing from `soroban_events`
+until replayed.
+
+**Why this threshold:** any pending row at all means indexed data is
+incomplete, and rows leave the pending state only through the replay
+procedure below — so the alert stays up until the gap is actually closed. A
+silent DLQ is the same as data loss. `for: 5m` only absorbs scrape jitter.
+Pending rows are unique per event (migration 0030): the gauge counts
+distinct poisoned events, not retry bursts.
+
+**First steps:**
+
+1. Inspect the queue:
+
+   ```sql
+   SELECT contract_id, ledger_sequence, error_message, attempts, occurred_at
+   FROM failed_events WHERE replayed_at IS NULL ORDER BY occurred_at;
+   ```
+
+   `error_message` names the exact commit error, updated to the most recent
+   failure; `attempts` accumulates across redeliveries.
+2. Fix the underlying cause (a malformed field failing column conversion, a
+   constraint interaction, …). The failure survived the whole retry budget,
+   so replaying before the fix will just fail again.
+3. **Replay** once the fix is deployed: re-ingest the affected range with
+   the backfill CLI (idempotent — `ON CONFLICT DO NOTHING` absorbs the
+   events that did commit). Note its scope: backfill restores rows in
+   `soroban_events` only — it does not write outbox rows or token
+   projections, so replayed events are not delivered to Redis/webhook
+   subscribers and do not appear in `token_events`. Acceptable for
+   historical repair, but know what you are and are not restoring:
+
+   ```
+   trident-backfill --from-ledger <min> --to-ledger <max> [--contract <id>]
+   ```
+
+   using `SELECT MIN(ledger_sequence), MAX(ledger_sequence) FROM
+   failed_events WHERE replayed_at IS NULL;` for the range.
+4. Verify the events landed, then mark the rows replayed — this is what
+   resolves the alert (rows are kept as history, never deleted):
+
+   ```sql
+   UPDATE failed_events d
+   SET replayed_at = NOW()
+   FROM soroban_events e
+   WHERE d.replayed_at IS NULL
+     AND e.ledger_sequence = d.ledger_sequence
+     AND e.transaction_hash = d.transaction_hash
+     AND e.event_index = d.event_index;
+   ```
+
+   The gauge refreshes on the next active poll cycle; the alert clears once
+   no pending rows remain.
