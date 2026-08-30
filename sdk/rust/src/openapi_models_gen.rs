@@ -45,6 +45,9 @@ pub struct OpenApiModels {
 
     pub indexer_stats_response: Option<IndexerStatsResponse>,
 
+    #[serde(rename = "ListAPIKeysResponse")]
+    pub list_api_keys_response: Option<ListApiKeysResponse>,
+
     pub liveness_response: Option<LivenessResponse>,
 
     pub ready_checks: Option<ReadyChecks>,
@@ -266,7 +269,7 @@ pub struct ErrorResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Error {
-    /// Error code (e.g., INVALID_ARGUMENT, INTERNAL, UNAVAILABLE)
+    /// Error code (e.g., INVALID_ARGUMENT, INTERNAL, UNAVAILABLE, CONFLICT)
     pub code: String,
 
     /// Human-readable error message
@@ -377,6 +380,17 @@ pub enum IndexerStatsResponseStatus {
     Lagging,
 
     Stalled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListApiKeysResponse {
+    pub api_keys: Vec<ApiKeyResponse>,
+
+    /// Whether another page is available.
+    pub has_more: bool,
+
+    /// Opaque cursor for the next page (null if has_more is false).
+    pub next_cursor: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
