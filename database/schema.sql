@@ -1,6 +1,6 @@
 -- Trident PostgreSQL Schema
 -- Convenience full-schema snapshot for local/dev bootstrap and documentation.
--- The migration chain in ./migrations/ (0001-0028) is the source of truth and is
+-- The migration chain in ./migrations/ (0001-0029) is the source of truth and is
 -- what CI and production apply; this file must mirror the end state of that chain.
 -- Keep in sync whenever a migration is added.
 
@@ -152,8 +152,28 @@ CREATE TABLE IF NOT EXISTS audit_log (
     ts           TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_audit_log_key_ts ON audit_log (api_key_id, ts DESC);
-CREATE INDEX IF NOT EXISTS idx_audit_log_ts     ON audit_log (ts DESC);
+-- Covers the admin analytics queries (migration 0029). The INCLUDE columns
+-- are read but never seeked on, so they live only in the leaves and make
+-- those queries index-only rather than paying a heap visit per matching row.
+-- Supersedes the original idx_audit_log_key_ts (api_key_id, ts DESC), which
+-- was a strict prefix of this index.
+CREATE INDEX IF NOT EXISTS idx_audit_log_key_ts_covering
+    ON audit_log (api_key_id, ts DESC)
+    INCLUDE (status_code, endpoint, duration_ms);
+
+-- Covers the usage rollup job (migration 0029). Partial on the job's own
+-- WHERE clause: rows whose key was deleted (api_key_id is ON DELETE SET
+-- NULL) can never contribute to a per-key rollup.
+CREATE INDEX IF NOT EXISTS idx_audit_log_rollup
+    ON audit_log (ts)
+    INCLUDE (api_key_id, status_code, duration_ms)
+    WHERE api_key_id IS NOT NULL;
+
+-- Time-range scans over all rows, including those with a NULL api_key_id
+-- that idx_audit_log_rollup excludes. Also what the retention cleanup falls
+-- back to once its predicate becomes selective enough to prefer an index —
+-- see docs/db/explain-audit-log-247.txt.
+CREATE INDEX IF NOT EXISTS idx_audit_log_ts ON audit_log (ts DESC);
 
 -- ---------------------------------------------------------------------------
 -- parse_errors
