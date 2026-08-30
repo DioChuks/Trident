@@ -600,6 +600,12 @@ mod tests {
         })
     }
 
+    /// These two tests mutate genuinely global state — the `indexed_contracts`
+    /// allowlist and the `latest_ledger_cursor` row — so they hold this for
+    /// their whole run instead of racing each other (and use a ledger window,
+    /// [30201, 30600], that no other suite's fixtures touch).
+    static RECONCILE_DB_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     async fn seed_event(pool: &sqlx::PgPool, ledger: u64, idx: u32, contract: &str) {
         sqlx::query(
             "INSERT INTO soroban_events
@@ -623,14 +629,15 @@ mod tests {
     /// and a parse-error row counts as accounted for.
     #[tokio::test]
     async fn pass_reports_missing_and_extra_ledger_ranges() {
+        let _guard = RECONCILE_DB_LOCK.lock().await;
         let Some(db_url) = test_db_url() else { return };
         let pool = sqlx::PgPool::connect(&db_url).await.expect("db connect");
 
-        sqlx::query("DELETE FROM soroban_events")
+        sqlx::query("DELETE FROM soroban_events WHERE ledger_sequence BETWEEN 30201 AND 30600")
             .execute(&pool)
             .await
             .expect("clear events");
-        sqlx::query("DELETE FROM parse_errors")
+        sqlx::query("DELETE FROM parse_errors WHERE ledger_sequence BETWEEN 30201 AND 30600")
             .execute(&pool)
             .await
             .expect("clear parse errors");
@@ -638,7 +645,7 @@ mod tests {
             .execute(&pool)
             .await
             .expect("clear allowlist");
-        sqlx::query("UPDATE system_state SET value = '900' WHERE key = 'latest_ledger_cursor'")
+        sqlx::query("UPDATE system_state SET value = '30600' WHERE key = 'latest_ledger_cursor'")
             .execute(&pool)
             .await
             .expect("set cursor");
@@ -649,17 +656,17 @@ mod tests {
             .and(body_partial_json(json!({"method": "getLatestLedger"})))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "jsonrpc": "2.0", "id": 1,
-                "result": {"sequence": 1000}
+                "result": {"sequence": 30700}
             })))
             .mount(&server)
             .await;
-        // Chain truth (window [501, 900] at span 400 / margin 100 / tip 1000):
-        //   850: two countable events           -> DB has 1 indexed + 1 parse
+        // Chain truth (window [30201, 30600] at span 400 / margin 100 / tip 1000):
+        //   30550: two countable events           -> DB has 1 indexed + 1 parse
         //        error, so it is fully accounted for (clean).
-        //   851: one FAILED-call event          -> must not count (clean).
-        //   852: one diagnostic event           -> must not count (clean).
-        //   853: one countable event            -> DB has nothing (missing).
-        //   860: nothing                        -> DB has one row (extra).
+        //   30551: one FAILED-call event          -> must not count (clean).
+        //   30552: one diagnostic event           -> must not count (clean).
+        //   30553: one countable event            -> DB has nothing (missing).
+        //   30560: nothing                        -> DB has one row (extra).
         Mock::given(method("POST"))
             .and(path("/"))
             .and(body_partial_json(json!({"method": "getEvents"})))
@@ -667,27 +674,27 @@ mod tests {
                 "jsonrpc": "2.0", "id": 1,
                 "result": {
                     "events": [
-                        raw_event(850, 0, "CRECON", "contract", true),
-                        raw_event(850, 1, "CRECON", "contract", true),
-                        raw_event(851, 0, "CRECON", "contract", false),
-                        raw_event(852, 0, "CRECON", "diagnostic", true),
-                        raw_event(853, 0, "CRECON", "contract", true),
+                        raw_event(30550, 0, "CRECON", "contract", true),
+                        raw_event(30550, 1, "CRECON", "contract", true),
+                        raw_event(30551, 0, "CRECON", "contract", false),
+                        raw_event(30552, 0, "CRECON", "diagnostic", true),
+                        raw_event(30553, 0, "CRECON", "contract", true),
                     ],
-                    "latestLedger": 1000
+                    "latestLedger": 30700
                 }
             })))
             .mount(&server)
             .await;
 
-        seed_event(&pool, 850, 0, "CRECON").await;
+        seed_event(&pool, 30550, 0, "CRECON").await;
         sqlx::query(
             "INSERT INTO parse_errors (ledger_sequence, event_index, raw_payload, error_message)
-             VALUES (850, 1, '{}', 'test decode failure')",
+             VALUES (30550, 1, '{}', 'test decode failure')",
         )
         .execute(&pool)
         .await
         .expect("seed parse error");
-        seed_event(&pool, 860, 0, "CRECON").await;
+        seed_event(&pool, 30560, 0, "CRECON").await;
 
         let rpc = RpcClient::with_endpoints(
             vec![server.uri()],
@@ -714,21 +721,21 @@ mod tests {
 
         let report = reconciler.run_pass().await.expect("pass");
 
-        assert_eq!(report.window_start, 501);
-        assert_eq!(report.window_end, 900);
+        assert_eq!(report.window_start, 30201);
+        assert_eq!(report.window_end, 30600);
         assert!(!report.truncated);
         assert_eq!(
             report.discrepant_ranges,
             vec![
                 DiscrepantRange {
-                    from_ledger: 853,
-                    to_ledger: 853,
+                    from_ledger: 30553,
+                    to_ledger: 30553,
                     rpc_events: 1,
                     db_events: 0,
                 },
                 DiscrepantRange {
-                    from_ledger: 860,
-                    to_ledger: 860,
+                    from_ledger: 30560,
+                    to_ledger: 30560,
                     rpc_events: 0,
                     db_events: 1,
                 },
@@ -746,14 +753,15 @@ mod tests {
     /// would read as missing.
     #[tokio::test]
     async fn allowlist_rules_are_mirrored_on_the_rpc_side() {
+        let _guard = RECONCILE_DB_LOCK.lock().await;
         let Some(db_url) = test_db_url() else { return };
         let pool = sqlx::PgPool::connect(&db_url).await.expect("db connect");
 
-        sqlx::query("DELETE FROM soroban_events")
+        sqlx::query("DELETE FROM soroban_events WHERE ledger_sequence BETWEEN 30201 AND 30600")
             .execute(&pool)
             .await
             .expect("clear events");
-        sqlx::query("DELETE FROM parse_errors")
+        sqlx::query("DELETE FROM parse_errors WHERE ledger_sequence BETWEEN 30201 AND 30600")
             .execute(&pool)
             .await
             .expect("clear parse errors");
@@ -763,12 +771,12 @@ mod tests {
             .expect("clear allowlist");
         sqlx::query(
             "INSERT INTO indexed_contracts (contract_id, network, index_from)
-             VALUES ('CLISTED', 'testnet', 855)",
+             VALUES ('CLISTED', 'testnet', 30555)",
         )
         .execute(&pool)
         .await
         .expect("seed allowlist");
-        sqlx::query("UPDATE system_state SET value = '900' WHERE key = 'latest_ledger_cursor'")
+        sqlx::query("UPDATE system_state SET value = '30600' WHERE key = 'latest_ledger_cursor'")
             .execute(&pool)
             .await
             .expect("set cursor");
@@ -779,13 +787,13 @@ mod tests {
             .and(body_partial_json(json!({"method": "getLatestLedger"})))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "jsonrpc": "2.0", "id": 1,
-                "result": {"sequence": 1000}
+                "result": {"sequence": 30700}
             })))
             .mount(&server)
             .await;
-        // 850: listed contract but BELOW its index_from -> not counted.
-        // 860: unlisted contract -> not counted.
-        // 870: listed, at/above index_from -> counted; DB has it (clean).
+        // 30550: listed contract but BELOW its index_from -> not counted.
+        // 30560: unlisted contract -> not counted.
+        // 30570: listed, at/above index_from -> counted; DB has it (clean).
         Mock::given(method("POST"))
             .and(path("/"))
             .and(body_partial_json(json!({"method": "getEvents"})))
@@ -793,17 +801,17 @@ mod tests {
                 "jsonrpc": "2.0", "id": 1,
                 "result": {
                     "events": [
-                        raw_event(850, 0, "CLISTED", "contract", true),
-                        raw_event(860, 0, "CUNLISTED", "contract", true),
-                        raw_event(870, 0, "CLISTED", "contract", true),
+                        raw_event(30550, 0, "CLISTED", "contract", true),
+                        raw_event(30560, 0, "CUNLISTED", "contract", true),
+                        raw_event(30570, 0, "CLISTED", "contract", true),
                     ],
-                    "latestLedger": 1000
+                    "latestLedger": 30700
                 }
             })))
             .mount(&server)
             .await;
 
-        seed_event(&pool, 870, 0, "CLISTED").await;
+        seed_event(&pool, 30570, 0, "CLISTED").await;
 
         let rpc = RpcClient::with_endpoints(
             vec![server.uri()],
