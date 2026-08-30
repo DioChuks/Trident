@@ -21,28 +21,29 @@ func (r *OpenAPIModels) Marshal() ([]byte, error) {
 }
 
 type OpenAPIModels struct {
-	APIKeyResponse              *APIKeyResponse              `json:"APIKeyResponse,omitempty"`
-	ContractEventFieldSchema    *ContractEventFieldSchema    `json:"ContractEventFieldSchema,omitempty"`
-	ContractEventSchema         *ContractEventSchema         `json:"ContractEventSchema,omitempty"`
-	ContractEventSchemaResponse *ContractEventSchemaResponse `json:"ContractEventSchemaResponse,omitempty"`
-	ContractResponse            *ContractResponse            `json:"ContractResponse,omitempty"`
-	ContractSpecFunction        *ContractSpecFunction        `json:"ContractSpecFunction,omitempty"`
-	ContractSpecResponse        *ContractSpecResponse        `json:"ContractSpecResponse,omitempty"`
-	ContractStats               *ContractStats               `json:"ContractStats,omitempty"`
-	ContractStatsResponse       *ContractStatsResponse       `json:"ContractStatsResponse,omitempty"`
-	ContractStorageResponse     *ContractStorageResponse     `json:"ContractStorageResponse,omitempty"`
-	ContractStorageValue        *ContractStorageValue        `json:"ContractStorageValue,omitempty"`
-	ErrorResponse               *ErrorResponse               `json:"ErrorResponse,omitempty"`
-	EventListResponse           *EventListResponse           `json:"EventListResponse,omitempty"`
-	IndexerStatsResponse        *IndexerStatsResponse        `json:"IndexerStatsResponse,omitempty"`
-	ListAPIKeysResponse         *ListAPIKeysResponse         `json:"ListAPIKeysResponse,omitempty"`
-	ListContractsResponse       *ListContractsResponse       `json:"ListContractsResponse,omitempty"`
-	LivenessResponse            *LivenessResponse            `json:"LivenessResponse,omitempty"`
-	ReadyChecks                 *ReadyChecks                 `json:"ReadyChecks,omitempty"`
-	ReadyResponse               *ReadyResponse               `json:"ReadyResponse,omitempty"`
-	SorobanEvent                *SorobanEvent                `json:"SorobanEvent,omitempty"`
-	TokenMetadataResponse       *TokenMetadataResponse       `json:"TokenMetadataResponse,omitempty"`
-	VersionResponse             *VersionResponse             `json:"VersionResponse,omitempty"`
+	APIKeyResponse                 *APIKeyResponse                 `json:"APIKeyResponse,omitempty"`
+	ContractEventFieldSchema       *ContractEventFieldSchema       `json:"ContractEventFieldSchema,omitempty"`
+	ContractEventSchema            *ContractEventSchema            `json:"ContractEventSchema,omitempty"`
+	ContractEventSchemaResponse    *ContractEventSchemaResponse    `json:"ContractEventSchemaResponse,omitempty"`
+	ContractResponse               *ContractResponse               `json:"ContractResponse,omitempty"`
+	ContractSpecFunction           *ContractSpecFunction           `json:"ContractSpecFunction,omitempty"`
+	ContractSpecResponse           *ContractSpecResponse           `json:"ContractSpecResponse,omitempty"`
+	ContractStats                  *ContractStats                  `json:"ContractStats,omitempty"`
+	ContractStatsResponse          *ContractStatsResponse          `json:"ContractStatsResponse,omitempty"`
+	ContractStorageHistoryResponse *ContractStorageHistoryResponse `json:"ContractStorageHistoryResponse,omitempty"`
+	ContractStorageResponse        *ContractStorageResponse        `json:"ContractStorageResponse,omitempty"`
+	ContractStorageValue           *ContractStorageValue           `json:"ContractStorageValue,omitempty"`
+	ErrorResponse                  *ErrorResponse                  `json:"ErrorResponse,omitempty"`
+	EventListResponse              *EventListResponse              `json:"EventListResponse,omitempty"`
+	IndexerStatsResponse           *IndexerStatsResponse           `json:"IndexerStatsResponse,omitempty"`
+	ListAPIKeysResponse            *ListAPIKeysResponse            `json:"ListAPIKeysResponse,omitempty"`
+	ListContractsResponse          *ListContractsResponse          `json:"ListContractsResponse,omitempty"`
+	LivenessResponse               *LivenessResponse               `json:"LivenessResponse,omitempty"`
+	ReadyChecks                    *ReadyChecks                    `json:"ReadyChecks,omitempty"`
+	ReadyResponse                  *ReadyResponse                  `json:"ReadyResponse,omitempty"`
+	SorobanEvent                   *SorobanEvent                   `json:"SorobanEvent,omitempty"`
+	TokenMetadataResponse          *TokenMetadataResponse          `json:"TokenMetadataResponse,omitempty"`
+	VersionResponse                *VersionResponse                `json:"VersionResponse,omitempty"`
 }
 
 type APIKeyResponse struct {
@@ -136,25 +137,35 @@ type ContractStats struct {
 }
 
 type ContractStatsResponse struct {
-	// Contracts sorted by event count (descending)                
-	Contracts                                      []ContractStats `json:"contracts"`
-	// Lower bound of queried ledger range                         
-	FromLedger                                     int64           `json:"from_ledger"`
-	// Timestamp when response was generated                       
-	GeneratedAt                                    time.Time       `json:"generated_at"`
-	// Network queried                                             
-	Network                                        Network         `json:"network"`
-	// Upper bound of queried ledger range                         
-	ToLedger                                       int64           `json:"to_ledger"`
+	// Contracts sorted by event count (descending)                                   
+	Contracts                                                         []ContractStats `json:"contracts"`
+	// Lower bound of queried ledger range                                            
+	FromLedger                                                        int64           `json:"from_ledger"`
+	// Timestamp when response was generated                                          
+	GeneratedAt                                                       time.Time       `json:"generated_at"`
+	// Whether more pages are available                                               
+	HasMore                                                           bool            `json:"has_more"`
+	// Network queried                                                                
+	Network                                                           Network         `json:"network"`
+	// Opaque cursor to pass as the cursor parameter for the next page                
+	NextCursor                                                        *string         `json:"next_cursor,omitempty"`
+	// Upper bound of queried ledger range                                            
+	ToLedger                                                          int64           `json:"to_ledger"`
 }
 
-type ContractStorageResponse struct {
-	// Soroban contract address                                                                                  
-	ContractID                                                                            string                 `json:"contract_id"`
-	// Network queried                                                                                           
-	Network                                                                               Network                `json:"network"`
-	// Storage snapshot values (latest, or full history when queried via /storage/history)                       
-	Values                                                                                []ContractStorageValue `json:"values"`
+type ContractStorageHistoryResponse struct {
+	// The contract whose storage history was queried                                        
+	ContractID                                                        string                 `json:"contract_id"`
+	// Whether more pages are available                                                      
+	HasMore                                                           bool                   `json:"has_more"`
+	// Network the contract is indexed on                                                    
+	Network                                                           string                 `json:"network"`
+	// Opaque cursor to pass as the cursor parameter for the next page                       
+	NextCursor                                                        *string                `json:"next_cursor,omitempty"`
+	// The storage key whose history was queried                                             
+	StorageKey                                                        string                 `json:"storage_key"`
+	// Storage history entries, oldest first                                                 
+	Values                                                            []ContractStorageValue `json:"values"`
 }
 
 type ContractStorageValue struct {
@@ -168,6 +179,15 @@ type ContractStorageValue struct {
 	StorageKey                                                         string      `json:"storage_key"`
 	// Human-readable decoded value (absent when the entry was removed)            
 	Value                                                              interface{} `json:"value"`
+}
+
+type ContractStorageResponse struct {
+	// Soroban contract address                                                                                  
+	ContractID                                                                            string                 `json:"contract_id"`
+	// Network queried                                                                                           
+	Network                                                                               Network                `json:"network"`
+	// Storage snapshot values (latest, or full history when queried via /storage/history)                       
+	Values                                                                                []ContractStorageValue `json:"values"`
 }
 
 type ErrorResponse struct {

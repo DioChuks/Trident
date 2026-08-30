@@ -35,6 +35,8 @@ pub struct OpenApiModels {
 
     pub contract_stats_response: Option<ContractStatsResponse>,
 
+    pub contract_storage_history_response: Option<ContractStorageHistoryResponse>,
+
     pub contract_storage_response: Option<ContractStorageResponse>,
 
     pub contract_storage_value: Option<ContractStorageValue>,
@@ -217,22 +219,37 @@ pub struct ContractStatsResponse {
     /// Timestamp when response was generated
     pub generated_at: String,
 
+    /// Whether more pages are available
+    pub has_more: bool,
+
     /// Network queried
     pub network: Network,
+
+    /// Opaque cursor to pass as the cursor parameter for the next page
+    pub next_cursor: Option<String>,
 
     /// Upper bound of queried ledger range
     pub to_ledger: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ContractStorageResponse {
-    /// Soroban contract address
+pub struct ContractStorageHistoryResponse {
+    /// The contract whose storage history was queried
     pub contract_id: String,
 
-    /// Network queried
-    pub network: Network,
+    /// Whether more pages are available
+    pub has_more: bool,
 
-    /// Storage snapshot values (latest, or full history when queried via /storage/history)
+    /// Network the contract is indexed on
+    pub network: String,
+
+    /// Opaque cursor to pass as the cursor parameter for the next page
+    pub next_cursor: Option<String>,
+
+    /// The storage key whose history was queried
+    pub storage_key: String,
+
+    /// Storage history entries, oldest first
     pub values: Vec<ContractStorageValue>,
 }
 
@@ -252,6 +269,18 @@ pub struct ContractStorageValue {
 
     /// Human-readable decoded value (absent when the entry was removed)
     pub value: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContractStorageResponse {
+    /// Soroban contract address
+    pub contract_id: String,
+
+    /// Network queried
+    pub network: Network,
+
+    /// Storage snapshot values (latest, or full history when queried via /storage/history)
+    pub values: Vec<ContractStorageValue>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
