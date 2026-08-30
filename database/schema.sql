@@ -1,6 +1,6 @@
 -- Trident PostgreSQL Schema
 -- Convenience full-schema snapshot for local/dev bootstrap and documentation.
--- The migration chain in ./migrations/ (0001-0028) is the source of truth and is
+-- The migration chain in ./migrations/ (0001-0029) is the source of truth and is
 -- what CI and production apply; this file must mirror the end state of that chain.
 -- Keep in sync whenever a migration is added.
 
