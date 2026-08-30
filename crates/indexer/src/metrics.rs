@@ -40,6 +40,14 @@ pub const EFFECTIVE_POLL_INTERVAL_MS: &str = "trident_indexer_effective_poll_int
 pub const RPC_TIMEOUTS_TOTAL: &str = "trident_indexer_rpc_timeouts_total";
 pub const RPC_ACTIVE_ENDPOINT: &str = "trident_indexer_rpc_active_endpoint";
 pub const RPC_FAILOVERS_TOTAL: &str = "trident_indexer_rpc_failovers_total";
+/// Count of structurally valid ScVal variants decoded from event payloads
+/// where they should never legitimately appear (`ContractInstance`,
+/// `LedgerKeyContractInstance`, `LedgerKeyNonce`). Emitted by the shared
+/// decoder in `trident_common::scval` (issue #506, superseding the #415
+/// debug-fallback counter: the decoder no longer has a fallback — matches
+/// are exhaustive, so a new XDR variant fails compilation instead).
+pub const UNEXPECTED_SCVAL_VARIANT_TOTAL: &str =
+    trident_common::scval::UNEXPECTED_SCVAL_VARIANT_TOTAL;
 pub const OUTBOX_BACKLOG: &str = "trident_indexer_outbox_backlog";
 pub const OUTBOX_PUBLISHED_TOTAL: &str = "trident_indexer_outbox_published_total";
 pub const OUTBOX_PUBLISH_FAILURES_TOTAL: &str = "trident_indexer_outbox_publish_failures_total";
@@ -157,6 +165,10 @@ pub fn install(port: u16) -> Result<(), TridentError> {
         OUTBOX_PUBLISH_FAILURES_TOTAL,
         "Outbox publish attempts that failed (issue #200)"
     );
+    describe_counter!(
+        UNEXPECTED_SCVAL_VARIANT_TOTAL,
+        "ScVal variants decoded from event payloads where they should never appear (issue #506)"
+    );
     describe_gauge!(
         HEARTBEAT_TIMESTAMP,
         "Unix timestamp (seconds) of the most recent completed poll cycle (#218)"
@@ -205,6 +217,7 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     counter!(RPC_FAILOVERS_TOTAL).increment(0);
     counter!(OUTBOX_PUBLISHED_TOTAL).increment(0);
     counter!(OUTBOX_PUBLISH_FAILURES_TOTAL).increment(0);
+    counter!(UNEXPECTED_SCVAL_VARIANT_TOTAL).increment(0);
     gauge!(RPC_ACTIVE_ENDPOINT).set(0.0);
     gauge!(OUTBOX_BACKLOG).set(0.0);
     gauge!(LEDGER_LAG).set(0.0);
