@@ -33,6 +33,16 @@ pub const PARSE_ERRORS_TOTAL: &str = "trident_indexer_parse_errors_total";
 /// including ones that later succeed on retry: this counter only moves when an
 /// event is actually abandoned, which is what an alert should fire on.
 pub const DEAD_LETTERED_TOTAL: &str = "trident_indexer_dead_lettered_total";
+/// Deliberately separate from DEAD_LETTERED_TOTAL above: that one counts
+/// undecodable events captured in `parse_errors` (a poison message — retry
+/// never helps), while this counts well-formed events whose database commit
+/// failed after the retry budget and landed in `failed_events` for replay
+/// (issue #508). Conflating them made one number answer two different
+/// operational questions.
+pub const PERSIST_DEAD_LETTERED_TOTAL: &str = "trident_indexer_persist_dead_lettered_total";
+/// Current number of `failed_events` rows awaiting replay. Non-empty pages
+/// via TridentIndexerPersistDeadLetterBacklog (monitoring/alerts.yml).
+pub const PERSIST_DEAD_LETTER_BACKLOG: &str = "trident_indexer_persist_dead_letter_backlog";
 pub const POLL_DURATION_SECONDS: &str = "trident_indexer_poll_duration_seconds";
 pub const POLL_ERRORS_TOTAL: &str = "trident_indexer_poll_errors_total";
 pub const RPC_RETRIES_TOTAL: &str = "trident_indexer_rpc_retries_total";
@@ -139,6 +149,18 @@ pub fn install(port: u16) -> Result<(), TridentError> {
         "Events skipped (diagnostic, failed call, or contract filter)"
     );
     describe_counter!(PARSE_ERRORS_TOTAL, "Total events that failed XDR decoding");
+    describe_counter!(
+        DEAD_LETTERED_TOTAL,
+        "Undecodable events durably captured in parse_errors (issue #414)"
+    );
+    describe_counter!(
+        PERSIST_DEAD_LETTERED_TOTAL,
+        "Well-formed events captured in failed_events after exhausting the persist retry budget (issue #508)"
+    );
+    describe_gauge!(
+        PERSIST_DEAD_LETTER_BACKLOG,
+        "failed_events rows awaiting replay; non-empty pages via TridentIndexerPersistDeadLetterBacklog (issue #508)"
+    );
     describe_histogram!(
         POLL_DURATION_SECONDS,
         "Time per poll_once cycle, in seconds"
@@ -254,6 +276,9 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     counter!(RECONCILE_EXTRA_EVENTS_TOTAL).increment(0);
     gauge!(RECONCILE_DISCREPANT_LEDGERS).set(0.0);
     gauge!(RECONCILE_WINDOW_END_LEDGER).set(0.0);
+    counter!(PERSIST_DEAD_LETTERED_TOTAL).increment(0);
+    gauge!(PERSIST_DEAD_LETTER_BACKLOG).set(0.0);
+    counter!(DEAD_LETTERED_TOTAL).increment(0);
     gauge!(RPC_ACTIVE_ENDPOINT).set(0.0);
     gauge!(OUTBOX_BACKLOG).set(0.0);
     gauge!(LEDGER_LAG).set(0.0);
@@ -372,6 +397,14 @@ pub fn record_events_skipped(count: u64) {
 
 pub fn record_parse_error() {
     counter!(PARSE_ERRORS_TOTAL).increment(1);
+}
+
+pub fn record_persist_dead_lettered() {
+    counter!(PERSIST_DEAD_LETTERED_TOTAL).increment(1);
+}
+
+pub fn set_persist_dead_letter_backlog(depth: i64) {
+    gauge!(PERSIST_DEAD_LETTER_BACKLOG).set(depth as f64);
 }
 
 pub fn record_dead_lettered() {
