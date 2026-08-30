@@ -28,6 +28,29 @@ info:
     - `network` — `testnet` or `mainnet`.
     - Unknown query parameters are rejected, so a typo such as `?limitt=5`
       fails loudly instead of silently changing the page size.
+
+    ## Pagination
+
+    Every list endpoint returns the same keyset-pagination envelope: the item
+    array, `has_more`, and `next_cursor`.
+
+    `next_cursor` is **always present** in the response object. When there is
+    no further page it is the explicit JSON value `null` — it is never omitted:
+
+    ```json
+    {"contracts": [], "has_more": false, "next_cursor": null}
+    ```
+
+    This is the normative wire form for every list endpoint. Explicit `null`
+    is used rather than an omitted key because the two are not equivalent to a
+    strictly-typed client: an omitted key cannot be distinguished from a server
+    too old to send the field, whereas `null` unambiguously means "no next
+    page". Fixing the representation across all list endpoints is what lets an
+    SDK auto-pager loop on one rule — *stop when `next_cursor` is `null`* —
+    with no per-endpoint special-casing.
+
+    Treat the cursor as opaque: pass back exactly the value you received, and
+    never construct or parse one.
   version: 1.0.0
   contact:
     name: Trident Team
@@ -1413,6 +1436,55 @@ components:
           type: string
           nullable: true
           description: Opaque cursor for the next page (null if has_more is false).
+
+    ListContractsResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - contracts
+        - has_more
+        - next_cursor
+      properties:
+        contracts:
+          type: array
+          items:
+            $ref: "#/components/schemas/ContractResponse"
+        has_more:
+          type: boolean
+          description: Whether another page is available.
+        next_cursor:
+          type: string
+          nullable: true
+          description: Opaque cursor for the next page (null if has_more is false).
+
+    ContractResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - contract_id
+        - index_from
+        - created_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        contract_id:
+          type: string
+          description: Stellar contract id (C... strkey).
+        network:
+          type: string
+          nullable: true
+        label:
+          type: string
+          nullable: true
+        index_from:
+          type: integer
+          format: int64
+          description: Ledger sequence indexing began from.
+        created_at:
+          type: string
+          format: date-time
 
     ErrorResponse:
       type: object
