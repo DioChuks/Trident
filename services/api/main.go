@@ -349,8 +349,6 @@ func main() {
 	mux.HandleFunc("GET /metrics", handlers.MetricsHandler(pool, redisClient))
 	mux.HandleFunc("GET /internal/status", handlers.InternalStatus())
 	mux.Handle("/ws", middleware.WSConnectionLimit(ws.Handler(hub)))
-	keyValidator := middleware.Validator(middleware.ParseKeyHashes(os.Getenv("API_KEY_HASHES")))
-	mux.Handle("/graphql", middleware.WSConnectionLimit(ws.GraphQLHandler(hub, keyValidator)))
 
 	_ = usageTrack // passed to middleware in future; declared for shutdown ordering
 
@@ -366,6 +364,21 @@ func main() {
 		authDB.DB = pool
 	}
 	authDB.Redis = redisClient
+
+	// GraphQL/WS is registered after rlCfg and authDB exist because it must
+	// reuse them (issue #223). The HTTP middlewares cannot cover this
+	// endpoint on their own: NewDBAuth skips any path that is neither /v1/*
+	// nor /ws, and TieredRateLimit keys off the X-API-Key header, which a
+	// WebSocket client never sends — it authenticates in the connection_init
+	// payload instead. Passing the same auth config and rate-limit config in
+	// here gives GraphQL the same api_keys lookup and the same per-key
+	// sliding window REST gets, rather than the legacy env-var key set and no
+	// limit at all.
+	mux.Handle("/graphql", middleware.WSConnectionLimit(ws.GraphQLHandler(hub, ws.GraphQLDeps{
+		Auth:        middleware.GraphQLDBAuth(authDB),
+		RateLimiter: middleware.GraphQLRateLimiter(rlCfg),
+		Backend:     handlers.NewGraphQLBackend(pool),
+	})))
 
 	handler := middleware.NewBodySizeLimitFromEnv()(mux)
 	handler = middleware.TieredRateLimit(rlCfg)(handler)

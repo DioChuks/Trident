@@ -43,11 +43,21 @@ type CreateContractRequest struct {
 	IndexFrom  int64  `json:"index_from,omitempty"`
 }
 
-// ListContractsResponse is the response for GET /v1/admin/contracts.
+// ListContractsResponse is the response for GET /v1/admin/contracts — the
+// same has_more/next_cursor envelope as ListEventsResponse and
+// ListAPIKeysResponse (issue #220).
+//
+// next_cursor deliberately carries no `omitempty` (issue #575): on the last
+// page it serialises as an explicit `null` rather than disappearing from the
+// object. Absence and null are different signals to a strictly-typed SDK —
+// an absent field cannot be told apart from a server too old to send it,
+// whereas null unambiguously means "no next page". Every list endpoint in
+// this API uses the explicit-null form, so the SDKs' auto-pagers need no
+// per-endpoint special-casing.
 type ListContractsResponse struct {
 	Contracts  []ContractResponse `json:"contracts"`
 	HasMore    bool               `json:"has_more"`
-	NextCursor *string            `json:"next_cursor,omitempty"`
+	NextCursor *string            `json:"next_cursor"`
 }
 
 // CreateContract handles POST /v1/admin/contracts.
