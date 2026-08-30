@@ -556,6 +556,19 @@ paths:
           schema:
             type: string
           description: Storage key to fetch history for, as returned by the storage/spec endpoints
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+          description: Maximum number of history entries to return
+        - name: cursor
+          in: query
+          schema:
+            type: string
+          description: Opaque pagination cursor from previous response's next_cursor (for next page)
       responses:
         "200":
           description: Recorded changes for the requested storage key
@@ -569,7 +582,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ContractStorageResponse"
+                $ref: "#/components/schemas/ContractStorageHistoryResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -638,6 +651,11 @@ paths:
             maximum: 100
             default: 50
           description: Number of top contracts to return
+        - name: cursor
+          in: query
+          schema:
+            type: string
+          description: Opaque pagination cursor from previous response's next_cursor (for next page)
       responses:
         "200":
           description: >-
@@ -1258,6 +1276,37 @@ components:
             $ref: "#/components/schemas/ContractStorageValue"
           description: Storage snapshot values (latest, or full history when queried via /storage/history)
 
+    ContractStorageHistoryResponse:
+      type: object
+      required:
+        - contract_id
+        - network
+        - storage_key
+        - values
+        - has_more
+      properties:
+        contract_id:
+          type: string
+          description: The contract whose storage history was queried
+        network:
+          type: string
+          description: Network the contract is indexed on
+        storage_key:
+          type: string
+          description: The storage key whose history was queried
+        values:
+          type: array
+          items:
+            $ref: "#/components/schemas/ContractStorageValue"
+          description: Storage history entries, oldest first
+        has_more:
+          type: boolean
+          description: Whether more pages are available
+        next_cursor:
+          type: string
+          nullable: true
+          description: Opaque cursor to pass as the cursor parameter for the next page
+
     ContractStorageValue:
       type: object
       additionalProperties: false
@@ -1293,6 +1342,7 @@ components:
         - to_ledger
         - network
         - generated_at
+        - has_more
       properties:
         contracts:
           type: array
@@ -1315,6 +1365,13 @@ components:
           type: string
           format: date-time
           description: Timestamp when response was generated
+        has_more:
+          type: boolean
+          description: Whether more pages are available
+        next_cursor:
+          type: string
+          nullable: true
+          description: Opaque cursor to pass as the cursor parameter for the next page
 
     ContractStats:
       type: object

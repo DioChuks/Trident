@@ -591,6 +591,20 @@ export interface components {
             /** @description Storage snapshot values (latest, or full history when queried via /storage/history) */
             values: components["schemas"]["ContractStorageValue"][];
         };
+        ContractStorageHistoryResponse: {
+            /** @description The contract whose storage history was queried */
+            contract_id: string;
+            /** @description Network the contract is indexed on */
+            network: string;
+            /** @description The storage key whose history was queried */
+            storage_key: string;
+            /** @description Storage history entries, oldest first */
+            values: components["schemas"]["ContractStorageValue"][];
+            /** @description Whether more pages are available */
+            has_more: boolean;
+            /** @description Opaque cursor to pass as the cursor parameter for the next page */
+            next_cursor?: string | null;
+        };
         ContractStorageValue: {
             /** @description Base64-encoded XDR LedgerKey this value was read from */
             storage_key: string;
@@ -632,6 +646,10 @@ export interface components {
              * @description Timestamp when response was generated
              */
             generated_at: string;
+            /** @description Whether more pages are available */
+            has_more: boolean;
+            /** @description Opaque cursor to pass as the cursor parameter for the next page */
+            next_cursor?: string | null;
         };
         ContractStats: {
             /** @description Soroban contract address */
@@ -1175,6 +1193,10 @@ export interface operations {
             query: {
                 /** @description Storage key to fetch history for, as returned by the storage/spec endpoints */
                 key: string;
+                /** @description Maximum number of history entries to return */
+                limit?: number;
+                /** @description Opaque pagination cursor from previous response's next_cursor (for next page) */
+                cursor?: string;
             };
             header?: never;
             path: {
@@ -1194,7 +1216,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ContractStorageResponse"];
+                    "application/json": components["schemas"]["ContractStorageHistoryResponse"];
                 };
             };
             400: components["responses"]["BadRequest"];
@@ -1236,6 +1258,8 @@ export interface operations {
                 network?: "testnet" | "mainnet";
                 /** @description Number of top contracts to return */
                 limit?: number;
+                /** @description Opaque pagination cursor from previous response's next_cursor (for next page) */
+                cursor?: string;
             };
             header?: never;
             path?: never;
