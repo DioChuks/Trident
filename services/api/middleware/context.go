@@ -34,6 +34,15 @@ func NetworkFromContext(ctx context.Context) string {
 	return "testnet"
 }
 
+// WithNetwork attaches an authenticated key's network to ctx for
+// NetworkFromContext to retrieve downstream. The counterpart to
+// WithAPIKeyID, exported for the same reason: so a test can simulate an
+// authenticated request on a given network without driving the whole auth
+// middleware.
+func WithNetwork(ctx context.Context, network string) context.Context {
+	return context.WithValue(ctx, contextKeyNetwork, network)
+}
+
 // requestLogState is a mutable holder for request facts that are only known
 // deep inside the middleware chain but must appear on StructuredLogging's
 // end-of-request log line (issue #239).

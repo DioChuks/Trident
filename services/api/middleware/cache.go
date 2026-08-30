@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -78,10 +80,57 @@ type CacheKeyFunc func(r *http.Request) (key, contractID string)
 // parameters together on purpose, to bound a fixed label's cardinality —
 // exactly the wrong thing for a cache key, where two different contracts
 // must land in two different cache entries, not share one.
+//
+// The three components are length-prefixed rather than joined on a bare
+// separator (issue #576). Joining on an unescaped "|" let a component
+// containing that byte imitate the delimiter: a path of
+// "/v1/contracts/C1|mainnet|/spec" (reaching the server percent-encoded as
+// %7C, which r.URL.Path holds decoded) produced a key byte-identical to the
+// one built for a different path/network pair. Length-prefixing removes the
+// ambiguity structurally — a reader consumes exactly n bytes, so no
+// component's content can be mistaken for framing, whatever bytes it holds.
+//
+// This was not reachable when written: both routes wrapped today
+// (/v1/contracts/{id}/spec and .../events/schema) validate the contract id
+// against ^C[A-Z2-7]{55}$, which cannot contain "|". It is fixed as a trap
+// for the next caller. ResponseCache is a general-purpose helper documented
+// as such, and the next route wrapped with a free-form path segment or an
+// unvalidated query parameter would get a cross-route cache collision whose
+// symptom — one endpoint serving another endpoint's response — is very hard
+// to trace back to a delimiter.
 func DefaultCacheKey(r *http.Request) (string, string) {
 	network := NetworkFromContext(r.Context())
-	key := r.URL.Path + "|" + network + "|" + r.URL.Query().Encode()
+	key := joinCacheKeyParts(r.URL.Path, network, r.URL.Query().Encode())
 	return key, r.PathValue("id")
+}
+
+// joinCacheKeyParts joins cache key components unambiguously by prefixing
+// each with its byte length: "<len>:<bytes>" repeated, e.g.
+//
+//	joinCacheKeyParts("/a", "mainnet", "") == "2:/a7:mainnet0:"
+//
+// Because a reader takes exactly the announced number of bytes, no component
+// can forge the framing of another — which is the property a bare separator
+// lacks and the whole point of issue #576. The encoding is injective: two
+// different component tuples cannot produce the same string.
+//
+// The parts stay human-readable in the key, which matters when inspecting
+// Redis during an incident; hashing would also close the collision but makes
+// every key opaque.
+func joinCacheKeyParts(parts ...string) string {
+	var b strings.Builder
+	// Each part contributes its bytes plus a short length prefix and colon.
+	n := 0
+	for _, p := range parts {
+		n += len(p) + 8
+	}
+	b.Grow(n)
+	for _, p := range parts {
+		b.WriteString(strconv.Itoa(len(p)))
+		b.WriteByte(':')
+		b.WriteString(p)
+	}
+	return b.String()
 }
 
 // cacheVersionPrefix keys the per-contract invalidation counter (issue
