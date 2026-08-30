@@ -322,11 +322,17 @@ class ContractStatsResponse:
     generated_at: str
     """Timestamp when response was generated"""
 
+    has_more: bool
+    """Whether more pages are available"""
+
     network: Network
     """Network queried"""
 
     to_ledger: int
     """Upper bound of queried ledger range"""
+
+    next_cursor: str | None = None
+    """Opaque cursor to pass as the cursor parameter for the next page"""
 
     @staticmethod
     def from_dict(obj: Any) -> 'ContractStatsResponse':
@@ -334,17 +340,22 @@ class ContractStatsResponse:
         contracts = from_list(ContractStats.from_dict, obj.get("contracts"))
         from_ledger = from_int(obj.get("from_ledger"))
         generated_at = from_str(obj.get("generated_at"))
+        has_more = from_bool(obj.get("has_more"))
         network = Network(obj.get("network"))
         to_ledger = from_int(obj.get("to_ledger"))
-        return ContractStatsResponse(contracts, from_ledger, generated_at, network, to_ledger)
+        next_cursor = from_union([from_str, from_none], obj.get("next_cursor"))
+        return ContractStatsResponse(contracts, from_ledger, generated_at, has_more, network, to_ledger, next_cursor)
 
     def to_dict(self) -> dict:
         result: dict = {}
         result["contracts"] = from_list(lambda x: to_class(ContractStats, x), self.contracts)
         result["from_ledger"] = from_int(self.from_ledger)
         result["generated_at"] = from_str(self.generated_at)
+        result["has_more"] = from_bool(self.has_more)
         result["network"] = to_enum(Network, self.network)
         result["to_ledger"] = from_int(self.to_ledger)
+        if self.next_cursor is not None:
+            result["next_cursor"] = from_union([from_str, from_none], self.next_cursor)
         return result
 
 
@@ -382,6 +393,49 @@ class ContractStorageValue:
         result["storage_key"] = from_str(self.storage_key)
         result["key"] = self.key
         result["value"] = self.value
+        return result
+
+
+@dataclass
+class ContractStorageHistoryResponse:
+    contract_id: str
+    """The contract whose storage history was queried"""
+
+    has_more: bool
+    """Whether more pages are available"""
+
+    network: str
+    """Network the contract is indexed on"""
+
+    storage_key: str
+    """The storage key whose history was queried"""
+
+    values: list[ContractStorageValue]
+    """Storage history entries, oldest first"""
+
+    next_cursor: str | None = None
+    """Opaque cursor to pass as the cursor parameter for the next page"""
+
+    @staticmethod
+    def from_dict(obj: Any) -> 'ContractStorageHistoryResponse':
+        assert isinstance(obj, dict)
+        contract_id = from_str(obj.get("contract_id"))
+        has_more = from_bool(obj.get("has_more"))
+        network = from_str(obj.get("network"))
+        storage_key = from_str(obj.get("storage_key"))
+        values = from_list(ContractStorageValue.from_dict, obj.get("values"))
+        next_cursor = from_union([from_str, from_none], obj.get("next_cursor"))
+        return ContractStorageHistoryResponse(contract_id, has_more, network, storage_key, values, next_cursor)
+
+    def to_dict(self) -> dict:
+        result: dict = {}
+        result["contract_id"] = from_str(self.contract_id)
+        result["has_more"] = from_bool(self.has_more)
+        result["network"] = from_str(self.network)
+        result["storage_key"] = from_str(self.storage_key)
+        result["values"] = from_list(lambda x: to_class(ContractStorageValue, x), self.values)
+        if self.next_cursor is not None:
+            result["next_cursor"] = from_union([from_str, from_none], self.next_cursor)
         return result
 
 
@@ -809,6 +863,7 @@ class OpenAPIModels:
     contract_spec_response: ContractSpecResponse | None = None
     contract_stats: ContractStats | None = None
     contract_stats_response: ContractStatsResponse | None = None
+    contract_storage_history_response: ContractStorageHistoryResponse | None = None
     contract_storage_response: ContractStorageResponse | None = None
     contract_storage_value: ContractStorageValue | None = None
     error_response: ErrorResponse | None = None
@@ -832,6 +887,7 @@ class OpenAPIModels:
         contract_spec_response = from_union([ContractSpecResponse.from_dict, from_none], obj.get("ContractSpecResponse"))
         contract_stats = from_union([ContractStats.from_dict, from_none], obj.get("ContractStats"))
         contract_stats_response = from_union([ContractStatsResponse.from_dict, from_none], obj.get("ContractStatsResponse"))
+        contract_storage_history_response = from_union([ContractStorageHistoryResponse.from_dict, from_none], obj.get("ContractStorageHistoryResponse"))
         contract_storage_response = from_union([ContractStorageResponse.from_dict, from_none], obj.get("ContractStorageResponse"))
         contract_storage_value = from_union([ContractStorageValue.from_dict, from_none], obj.get("ContractStorageValue"))
         error_response = from_union([ErrorResponse.from_dict, from_none], obj.get("ErrorResponse"))
@@ -843,7 +899,7 @@ class OpenAPIModels:
         soroban_event = from_union([SorobanEvent.from_dict, from_none], obj.get("SorobanEvent"))
         token_metadata_response = from_union([TokenMetadataResponse.from_dict, from_none], obj.get("TokenMetadataResponse"))
         version_response = from_union([VersionResponse.from_dict, from_none], obj.get("VersionResponse"))
-        return OpenAPIModels(api_key_response, contract_event_field_schema, contract_event_schema, contract_event_schema_response, contract_spec_function, contract_spec_response, contract_stats, contract_stats_response, contract_storage_response, contract_storage_value, error_response, event_list_response, indexer_stats_response, liveness_response, ready_checks, ready_response, soroban_event, token_metadata_response, version_response)
+        return OpenAPIModels(api_key_response, contract_event_field_schema, contract_event_schema, contract_event_schema_response, contract_spec_function, contract_spec_response, contract_stats, contract_stats_response, contract_storage_history_response, contract_storage_response, contract_storage_value, error_response, event_list_response, indexer_stats_response, liveness_response, ready_checks, ready_response, soroban_event, token_metadata_response, version_response)
 
     def to_dict(self) -> dict:
         result: dict = {}
@@ -863,6 +919,8 @@ class OpenAPIModels:
             result["ContractStats"] = from_union([lambda x: to_class(ContractStats, x), from_none], self.contract_stats)
         if self.contract_stats_response is not None:
             result["ContractStatsResponse"] = from_union([lambda x: to_class(ContractStatsResponse, x), from_none], self.contract_stats_response)
+        if self.contract_storage_history_response is not None:
+            result["ContractStorageHistoryResponse"] = from_union([lambda x: to_class(ContractStorageHistoryResponse, x), from_none], self.contract_storage_history_response)
         if self.contract_storage_response is not None:
             result["ContractStorageResponse"] = from_union([lambda x: to_class(ContractStorageResponse, x), from_none], self.contract_storage_response)
         if self.contract_storage_value is not None:

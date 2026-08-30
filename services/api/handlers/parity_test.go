@@ -131,7 +131,9 @@ func TestRESTGraphQLParity_PaginationCursorRoundTrip(t *testing.T) {
 	}
 
 	var body1 map[string]any
-	json.NewDecoder(rr1.Body).Decode(&body1)
+	if err := json.NewDecoder(rr1.Body).Decode(&body1); err != nil {
+		t.Fatalf("page 1: decode: %v", err)
+	}
 
 	nextCursor, ok := body1["next_cursor"].(string)
 	if !ok || nextCursor == "" {
@@ -155,7 +157,9 @@ func TestRESTGraphQLParity_PaginationCursorRoundTrip(t *testing.T) {
 	}
 
 	var body2 map[string]any
-	json.NewDecoder(rr2.Body).Decode(&body2)
+	if err := json.NewDecoder(rr2.Body).Decode(&body2); err != nil {
+		t.Fatalf("page 2: decode: %v", err)
+	}
 
 	if body2["has_more"] != false {
 		t.Error("page 2 should have has_more=false")

@@ -284,7 +284,7 @@ export interface paths {
         };
         /**
          * List API keys
-         * @description List all API keys (admin only)
+         * @description List all API keys (admin only), using keyset pagination consistent with GET /v1/events
          */
         get: operations["listApiKeys"];
         put?: never;
@@ -591,6 +591,20 @@ export interface components {
             /** @description Storage snapshot values (latest, or full history when queried via /storage/history) */
             values: components["schemas"]["ContractStorageValue"][];
         };
+        ContractStorageHistoryResponse: {
+            /** @description The contract whose storage history was queried */
+            contract_id: string;
+            /** @description Network the contract is indexed on */
+            network: string;
+            /** @description The storage key whose history was queried */
+            storage_key: string;
+            /** @description Storage history entries, oldest first */
+            values: components["schemas"]["ContractStorageValue"][];
+            /** @description Whether more pages are available */
+            has_more: boolean;
+            /** @description Opaque cursor to pass as the cursor parameter for the next page */
+            next_cursor?: string | null;
+        };
         ContractStorageValue: {
             /** @description Base64-encoded XDR LedgerKey this value was read from */
             storage_key: string;
@@ -632,6 +646,10 @@ export interface components {
              * @description Timestamp when response was generated
              */
             generated_at: string;
+            /** @description Whether more pages are available */
+            has_more: boolean;
+            /** @description Opaque cursor to pass as the cursor parameter for the next page */
+            next_cursor?: string | null;
         };
         ContractStats: {
             /** @description Soroban contract address */
@@ -1124,6 +1142,10 @@ export interface operations {
             query: {
                 /** @description Storage key to fetch history for, as returned by the storage/spec endpoints */
                 key: string;
+                /** @description Maximum number of history entries to return */
+                limit?: number;
+                /** @description Opaque pagination cursor from previous response's next_cursor (for next page) */
+                cursor?: string;
             };
             header?: never;
             path: {
@@ -1143,7 +1165,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ContractStorageResponse"];
+                    "application/json": components["schemas"]["ContractStorageHistoryResponse"];
                 };
             };
             400: components["responses"]["BadRequest"];
@@ -1185,6 +1207,8 @@ export interface operations {
                 network?: "testnet" | "mainnet";
                 /** @description Number of top contracts to return */
                 limit?: number;
+                /** @description Opaque pagination cursor from previous response's next_cursor (for next page) */
+                cursor?: string;
             };
             header?: never;
             path?: never;
@@ -1213,24 +1237,46 @@ export interface operations {
     };
     listApiKeys: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Maximum number of API keys to return */
+                limit?: number;
+                /** @description Opaque pagination cursor from previous response's next_cursor (for next page) */
+                cursor?: string;
+            };
             header?: never;
             path?: never;
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description List of API keys */
+            /** @description List of API keys with pagination metadata */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
                     "application/json": {
-                        api_keys: components["schemas"]["APIKeyResponse"][];
+                        api_keys: {
+                            /** Format: uuid */
+                            id?: string;
+                            key_prefix?: string;
+                            label?: string;
+                            network?: string;
+                            rate_limit_tier?: string;
+                            /** Format: date-time */
+                            last_used_at?: string;
+                            request_count?: number;
+                            /** Format: date-time */
+                            created_at?: string;
+                        }[];
+                        /** @description Whether more pages are available */
+                        has_more?: boolean;
+                        /** @description Opaque cursor to pass as the cursor parameter for the next page */
+                        next_cursor?: string | null;
                     };
                 };
             };
+            400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             429: components["responses"]["TooManyRequestsIPOnly"];
         };
