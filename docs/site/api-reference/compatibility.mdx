@@ -8,14 +8,14 @@ people work. This page is the stated promise about what `v1` guarantees —
 and, just as importantly, what it deliberately does not guarantee yet.
 
 The OpenAPI specification at
-[`api/openapi.yaml`](https://github.com/Telocel-Labs/Trident/blob/main/api/openapi.yaml)
+[`api/openapi.yaml`](https://github.com/Telocel-Labs/Trident/blob/dev/api/openapi.yaml)
 is the contract of record: a CI contract test fails whenever a route exists
 without a spec entry or a spec entry without a route, so the spec cannot
 silently drift from the implementation in either direction.
 
 The change-management rules — what counts as a breaking change, the
 `x-experimental` marker, and the deprecation mechanism — are defined in
-[`docs/API_STABILITY.md`](https://github.com/Telocel-Labs/Trident/blob/main/docs/API_STABILITY.md),
+[`docs/API_STABILITY.md`](https://github.com/Telocel-Labs/Trident/blob/dev/docs/API_STABILITY.md),
 the policy of record. This page declares the concrete v1 surface those
 rules apply to: which endpoints are stable, which are explicitly not yet,
 and the response contracts (error envelope, pagination, headers) clients
@@ -92,7 +92,7 @@ without a major version. Depend on them knowingly:
 ## Deprecation and breaking changes
 
 The full rules live in
-[`docs/API_STABILITY.md`](https://github.com/Telocel-Labs/Trident/blob/main/docs/API_STABILITY.md).
+[`docs/API_STABILITY.md`](https://github.com/Telocel-Labs/Trident/blob/dev/docs/API_STABILITY.md).
 In short:
 
 1. A deprecation is **announced in the changelog** with a removal date at
