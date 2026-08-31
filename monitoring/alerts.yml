@@ -135,6 +135,12 @@ groups:
       # emitting contract deserves a look.
       - alert: TridentIndexerUnexpectedScValVariant
         expr: increase(trident_scval_unexpected_variant_total[1h]) > 0
+      # A non-empty persist dead-letter queue is data missing from
+      # soroban_events until someone replays it — a silently growing DLQ is
+      # the same as data loss. Rows leave the pending state only through the
+      # documented replay procedure, so this fires for as long as any exist.
+      - alert: TridentIndexerPersistDeadLetterBacklog
+        expr: trident_indexer_persist_dead_letter_backlog > 0
         for: 5m
         labels:
           severity: warning
@@ -148,26 +154,6 @@ groups:
             indexer logs name the variant and context. Identify the emitting
             contract from the logs and review what it is publishing.
           runbook_url: "docs/runbooks/alerts.md#tridentindexerunexpectedscvalvariant"
-      # A non-empty persist dead-letter queue is data missing from
-      # soroban_events until someone replays it — a silently growing DLQ is
-      # the same as data loss. Rows leave the pending state only through the
-      # documented replay procedure, so this fires for as long as any exist.
-      - alert: TridentIndexerPersistDeadLetterBacklog
-        expr: trident_indexer_persist_dead_letter_backlog > 0
-        for: 5m
-        labels:
-          severity: warning
-          service: indexer
-        annotations:
-          summary: "Trident dead-letter queue holds {{ $value }} event(s) that failed to persist"
-          description: >
-            failed_events has pending rows: at least one event exhausted the
-            persist retry budget and was captured with its payload and error
-            message instead of being indexed. Ingestion has advanced past it,
-            but the data is missing from soroban_events until it is replayed.
-            Diagnose error_message, fix the underlying cause, then run the
-            replay procedure in the runbook and mark the rows replayed_at.
-          runbook_url: "docs/runbooks/alerts.md#tridentindexerpersistdeadletterbacklog"
 
   # ---------------------------------------------------------------------------
   # Ledger-range reconciliation against the RPC source (#511).
