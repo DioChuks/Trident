@@ -283,15 +283,15 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     counter!(OUTBOX_PUBLISHED_TOTAL).increment(0);
     counter!(OUTBOX_PUBLISH_FAILURES_TOTAL).increment(0);
     counter!(UNEXPECTED_SCVAL_VARIANT_TOTAL).increment(0);
+    counter!(PERSIST_DEAD_LETTERED_TOTAL).increment(0);
+    gauge!(PERSIST_DEAD_LETTER_BACKLOG).set(0.0);
+    counter!(DEAD_LETTERED_TOTAL).increment(0);
     counter!(RECONCILE_PASSES_TOTAL).increment(0);
     counter!(RECONCILE_PASS_FAILURES_TOTAL).increment(0);
     counter!(RECONCILE_MISSING_EVENTS_TOTAL).increment(0);
     counter!(RECONCILE_EXTRA_EVENTS_TOTAL).increment(0);
     gauge!(RECONCILE_DISCREPANT_LEDGERS).set(0.0);
     gauge!(RECONCILE_WINDOW_END_LEDGER).set(0.0);
-    counter!(PERSIST_DEAD_LETTERED_TOTAL).increment(0);
-    gauge!(PERSIST_DEAD_LETTER_BACKLOG).set(0.0);
-    counter!(DEAD_LETTERED_TOTAL).increment(0);
     gauge!(RPC_ACTIVE_ENDPOINT).set(0.0);
     gauge!(OUTBOX_BACKLOG).set(0.0);
     gauge!(LEDGER_LAG).set(0.0);
