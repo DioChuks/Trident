@@ -37,12 +37,14 @@ const authCacheTTL = 5 * time.Minute
 const authDBQueryTimeout = 2 * time.Second
 
 // ParseKeyHashes parses a comma-separated list of HMAC-SHA256 hex digests
-// (as stored in API_KEY_HASHES or API_KEY) into a set for lookup.
+// (as stored in API_KEY_HASHES) into a set for lookup.
+//
+// It reads only its argument. Falling back to API_KEY here would make a parse
+// function depend on the environment and would quietly widen the auth surface:
+// API_KEY holds a plaintext key, not a digest, so such a value could never
+// match anyway and would fail as a silent no-match rather than an error.
 func ParseKeyHashes(raw string) map[string]struct{} {
 	out := map[string]struct{}{}
-	if raw == "" {
-		raw = os.Getenv("API_KEY")
-	}
 	for _, h := range strings.Split(raw, ",") {
 		h = strings.TrimSpace(h)
 		if h != "" {
