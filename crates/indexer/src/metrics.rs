@@ -40,10 +40,14 @@ pub const EFFECTIVE_POLL_INTERVAL_MS: &str = "trident_indexer_effective_poll_int
 pub const RPC_TIMEOUTS_TOTAL: &str = "trident_indexer_rpc_timeouts_total";
 pub const RPC_ACTIVE_ENDPOINT: &str = "trident_indexer_rpc_active_endpoint";
 pub const RPC_FAILOVERS_TOTAL: &str = "trident_indexer_rpc_failovers_total";
-/// Count of ScVal values that hit the catch-all / debug-format fallback in
-/// `scval_to_string` or `scval_to_json` (issue #415). A high rate means the
-/// indexer is encountering Soroban types it cannot render as structured data.
-pub const UNHANDLED_SCVARIANT_TOTAL: &str = "trident_indexer_unhandled_scvariant_total";
+/// Count of structurally valid ScVal variants decoded from event payloads
+/// where they should never legitimately appear (`ContractInstance`,
+/// `LedgerKeyContractInstance`, `LedgerKeyNonce`). Emitted by the shared
+/// decoder in `trident_common::scval` (issue #506, superseding the #415
+/// debug-fallback counter: the decoder no longer has a fallback — matches
+/// are exhaustive, so a new XDR variant fails compilation instead).
+pub const UNEXPECTED_SCVAL_VARIANT_TOTAL: &str =
+    trident_common::scval::UNEXPECTED_SCVAL_VARIANT_TOTAL;
 pub const OUTBOX_BACKLOG: &str = "trident_indexer_outbox_backlog";
 pub const OUTBOX_PUBLISHED_TOTAL: &str = "trident_indexer_outbox_published_total";
 pub const OUTBOX_PUBLISH_FAILURES_TOTAL: &str = "trident_indexer_outbox_publish_failures_total";
@@ -83,6 +87,20 @@ pub const CATCHUP_LEDGERS_PER_SECOND: &str = "trident_indexer_catchup_ledgers_pe
 /// [`CATCHUP_LEDGERS_PER_SECOND`] (issue #420). Ledgers/sec alone hides the
 /// binding constraint: a sparse range moves fast in ledgers and slow in events.
 pub const CATCHUP_EVENTS_PER_SECOND: &str = "trident_indexer_catchup_events_per_second";
+
+/// Distance (in ledgers) between the current ingest cursor and the upper bound
+/// of the last named `soroban_events` partition (issue #525).
+///
+/// When this value drops to zero the indexer has reached or passed the
+/// boundary of the last named partition. Rows for ledgers beyond that boundary
+/// fall into `soroban_events_default` (the catch-all DEFAULT partition), which
+/// is the silent failure mode this alert guards against.
+///
+/// Updated once per poll cycle. The alert thresholds in `monitoring/alerts.yml`
+/// are:
+///   - warning  (TridentPartitionExhaustionWarning): < 5_000_000 ledgers (~289 days)
+///   - critical (TridentPartitionExhausted):          <= 0        ledgers (already past)
+pub const PARTITION_LOOKAHEAD_LEDGERS: &str = "trident_indexer_partition_lookahead_ledgers";
 
 /// Install the global Prometheus recorder and start serving `/metrics` on
 /// `port`. Must be called once, before the streamer starts recording.
@@ -148,8 +166,8 @@ pub fn install(port: u16) -> Result<(), TridentError> {
         "Outbox publish attempts that failed (issue #200)"
     );
     describe_counter!(
-        UNHANDLED_SCVARIANT_TOTAL,
-        "ScVal values that hit the debug-format fallback (issue #415)"
+        UNEXPECTED_SCVAL_VARIANT_TOTAL,
+        "ScVal variants decoded from event payloads where they should never appear (issue #506)"
     );
     describe_gauge!(
         HEARTBEAT_TIMESTAMP,
@@ -183,6 +201,10 @@ pub fn install(port: u16) -> Result<(), TridentError> {
         CATCHUP_EVENTS_PER_SECOND,
         "Backfill rate in events/sec while behind the chain tip (issue #420)"
     );
+    describe_gauge!(
+        PARTITION_LOOKAHEAD_LEDGERS,
+        "Ledgers remaining before the ingest cursor reaches the last named soroban_events partition boundary (issue #525)"
+    );
 
     // Counters only render in the scrape output once touched at least once;
     // seed them at zero so /metrics is complete from the very first scrape.
@@ -195,7 +217,7 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     counter!(RPC_FAILOVERS_TOTAL).increment(0);
     counter!(OUTBOX_PUBLISHED_TOTAL).increment(0);
     counter!(OUTBOX_PUBLISH_FAILURES_TOTAL).increment(0);
-    counter!(UNHANDLED_SCVARIANT_TOTAL).increment(0);
+    counter!(UNEXPECTED_SCVAL_VARIANT_TOTAL).increment(0);
     gauge!(RPC_ACTIVE_ENDPOINT).set(0.0);
     gauge!(OUTBOX_BACKLOG).set(0.0);
     gauge!(LEDGER_LAG).set(0.0);
@@ -204,6 +226,12 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     gauge!(HEARTBEAT_TIMESTAMP).set(0.0);
     gauge!(DB_POOL_SIZE).set(0.0);
     gauge!(DB_POOL_IDLE_CONNECTIONS).set(0.0);
+    // Seed at 0 so the gauge is present from the first scrape and fails safe.
+    // Seeding at i64::MAX would report infinite headroom, so an indexer that
+    // crash-loops before its first successful poll would leave both partition
+    // alerts resolved — silence in exactly the case that needs paging. The
+    // real value is written after the first poll cycle.
+    gauge!(PARTITION_LOOKAHEAD_LEDGERS).set(0.0);
 
     // Histograms render nothing at all until they observe a value — not even
     // a HELP/TYPE header — so an indexer that has not yet made an RPC call
@@ -314,10 +342,6 @@ pub fn record_dead_lettered() {
     counter!(DEAD_LETTERED_TOTAL).increment(1);
 }
 
-pub fn record_unhandled_scvariant() {
-    counter!(UNHANDLED_SCVARIANT_TOTAL).increment(1);
-}
-
 pub fn record_poll_duration(seconds: f64) {
     histogram!(POLL_DURATION_SECONDS).record(seconds);
 }
@@ -398,4 +422,16 @@ pub fn record_decode_duration(seconds: f64) {
 /// which endpoints are degraded and whether failover is working.
 pub fn set_rpc_health_score(endpoint: &str, score: u8) {
     gauge!(RPC_HEALTH_SCORE, "endpoint" => endpoint.to_string()).set(score as f64);
+}
+
+/// Publish how many ledgers remain before the ingest cursor reaches the upper
+/// bound of the last named `soroban_events` partition (issue #525).
+///
+/// A negative value means the cursor has already passed the boundary and rows
+/// are falling into the DEFAULT catch-all partition. Two Prometheus alerts in
+/// `monitoring/alerts.yml` fire on this gauge:
+///   - TridentPartitionExhaustionWarning  (< 5_000_000, warning severity)
+///   - TridentPartitionExhausted          (<= 0,        critical severity + Fatal poll error)
+pub fn set_partition_lookahead(lookahead: i64) {
+    gauge!(PARTITION_LOOKAHEAD_LEDGERS).set(lookahead as f64);
 }
