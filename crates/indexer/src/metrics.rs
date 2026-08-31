@@ -40,10 +40,14 @@ pub const EFFECTIVE_POLL_INTERVAL_MS: &str = "trident_indexer_effective_poll_int
 pub const RPC_TIMEOUTS_TOTAL: &str = "trident_indexer_rpc_timeouts_total";
 pub const RPC_ACTIVE_ENDPOINT: &str = "trident_indexer_rpc_active_endpoint";
 pub const RPC_FAILOVERS_TOTAL: &str = "trident_indexer_rpc_failovers_total";
-/// Count of ScVal values that hit the catch-all / debug-format fallback in
-/// `scval_to_string` or `scval_to_json` (issue #415). A high rate means the
-/// indexer is encountering Soroban types it cannot render as structured data.
-pub const UNHANDLED_SCVARIANT_TOTAL: &str = "trident_indexer_unhandled_scvariant_total";
+/// Count of structurally valid ScVal variants decoded from event payloads
+/// where they should never legitimately appear (`ContractInstance`,
+/// `LedgerKeyContractInstance`, `LedgerKeyNonce`). Emitted by the shared
+/// decoder in `trident_common::scval` (issue #506, superseding the #415
+/// debug-fallback counter: the decoder no longer has a fallback — matches
+/// are exhaustive, so a new XDR variant fails compilation instead).
+pub const UNEXPECTED_SCVAL_VARIANT_TOTAL: &str =
+    trident_common::scval::UNEXPECTED_SCVAL_VARIANT_TOTAL;
 pub const OUTBOX_BACKLOG: &str = "trident_indexer_outbox_backlog";
 pub const OUTBOX_PUBLISHED_TOTAL: &str = "trident_indexer_outbox_published_total";
 pub const OUTBOX_PUBLISH_FAILURES_TOTAL: &str = "trident_indexer_outbox_publish_failures_total";
@@ -162,8 +166,8 @@ pub fn install(port: u16) -> Result<(), TridentError> {
         "Outbox publish attempts that failed (issue #200)"
     );
     describe_counter!(
-        UNHANDLED_SCVARIANT_TOTAL,
-        "ScVal values that hit the debug-format fallback (issue #415)"
+        UNEXPECTED_SCVAL_VARIANT_TOTAL,
+        "ScVal variants decoded from event payloads where they should never appear (issue #506)"
     );
     describe_gauge!(
         HEARTBEAT_TIMESTAMP,
@@ -213,7 +217,7 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     counter!(RPC_FAILOVERS_TOTAL).increment(0);
     counter!(OUTBOX_PUBLISHED_TOTAL).increment(0);
     counter!(OUTBOX_PUBLISH_FAILURES_TOTAL).increment(0);
-    counter!(UNHANDLED_SCVARIANT_TOTAL).increment(0);
+    counter!(UNEXPECTED_SCVAL_VARIANT_TOTAL).increment(0);
     gauge!(RPC_ACTIVE_ENDPOINT).set(0.0);
     gauge!(OUTBOX_BACKLOG).set(0.0);
     gauge!(LEDGER_LAG).set(0.0);
@@ -336,10 +340,6 @@ pub fn record_parse_error() {
 
 pub fn record_dead_lettered() {
     counter!(DEAD_LETTERED_TOTAL).increment(1);
-}
-
-pub fn record_unhandled_scvariant() {
-    counter!(UNHANDLED_SCVARIANT_TOTAL).increment(1);
 }
 
 pub fn record_poll_duration(seconds: f64) {

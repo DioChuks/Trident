@@ -117,6 +117,33 @@ malformed events.
 3. If it's a new, valid event shape, this is a parser bug — file/fix rather
    than treating it as transient.
 
+## TridentIndexerUnexpectedScValVariant
+
+**Means:** an event payload contained an ScVal variant that no well-behaved
+contract emits — `ContractInstance`, `LedgerKeyContractInstance`, or
+`LedgerKeyNonce`. The decoder (issue #506) stored the value faithfully as a
+tagged JSON object; nothing was lost or coerced, but the traffic is
+anomalous.
+
+**Why this threshold:** any occurrence at all is worth a look — these
+variants exist for ledger entries, not event payloads, so a contract putting
+them into events is at best confused and at worst probing the decoder. `> 0
+over 1h, for 5m` surfaces every occurrence without flapping on a single
+scrape.
+
+Note this alert cannot fire for *unknown* variants: the decoder matches the
+`ScVal` enum exhaustively with no fallback arm, so a variant added by an XDR
+upgrade fails compilation instead of reaching production.
+
+**First steps:**
+1. Find the warn-level `decoded an ScVal variant that should not appear in
+   event payloads` log lines — they name the variant and decode context.
+2. Identify the emitting contract from the surrounding event logs and review
+   what it publishes.
+3. If a legitimate new use appears for one of these variants in event
+   payloads, decide its first-class rendering and demote it from the
+   anomalous set.
+
 ## TridentIndexerRPCErrorRateHigh
 
 **Means:** over 5% of Stellar RPC calls (`getEvents`/`getLedgers`) errored in
