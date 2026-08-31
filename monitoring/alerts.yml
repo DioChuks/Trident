@@ -154,15 +154,6 @@ groups:
             indexer logs name the variant and context. Identify the emitting
             contract from the logs and review what it is publishing.
           runbook_url: "docs/runbooks/alerts.md#tridentindexerunexpectedscvalvariant"
-          summary: "Trident dead-letter queue holds {{ $value }} event(s) that failed to persist"
-          description: >
-            failed_events has pending rows: at least one event exhausted the
-            persist retry budget and was captured with its payload and error
-            message instead of being indexed. Ingestion has advanced past it,
-            but the data is missing from soroban_events until it is replayed.
-            Diagnose error_message, fix the underlying cause, then run the
-            replay procedure in the runbook and mark the rows replayed_at.
-          runbook_url: "docs/runbooks/alerts.md#tridentindexerpersistdeadletterbacklog"
 
   # ---------------------------------------------------------------------------
   # Ledger-range reconciliation against the RPC source (#511).

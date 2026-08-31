@@ -661,7 +661,6 @@ fly config validate -c fly/api.toml
 fly config validate -c fly/grpc-api.toml
 fly config validate -c fly/indexer.toml
 ```
->>>>>>> origin/dev
 
 ### Updating secrets
 
