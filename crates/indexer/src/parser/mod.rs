@@ -1565,6 +1565,29 @@ mod tests {
             )
     }
 
+    // Hostile-input fuzzing (issue #507): truncation, trailing bytes, lying
+    // length prefixes, and hostile nesting depth. The parser consumes
+    // untrusted network data, so malformed input must yield a handled error
+    // — never a panic, a stack overflow, or an unbounded allocation. These
+    // run in the same parser::tests:: pass CI re-executes with
+    // PROPTEST_CASES=50000 (.github/workflows/ci.yml, rust job).
+    // -----------------------------------------------------------------------
+
+    /// Wire bytes for a Vec nested `depth` levels around a U32, built
+    /// directly as bytes: encoding a deep value through the XDR writer
+    /// would recurse just as deep, so hostile depths must be synthesized.
+    fn nested_vec_wire(depth: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        for _ in 0..depth {
+            out.extend_from_slice(&16u32.to_be_bytes()); // ScValType::Vec
+            out.extend_from_slice(&1u32.to_be_bytes()); // Option: Some
+            out.extend_from_slice(&1u32.to_be_bytes()); // one element
+        }
+        out.extend_from_slice(&3u32.to_be_bytes()); // ScValType::U32
+        out.extend_from_slice(&7u32.to_be_bytes());
+        out
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(2000))]
 
@@ -1585,6 +1608,74 @@ mod tests {
         fn parse_event_with_projection_never_panics_index_diagnostic_false(raw in arb_raw_event()) {
             let parser = Parser::new(false);
             let _ = parser.parse_event_with_projection(&raw);
+        }
+
+        #[test]
+        fn truncated_valid_xdr_is_a_handled_error(b64 in arb_scval_b64(), cut in any::<prop::sample::Index>()) {
+            let bytes = STANDARD.decode(&b64).expect("generator emits valid base64");
+            // Every strict prefix of a valid encoding is incomplete: XDR is
+            // self-delimiting, so the decoder must error — and must not panic.
+            let cut = cut.index(bytes.len().max(1));
+            if cut < bytes.len() {
+                let truncated = STANDARD.encode(&bytes[..cut]);
+                prop_assert!(decode_scval(&truncated).is_err(),
+                    "strict prefix of a valid encoding decoded successfully");
+            }
+        }
+
+        #[test]
+        fn trailing_garbage_after_a_valid_value_is_rejected(
+            b64 in arb_scval_b64(),
+            extra in proptest::collection::vec(any::<u8>(), 1..32),
+        ) {
+            let mut bytes = STANDARD.decode(&b64).expect("generator emits valid base64");
+            bytes.extend(extra);
+            prop_assert!(decode_scval(&STANDARD.encode(&bytes)).is_err(),
+                "value followed by trailing bytes must be rejected");
+        }
+
+        #[test]
+        fn arbitrary_nesting_depth_never_panics(depth in 1u32..300) {
+            // Below the budget this decodes and renders; above it, a handled
+            // error. Either way the process survives — without the depth
+            // limit a deep payload overflows the stack, which is a SIGABRT,
+            // not an Err. The boundary assertions pin the budget in
+            // CONTAINER LEVELS: everything the Soroban host can legally emit
+            // (<= 100 levels, DEFAULT_HOST_DEPTH_LIMIT) must decode; each
+            // Vec level costs ~4 reader frames against MAX_SCVAL_DEPTH=500,
+            // so failures may only start well past the host limit.
+            let b64 = STANDARD.encode(nested_vec_wire(depth));
+            match decode_scval(&b64) {
+                Ok(val) => {
+                    let _ = scval_to_string(&val);
+                    let _ = scval_to_json(&val);
+                }
+                Err(_) => {
+                    prop_assert!(
+                        depth > 100,
+                        "host-legal nesting must decode, failed at depth {depth}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn deep_nesting_beyond_the_budget_is_rejected(depth in 200u32..2000) {
+            let b64 = STANDARD.encode(nested_vec_wire(depth));
+            prop_assert!(decode_scval(&b64).is_err(),
+                "nesting past MAX_SCVAL_DEPTH must be a handled error");
+        }
+
+        #[test]
+        fn lying_collection_length_prefix_never_panics(claim in any::<u32>(), tag in 0u32..24) {
+            // A collection/bytes discriminant followed by an arbitrary length
+            // claim and almost no real data: the reader's byte budget is the
+            // input length, so the claim cannot drive allocation or scanning
+            // past the payload.
+            let mut wire = tag.to_be_bytes().to_vec();
+            wire.extend_from_slice(&claim.to_be_bytes());
+            wire.extend_from_slice(&[0xAA; 8]);
+            let _ = decode_scval(&STANDARD.encode(&wire));
         }
     }
 
