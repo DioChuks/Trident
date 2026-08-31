@@ -143,6 +143,53 @@ upgrade fails compilation instead of reaching production.
 3. If a legitimate new use appears for one of these variants in event
    payloads, decide its first-class rendering and demote it from the
    anomalous set.
+## TridentIndexerReconciliationMismatch
+
+**Means:** the reconciliation loop (issue #511) re-fetched a settled ledger
+window from `getEvents` - applying the ingest pipeline's own filter and skip
+rules - and the per-ledger event counts disagree with what the database
+holds (`soroban_events` plus `parse_errors`). Some ledgers are
+under-indexed (missing events) or over-indexed (extra events).
+
+**Why this threshold:** any disagreement at all means the indexed data is
+wrong for those ledgers; the gauge is refreshed every pass (default 10
+minutes), so `for: 15m` means at least two consecutive passes agreed on the
+disagreement. Warning rather than critical while the detector is new;
+ratchet to critical once it has run clean on testnet for a while.
+
+**First steps:**
+1. Find the `Reconciliation discrepancy` warn logs - they name each ledger
+   range with the RPC and database counts
+   (`trident_indexer_reconcile_missing_events_total` vs
+   `_extra_events_total` says which direction).
+2. For missing events, re-ingest the reported ranges:
+   `trident-backfill --from-ledger <from> --to-ledger <to>` (idempotent).
+   Use `--dry-run` first to preview counts for any range on demand.
+3. If the discrepancy reappears on later passes for NEW ranges, the ingest
+   pipeline is dropping events right now - check parse-error rates, RPC
+   health, and recent deploys before backfilling further.
+4. Extra events (indexed rows the chain does not report) usually mean a
+   backfill wrote rows outside the allowlist rules or a duplicate-index bug
+   - inspect the rows in the reported range before deleting anything.
+
+## TridentIndexerReconciliationFailing
+
+**Means:** the reconciliation loop keeps aborting before producing a report
+- `getLatestLedger`/`getEvents` failures, or database errors during the
+count queries.
+
+**Why this threshold:** a single failed pass self-heals next interval; more
+than two failures inside 30 minutes, sustained for 30 minutes, means the
+loop has effectively stopped verifying. While this fires, the mismatch
+alert's silence is unknown, not clean.
+
+**First steps:**
+1. Check the `Reconciliation pass failed` warn logs for the error.
+2. If RPC-related, see `TridentIndexerRPCErrorRateHigh` - the reconciler
+   shares the endpoint pool and fails alongside it.
+3. If the indexer cursor has not yet reached the settled window (fresh
+   deploy, deep backfill), passes fail with "nothing to reconcile yet" -
+   expected until the indexer catches up.
 
 ## TridentIndexerRPCErrorRateHigh
 

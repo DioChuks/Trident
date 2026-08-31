@@ -30,6 +30,12 @@ port `9090`, set via `METRICS_PORT`). Defined in
 | `trident_indexer_last_poll_timestamp_seconds` | gauge | — | unix seconds | Set once per poll-loop iteration regardless of outcome — the dead-man's-switch (#218). Stale means the loop is hung, not just slow. |
 | `trident_indexer_db_pool_size` | gauge | — | connections | Current size of the indexer's own Postgres pool. |
 | `trident_indexer_db_pool_idle_connections` | gauge | — | connections | Idle connections in the indexer's own Postgres pool. |
+| `trident_indexer_reconcile_passes_total` | counter | - | passes | Reconciliation passes that completed a full settled-window compare against the RPC source (#511). |
+| `trident_indexer_reconcile_pass_failures_total` | counter | - | passes | Reconciliation passes that aborted before producing a report. While these grow, mismatch silence is unknown, not clean. |
+| `trident_indexer_reconcile_missing_events_total` | counter | - | events | Events the RPC reports (after ingest selection rules) that the database does not account for - silent under-indexing. |
+| `trident_indexer_reconcile_extra_events_total` | counter | - | events | Events in the database that the RPC does not report for the window - over-indexing. |
+| `trident_indexer_reconcile_discrepant_ledgers` | gauge | - | ledgers | Ledgers in the most recent pass whose counts disagreed; stays non-zero every pass until resolved. Alerted via `TridentIndexerReconciliationMismatch`. |
+| `trident_indexer_reconcile_window_end_ledger` | gauge | - | ledger | Highest ledger covered by the most recent completed pass. |
 | `trident_indexer_catchup_ledgers_per_second` | gauge | — | ledgers/sec | Backfill rate while behind the chain tip (issue #420). **Only exported while catching up** — absent, not zero, once the lag drops below 10 ledgers. See [performance.md](performance.md#indexer-catch-up-throughput). |
 | `trident_indexer_catchup_events_per_second` | gauge | — | events/sec | Backfill rate in events, over the same window as the gauge above. Reported alongside it because ledgers/sec alone hides whether a sparse or dense range is being processed. |
 
