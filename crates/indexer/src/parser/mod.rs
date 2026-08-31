@@ -11,13 +11,18 @@
 //! - Returning `TridentError::ParseError` for any input that cannot be decoded so
 //!   the caller (Streamer) can decide whether to skip or halt.
 
-use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::Value as Json;
-use stellar_strkey::{ed25519, Contract};
-use stellar_xdr::curr::{
-    AccountId, ContractId, Limited, Limits, PublicKey, ReadXdr, ScAddress, ScVal,
-};
+use stellar_xdr::curr::ScVal;
 use trident_common::{EventType, SorobanEvent, TridentError};
+
+// ScVal decoding moved to the shared crate so the live parser and the
+// backfill re-ingest path can never render the same XDR differently
+// (issue #506). Re-exported here so in-crate callers and the existing test
+// suite — including the proptest fuzz pass CI runs at PROPTEST_CASES=50000 —
+// keep addressing them through `crate::parser::*`.
+pub use trident_common::scval::{
+    decode_scval, scaddress_to_string, scval_to_json, scval_to_string,
+};
 
 use crate::rpc::RawEvent;
 
@@ -31,6 +36,7 @@ use sac::SacRegistry;
 use token_events::TokenEvent;
 
 /// A normalised event together with its optional typed projections.
+#[derive(Debug)]
 pub struct ParsedEvent {
     pub event: SorobanEvent,
     /// `Some` only for standard SEP-41 / SAC value-movement events whose payload
@@ -207,208 +213,14 @@ fn parse_event_type(raw: &str) -> Result<EventType, TridentError> {
     }
 }
 
-/// Render a 256-bit unsigned value, supplied as four 64-bit limbs
-/// (most-significant first), as a decimal string.
-///
-/// Rust has no u256, and the previous implementation packed all four limbs
-/// into a u128 with 32-bit shifts — which both truncated the top half and
-/// mis-positioned the rest, so any value above 2^128 decoded to a
-/// plausible-looking but wrong number. Long multiplication over decimal
-/// digits avoids needing a big-integer dependency for the one place we need
-/// this (issue #415).
-fn u256_limbs_to_decimal(limbs: [u64; 4]) -> String {
-    // digits holds the running value, least-significant decimal digit first.
-    let mut digits: Vec<u8> = vec![0];
-    for limb in limbs {
-        // value = value * 2^64 + limb, done as two steps over base-10 digits.
-        for _ in 0..64 {
-            let mut carry = 0u8;
-            for d in digits.iter_mut() {
-                let doubled = *d * 2 + carry;
-                *d = doubled % 10;
-                carry = doubled / 10;
-            }
-            if carry > 0 {
-                digits.push(carry);
-            }
-        }
-        let mut carry = limb as u128;
-        let mut i = 0;
-        while carry > 0 || i < digits.len() {
-            if i == digits.len() {
-                digits.push(0);
-            }
-            let sum = digits[i] as u128 + (carry % 10);
-            digits[i] = (sum % 10) as u8;
-            carry = carry / 10 + sum / 10;
-            i += 1;
-        }
-    }
-    while digits.len() > 1 && *digits.last().unwrap() == 0 {
-        digits.pop();
-    }
-    digits.iter().rev().map(|d| (b'0' + d) as char).collect()
-}
-
-/// Render a 256-bit signed value from its limbs. `hi_hi` is the signed
-/// most-significant limb; negatives are two's complement across all 256 bits,
-/// so they are negated into the unsigned domain and printed with a sign.
-fn i256_limbs_to_decimal(hi_hi: i64, hi_lo: u64, lo_hi: u64, lo_lo: u64) -> String {
-    if hi_hi >= 0 {
-        return u256_limbs_to_decimal([hi_hi as u64, hi_lo, lo_hi, lo_lo]);
-    }
-    // Two's complement negate: invert all limbs, then add one with carry.
-    let mut limbs = [!(hi_hi as u64), !hi_lo, !lo_hi, !lo_lo];
-    for limb in limbs.iter_mut().rev() {
-        let (next, overflow) = limb.overflowing_add(1);
-        *limb = next;
-        if !overflow {
-            break;
-        }
-    }
-    format!("-{}", u256_limbs_to_decimal(limbs))
-}
-
-pub fn decode_scval(b64: &str) -> Result<ScVal, TridentError> {
-    let bytes = STANDARD
-        .decode(b64)
-        .map_err(|e| TridentError::parse(anyhow::Error::new(e).context("base64 decode")))?;
-    let mut cursor = std::io::Cursor::new(bytes);
-    ScVal::read_xdr(&mut Limited::new(&mut cursor, Limits::none()))
-        .map_err(|e| TridentError::parse(anyhow::Error::new(e).context("XDR decode ScVal")))
-}
-
-/// Convert a topic `ScVal` to a compact string representation.
-pub fn scval_to_string(val: &ScVal) -> String {
-    match val {
-        ScVal::Symbol(s) => s.to_utf8_string_lossy(),
-        ScVal::String(s) => s.to_utf8_string_lossy(),
-        ScVal::Bool(b) => b.to_string(),
-        ScVal::Void => "void".into(),
-        ScVal::U32(n) => n.to_string(),
-        ScVal::I32(n) => n.to_string(),
-        ScVal::U64(n) => n.to_string(),
-        ScVal::I64(n) => n.to_string(),
-        ScVal::U128(parts) => {
-            let val = ((parts.hi as u128) << 64) | (parts.lo as u128);
-            val.to_string()
-        }
-        ScVal::I128(parts) => {
-            let val = ((parts.hi as i128) << 64) | (parts.lo as i128);
-            val.to_string()
-        }
-        ScVal::U256(parts) => {
-            u256_limbs_to_decimal([parts.hi_hi, parts.hi_lo, parts.lo_hi, parts.lo_lo])
-        }
-        ScVal::I256(parts) => {
-            i256_limbs_to_decimal(parts.hi_hi, parts.hi_lo, parts.lo_hi, parts.lo_lo)
-        }
-        ScVal::Bytes(b) => hex::encode(b.as_slice()),
-        ScVal::Address(addr) => scaddress_to_string(addr),
-        // Timepoint and Duration are u64 newtypes; without these arms they fell
-        // through to the debug catch-all and rendered as "Timepoint(1700000000)"
-        // rather than a usable value, while also tripping the
-        // unhandled-variant metric on well-understood types (issue #415).
-        ScVal::Timepoint(t) => t.0.to_string(),
-        ScVal::Duration(d) => d.0.to_string(),
-        // A contract error in topic/data position. Rendered via Debug
-        // deliberately: the variant carries a code whose meaning is
-        // contract-defined, so there is no stable scalar to project it to.
-        ScVal::Error(e) => format!("{e:?}"),
-        // For complex types in topic position, fall back to debug representation
-        other => {
-            crate::metrics::record_unhandled_scvariant();
-            format!("{other:?}")
-        }
-    }
-}
-
-/// Recursively convert a `ScVal` to a `serde_json::Value` for the event body.
-pub fn scval_to_json(val: &ScVal) -> Json {
-    match val {
-        ScVal::Void => Json::Null,
-        ScVal::Bool(b) => Json::Bool(*b),
-        ScVal::Symbol(s) => Json::String(s.to_utf8_string_lossy()),
-        ScVal::String(s) => Json::String(s.to_utf8_string_lossy()),
-        ScVal::U32(n) => Json::from(*n),
-        ScVal::I32(n) => Json::from(*n),
-        ScVal::U64(n) => Json::from(*n),
-        ScVal::I64(n) => Json::from(*n),
-        ScVal::U128(parts) => {
-            let v = ((parts.hi as u128) << 64) | (parts.lo as u128);
-            // Use string for values that overflow JSON's safe integer range
-            if v <= u64::MAX as u128 {
-                Json::from(v as u64)
-            } else {
-                Json::String(v.to_string())
-            }
-        }
-        ScVal::I128(parts) => {
-            let v = ((parts.hi as i128) << 64) | (parts.lo as i128);
-            if v >= i64::MIN as i128 && v <= i64::MAX as i128 {
-                Json::from(v as i64)
-            } else {
-                Json::String(v.to_string())
-            }
-        }
-        ScVal::U256(parts) => Json::String(u256_limbs_to_decimal([
-            parts.hi_hi,
-            parts.hi_lo,
-            parts.lo_hi,
-            parts.lo_lo,
-        ])),
-        ScVal::I256(parts) => Json::String(i256_limbs_to_decimal(
-            parts.hi_hi,
-            parts.hi_lo,
-            parts.lo_hi,
-            parts.lo_lo,
-        )),
-        ScVal::Bytes(b) => Json::String(hex::encode(b.as_slice())),
-        ScVal::Address(addr) => Json::String(scaddress_to_string(addr)),
-        // u64-valued, so emitted as strings for the same reason U64/I64 are:
-        // values above 2^53 do not survive a JSON number round-trip through a
-        // JavaScript consumer (issue #415).
-        ScVal::Timepoint(t) => Json::String(t.0.to_string()),
-        ScVal::Duration(d) => Json::String(d.0.to_string()),
-        ScVal::Error(e) => Json::String(format!("{e:?}")),
-        ScVal::Vec(Some(items)) => Json::Array(items.iter().map(scval_to_json).collect()),
-        ScVal::Vec(None) => Json::Array(vec![]),
-        ScVal::Map(Some(entries)) => {
-            let obj: serde_json::Map<String, Json> = entries
-                .iter()
-                .map(|e| (scval_to_string(&e.key), scval_to_json(&e.val)))
-                .collect();
-            Json::Object(obj)
-        }
-        ScVal::Map(None) => Json::Object(serde_json::Map::new()),
-        other => {
-            crate::metrics::record_unhandled_scvariant();
-            Json::String(format!("{other:?}"))
-        }
-    }
-}
-
-pub(crate) fn scaddress_to_string(addr: &ScAddress) -> String {
-    match addr {
-        ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(bytes))) => {
-            // stellar-strkey 0.0.16+ returns heapless::String — convert to std::String
-            ed25519::PublicKey(bytes.0).to_string().as_str().to_owned()
-        }
-        // stellar-xdr 26.x wraps the hash in ContractId; the inner Hash holds [u8; 32]
-        ScAddress::Contract(ContractId(hash)) => Contract(hash.0).to_string().as_str().to_owned(),
-        // stellar-xdr 26.x added MuxedAccount, ClaimableBalance, LiquidityPool variants;
-        // these do not appear in Soroban contract events but the match must be exhaustive.
-        other => format!("{other:?}"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use base64::{engine::general_purpose::STANDARD, Engine};
     use stellar_xdr::curr::{
-        AccountId, BytesM, ContractId, Hash, Int128Parts, Limited, Limits, PublicKey, ScAddress,
-        ScMap, ScMapEntry, ScString, ScSymbol, ScVal, Uint256, VecM, WriteXdr,
+        AccountId, BytesM, ContractExecutable, ContractId, Hash, Int128Parts, Limited, Limits,
+        PublicKey, ScAddress, ScContractInstance, ScMap, ScMapEntry, ScNonceKey, ScString,
+        ScSymbol, ScVal, Uint256, VecM, WriteXdr,
     };
 
     use crate::rpc::RawEvent;
@@ -1156,7 +968,17 @@ mod tests {
 
     #[test]
     fn scval_to_string_vec_none() {
+        // An ABSENT vec renders as the explicit "Vec(None)" marker (#209's
+        // documented shape) — distinct from "[]", which is a present-but-
+        // empty vec. The distinction survived the move to the shared decoder
+        // (issue #506).
         assert_eq!(scval_to_string(&ScVal::Vec(None)), "Vec(None)");
+        assert_eq!(
+            scval_to_string(&ScVal::Vec(Some(stellar_xdr::curr::ScVec(
+                vec![].try_into().unwrap()
+            )))),
+            "[]"
+        );
     }
 
     #[test]
@@ -1223,6 +1045,266 @@ mod tests {
     #[test]
     fn scval_to_json_void() {
         assert_eq!(scval_to_json(&ScVal::Void), Json::Null);
+    }
+
+    // -----------------------------------------------------------------------
+    // Full ScVal variant coverage (issue #209)
+    // -----------------------------------------------------------------------
+    //
+    // `ScVal` (stellar-xdr `curr::ScVal`) has exactly 22 variants. `scval_to_string`
+    // and `scval_to_json` match every one explicitly with no wildcard arm, so
+    // adding a 23rd variant on a future stellar-xdr upgrade is a compile error
+    // here rather than a silent debug-format fallback. This table exercises
+    // each variant once end-to-end and pins its documented JSON shape (see
+    // docs/indexer/scval-json-mapping.md) as a golden test.
+
+    fn sample_contract_instance_wasm() -> ScVal {
+        ScVal::ContractInstance(ScContractInstance {
+            executable: ContractExecutable::Wasm(Hash([0xAB; 32])),
+            storage: None,
+        })
+    }
+
+    fn sample_contract_instance_stellar_asset_with_storage() -> ScVal {
+        let entries = VecM::try_from(vec![ScMapEntry {
+            key: ScVal::Symbol(ScSymbol::try_from("decimals".to_string()).unwrap()),
+            val: ScVal::U32(7),
+        }])
+        .unwrap();
+        ScVal::ContractInstance(ScContractInstance {
+            executable: ContractExecutable::StellarAsset,
+            storage: Some(ScMap(entries)),
+        })
+    }
+
+    #[test]
+    fn every_scval_variant_has_a_documented_json_shape() {
+        let map_entries = VecM::try_from(vec![ScMapEntry {
+            key: ScVal::Symbol(ScSymbol::try_from("k".to_string()).unwrap()),
+            val: ScVal::U32(1),
+        }])
+        .unwrap();
+
+        let cases: Vec<(&str, ScVal, Json)> = vec![
+            ("Bool", ScVal::Bool(true), Json::Bool(true)),
+            ("Void", ScVal::Void, Json::Null),
+            (
+                "Error",
+                ScVal::Error(stellar_xdr::curr::ScError::Contract(9)),
+                Json::String(format!("{:?}", stellar_xdr::curr::ScError::Contract(9))),
+            ),
+            ("U32", ScVal::U32(42), Json::from(42u32)),
+            ("I32", ScVal::I32(-42), Json::from(-42i32)),
+            ("U64", ScVal::U64(42), Json::from(42u64)),
+            ("I64", ScVal::I64(-42), Json::from(-42i64)),
+            (
+                "Timepoint",
+                ScVal::Timepoint(stellar_xdr::curr::TimePoint(1_700_000_000)),
+                Json::String("1700000000".to_string()),
+            ),
+            (
+                "Duration",
+                ScVal::Duration(stellar_xdr::curr::Duration(60)),
+                Json::String("60".to_string()),
+            ),
+            (
+                "U128",
+                ScVal::U128(stellar_xdr::curr::UInt128Parts { hi: 0, lo: 100 }),
+                Json::from(100u64),
+            ),
+            (
+                "I128",
+                ScVal::I128(Int128Parts {
+                    hi: -1,
+                    lo: u64::MAX,
+                }),
+                Json::from(-1i64),
+            ),
+            (
+                "U256",
+                ScVal::U256(stellar_xdr::curr::UInt256Parts {
+                    hi_hi: 0,
+                    hi_lo: 0,
+                    lo_hi: 0,
+                    lo_lo: 5,
+                }),
+                Json::String("5".to_string()),
+            ),
+            (
+                "I256",
+                ScVal::I256(stellar_xdr::curr::Int256Parts {
+                    hi_hi: 0,
+                    hi_lo: 0,
+                    lo_hi: 0,
+                    lo_lo: 5,
+                }),
+                Json::String("5".to_string()),
+            ),
+            (
+                "Bytes",
+                ScVal::Bytes(stellar_xdr::curr::ScBytes(
+                    BytesM::try_from(vec![0xDE, 0xAD]).unwrap(),
+                )),
+                Json::String("dead".to_string()),
+            ),
+            (
+                "String",
+                ScVal::String(ScString(
+                    stellar_xdr::curr::StringM::try_from(b"hi".to_vec()).unwrap(),
+                )),
+                Json::String("hi".to_string()),
+            ),
+            (
+                "Symbol",
+                ScVal::Symbol(ScSymbol::try_from("sym".to_string()).unwrap()),
+                Json::String("sym".to_string()),
+            ),
+            (
+                "Vec(Some)",
+                ScVal::Vec(Some(stellar_xdr::curr::ScVec(
+                    VecM::try_from(vec![ScVal::U32(1)]).unwrap(),
+                ))),
+                Json::Array(vec![Json::from(1u32)]),
+            ),
+            ("Vec(None)", ScVal::Vec(None), Json::Array(vec![])),
+            (
+                "Map(Some)",
+                ScVal::Map(Some(ScMap(map_entries))),
+                Json::Object({
+                    let mut m = serde_json::Map::new();
+                    m.insert("k".to_string(), Json::from(1u32));
+                    m
+                }),
+            ),
+            (
+                "Map(None)",
+                ScVal::Map(None),
+                Json::Object(serde_json::Map::new()),
+            ),
+            (
+                "Address",
+                ScVal::Address(ScAddress::Contract(ContractId(Hash([0u8; 32])))),
+                Json::String(scaddress_to_string(&ScAddress::Contract(ContractId(Hash(
+                    [0u8; 32],
+                ))))),
+            ),
+            (
+                "ContractInstance(Wasm)",
+                sample_contract_instance_wasm(),
+                Json::Object({
+                    let mut executable = serde_json::Map::new();
+                    executable.insert("type".to_string(), Json::String("wasm".to_string()));
+                    executable.insert(
+                        "wasm_hash".to_string(),
+                        Json::String(hex::encode([0xAB; 32])),
+                    );
+                    let mut m = serde_json::Map::new();
+                    m.insert("executable".to_string(), Json::Object(executable));
+                    m.insert("storage".to_string(), Json::Null);
+                    m
+                }),
+            ),
+            (
+                "ContractInstance(StellarAsset+storage)",
+                sample_contract_instance_stellar_asset_with_storage(),
+                Json::Object({
+                    let mut executable = serde_json::Map::new();
+                    executable.insert(
+                        "type".to_string(),
+                        Json::String("stellar_asset".to_string()),
+                    );
+                    let mut storage = serde_json::Map::new();
+                    storage.insert("decimals".to_string(), Json::from(7u32));
+                    let mut m = serde_json::Map::new();
+                    m.insert("executable".to_string(), Json::Object(executable));
+                    m.insert("storage".to_string(), Json::Object(storage));
+                    m
+                }),
+            ),
+            (
+                "LedgerKeyContractInstance",
+                ScVal::LedgerKeyContractInstance,
+                Json::String("ledger_key_contract_instance".to_string()),
+            ),
+            (
+                "LedgerKeyNonce",
+                ScVal::LedgerKeyNonce(ScNonceKey { nonce: 99 }),
+                Json::Object({
+                    let mut m = serde_json::Map::new();
+                    m.insert("nonce".to_string(), Json::String("99".to_string()));
+                    m
+                }),
+            ),
+        ];
+
+        for (name, val, expected_json) in cases {
+            // Never panics, decodes to the documented shape, and round-trips
+            // through serde_json (guards against e.g. a NaN or non-finite
+            // float slipping through, which this codec never produces but a
+            // future edit could).
+            let json = scval_to_json(&val);
+            assert_eq!(json, expected_json, "unexpected JSON shape for {name}");
+            let s = serde_json::to_string(&json)
+                .unwrap_or_else(|e| panic!("{name} JSON must serialise: {e}"));
+            let _: Json = serde_json::from_str(&s)
+                .unwrap_or_else(|e| panic!("{name} JSON must round-trip: {e}"));
+
+            // scval_to_string must not panic on any variant either.
+            let _ = scval_to_string(&val);
+        }
+    }
+
+    #[test]
+    fn contract_instance_string_repr_names_the_executable_kind() {
+        assert!(scval_to_string(&sample_contract_instance_wasm()).contains("wasm"));
+        assert!(
+            scval_to_string(&sample_contract_instance_stellar_asset_with_storage())
+                .contains("stellar_asset")
+        );
+    }
+
+    #[test]
+    fn ledger_key_variants_have_stable_string_repr() {
+        assert_eq!(
+            scval_to_string(&ScVal::LedgerKeyContractInstance),
+            "ledger_key_contract_instance"
+        );
+        assert_eq!(
+            scval_to_string(&ScVal::LedgerKeyNonce(ScNonceKey { nonce: 99 })),
+            "99"
+        );
+    }
+
+    #[test]
+    fn nested_map_inside_vec_inside_contract_instance_storage_decodes_recursively() {
+        // Recursive/nested structures (issue #209 acceptance criterion): a Map
+        // holding a Vec holding a Map, nested inside a ContractInstance's
+        // storage, all decode without truncation or panic.
+        let inner_map = ScMap(
+            VecM::try_from(vec![ScMapEntry {
+                key: ScVal::Symbol(ScSymbol::try_from("inner".to_string()).unwrap()),
+                val: ScVal::I32(-1),
+            }])
+            .unwrap(),
+        );
+        let vec_of_maps = ScVal::Vec(Some(stellar_xdr::curr::ScVec(
+            VecM::try_from(vec![ScVal::Map(Some(inner_map))]).unwrap(),
+        )));
+        let outer_storage = ScMap(
+            VecM::try_from(vec![ScMapEntry {
+                key: ScVal::Symbol(ScSymbol::try_from("items".to_string()).unwrap()),
+                val: vec_of_maps,
+            }])
+            .unwrap(),
+        );
+        let val = ScVal::ContractInstance(ScContractInstance {
+            executable: ContractExecutable::StellarAsset,
+            storage: Some(outer_storage),
+        });
+
+        let json = scval_to_json(&val);
+        let inner = &json["storage"]["items"][0]["inner"];
+        assert_eq!(*inner, Json::from(-1i32));
     }
 
     #[test]
@@ -1424,6 +1506,160 @@ mod tests {
                     assert!(!s.is_empty(), "scval_to_string must not return empty for non-Void");
                 }
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Whole-entry-point fuzzing (issue #219)
+    // -----------------------------------------------------------------------
+    //
+    // The #416 suite above fuzzes `decode_scval`/`scval_to_string`/
+    // `scval_to_json` directly. Those are internal helpers; the actual attack
+    // surface facing untrusted on-chain bytes is `Parser::parse_event_with_
+    // projection`, which additionally parses `event_type`/`ledger` strings,
+    // decodes every topic, and runs the SEP-41/NFT/invocation projections on
+    // top of the decoded value. This suite drives that entry point directly.
+
+    /// Generate an arbitrary, frequently-malformed `RawEvent` — the actual
+    /// parser entry point. Each field mixes a plausible value with garbage so
+    /// the fuzzer exercises the full decode -> normalise -> project pipeline
+    /// (event-type parsing, per-topic XDR decode, token/NFT projection),
+    /// not just a single inner conversion.
+    fn arb_raw_event() -> impl Strategy<Value = RawEvent> {
+        let arb_sc_encoded = prop_oneof![arb_scval_b64(), arb_raw_b64()];
+        (
+            prop_oneof![
+                3 => Just("contract".to_string()),
+                3 => Just("system".to_string()),
+                3 => Just("diagnostic".to_string()),
+                1 => "[a-zA-Z]{0,12}",
+            ],
+            prop_oneof![
+                3 => "[0-9]{1,10}",
+                1 => "[a-zA-Z!]{0,10}",
+                1 => Just(String::new()),
+            ],
+            proptest::option::of("[A-Za-z0-9]{0,56}"),
+            proptest::collection::vec(arb_sc_encoded.clone(), 0..6),
+            prop_oneof![
+                3 => arb_scval_b64(),
+                2 => arb_raw_b64(),
+                1 => Just(String::new()),
+            ],
+            any::<bool>(),
+        )
+            .prop_map(
+                |(event_type, ledger, contract_id, topic, value, successful)| RawEvent {
+                    event_type,
+                    ledger,
+                    ledger_closed_at: "2024-06-01T00:00:00Z".to_string(),
+                    contract_id,
+                    id: "fuzz-id".to_string(),
+                    paging_token: None,
+                    tx_hash: "fuzzhash".to_string(),
+                    operation_index: None,
+                    topic,
+                    value,
+                    in_successful_contract_call: successful,
+                },
+            )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2000))]
+
+        /// The core invariant this issue asks for: for any input, the parser
+        /// entry point returns `Ok(Some(_))`, `Ok(None)`, or an `Err` the
+        /// caller can record — it never panics. A panic here would abort the
+        /// streamer's poll loop on a single crafted event (issue #219).
+        #[test]
+        fn parse_event_with_projection_never_panics(raw in arb_raw_event()) {
+            let parser = Parser::new(true);
+            let _ = parser.parse_event_with_projection(&raw);
+        }
+
+        /// Same invariant with diagnostic events excluded, matching the
+        /// production default (`INDEX_DIAGNOSTIC=false`) and its early-return
+        /// branch in `parse_event_with_projection`.
+        #[test]
+        fn parse_event_with_projection_never_panics_index_diagnostic_false(raw in arb_raw_event()) {
+            let parser = Parser::new(false);
+            let _ = parser.parse_event_with_projection(&raw);
+        }
+    }
+
+    /// Seed corpus of realistic (non-random) event shapes, run as ordinary
+    /// regression tests rather than through proptest's random search (issue
+    /// #219: "seed the corpus with real testnet events"). These mirror
+    /// payload shapes actually seen from Soroban RPC — a SEP-41 transfer, a
+    /// diagnostic event, a system fee event, and an event with a Map-typed
+    /// body — so the fuzz suite's random search is complemented by fixed
+    /// cases known to matter, and a future edit that breaks one of these
+    /// shapes fails immediately instead of waiting on proptest to rediscover
+    /// it.
+    #[test]
+    fn seed_corpus_of_realistic_events_parses_without_panicking() {
+        let addr = |seed: u8| {
+            ScVal::Address(ScAddress::Account(AccountId(
+                PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256([seed; 32])),
+            )))
+        };
+
+        let seeds: Vec<RawEvent> = vec![
+            // A standard SEP-41 `transfer` event.
+            make_event(
+                "contract",
+                Some("CCONTRACT"),
+                vec![sym("transfer"), addr(1), addr(2)],
+                ScVal::I128(Int128Parts {
+                    hi: 0,
+                    lo: 1_000_000,
+                }),
+                true,
+            ),
+            // A diagnostic event (skipped unless index_diagnostic is set).
+            make_event(
+                "diagnostic",
+                Some("CCONTRACT"),
+                vec![sym("log")],
+                ScVal::String(ScString(
+                    stellar_xdr::curr::StringM::try_from(b"debug".to_vec()).unwrap(),
+                )),
+                true,
+            ),
+            // A system event with a Map-typed body (fee/resource accounting
+            // shapes commonly look like this).
+            make_event(
+                "system",
+                None,
+                vec![sym("fee_charged")],
+                ScVal::Map(Some(ScMap(
+                    VecM::try_from(vec![ScMapEntry {
+                        key: ScVal::Symbol(ScSymbol::try_from("amount".to_string()).unwrap()),
+                        val: ScVal::I64(12_345),
+                    }])
+                    .unwrap(),
+                ))),
+                true,
+            ),
+            // An event from a failed contract call — must be skipped
+            // (`Ok(None)`), not treated as an error.
+            make_event(
+                "contract",
+                Some("CCONTRACT"),
+                vec![sym("transfer")],
+                ScVal::Void,
+                false,
+            ),
+        ];
+
+        let parser = Parser::new(true);
+        for raw in &seeds {
+            let result = parser.parse_event_with_projection(raw);
+            assert!(
+                result.is_ok(),
+                "seed corpus event must parse cleanly: {raw:?} -> {result:?}"
+            );
         }
     }
 }
