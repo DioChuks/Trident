@@ -16,14 +16,22 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct OpenApiModels {
+    pub admin_key_usage_response: Option<AdminKeyUsageResponse>,
+
     #[serde(rename = "APIKeyResponse")]
     pub api_key_response: Option<ApiKeyResponse>,
+
+    pub contract_call_request: Option<ContractCallRequest>,
+
+    pub contract_call_response: Option<ContractCallResponse>,
 
     pub contract_event_field_schema: Option<ContractEventFieldSchema>,
 
     pub contract_event_schema: Option<ContractEventSchema>,
 
     pub contract_event_schema_response: Option<ContractEventSchemaResponse>,
+
+    pub contract_registration_request: Option<ContractRegistrationRequest>,
 
     pub contract_response: Option<ContractResponse>,
 
@@ -40,6 +48,8 @@ pub struct OpenApiModels {
     pub contract_storage_response: Option<ContractStorageResponse>,
 
     pub contract_storage_value: Option<ContractStorageValue>,
+
+    pub endpoint_usage: Option<EndpointUsage>,
 
     pub error_response: Option<ErrorResponse>,
 
@@ -63,6 +73,46 @@ pub struct OpenApiModels {
     pub token_metadata_response: Option<TokenMetadataResponse>,
 
     pub version_response: Option<VersionResponse>,
+
+    pub webhook_create_request: Option<WebhookCreateRequest>,
+
+    pub webhook_create_response: Option<WebhookCreateResponse>,
+
+    pub webhook_delivery: Option<WebhookDelivery>,
+
+    pub webhook_replay_response: Option<WebhookReplayResponse>,
+
+    pub webhook_rotate_secret_response: Option<WebhookRotateSecretResponse>,
+
+    pub webhook_status_response: Option<WebhookStatusResponse>,
+
+    pub webhook_subscription: Option<WebhookSubscription>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminKeyUsageResponse {
+    pub api_key_id: String,
+
+    /// Per-endpoint breakdown; empty when the window has no requests
+    pub by_endpoint: Vec<EndpointUsage>,
+
+    pub from: String,
+
+    /// Requests with status code < 400
+    pub successful_requests: i64,
+
+    pub to: String,
+
+    pub total_requests: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EndpointUsage {
+    pub avg_duration_ms: f64,
+
+    pub endpoint: String,
+
+    pub requests: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,6 +151,30 @@ pub enum Network {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContractCallRequest {
+    /// Base64-encoded XDR ScVal arguments, in order
+    pub args: Option<Vec<String>>,
+
+    /// Contract function name to invoke
+    pub function: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContractCallResponse {
+    /// Simulation error message; present only when success=false
+    pub error: Option<String>,
+
+    /// Raw base64 XDR of the return value; omitted on failure
+    pub raw_xdr: Option<String>,
+
+    /// Decoded return value; omitted when undecodable or failed
+    pub result: Option<serde_json::Value>,
+
+    /// False when the simulation itself reported a failure (still HTTP 200)
+    pub success: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContractEventFieldSchema {
     /// Stable field name for this event payload position or property
     pub name: String,
@@ -132,6 +206,21 @@ pub struct ContractEventSchemaResponse {
 
     /// Network queried
     pub network: Network,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContractRegistrationRequest {
+    /// Contract address (C... strkey, 56 characters)
+    pub contract_id: String,
+
+    /// Ledger sequence to start indexing from
+    pub index_from: Option<i64>,
+
+    /// Human-readable label
+    pub label: Option<String>,
+
+    /// Network scope; omitted or empty means all networks
+    pub network: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -516,4 +605,133 @@ pub struct VersionResponse {
     /// Semantic version tag of the running build, or "dev" for a binary built without release
     /// ldflags.
     pub version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebhookCreateRequest {
+    pub contract_id: String,
+
+    pub network: Option<String>,
+
+    /// Delivery target; must be https with a publicly resolvable, non-private host
+    pub target_url: String,
+
+    /// Optional topic filter
+    pub topic0: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebhookCreateResponse {
+    pub contract_id: String,
+
+    pub id: String,
+
+    pub network: String,
+
+    /// HMAC signing secret — shown here and in the listing
+    pub secret: String,
+
+    pub target_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebhookDelivery {
+    pub attempt: i64,
+
+    pub attempts: i64,
+
+    pub delivered_at: String,
+
+    pub event_id: String,
+
+    pub id: i64,
+
+    /// Omitted when empty
+    pub response_body: Option<String>,
+
+    pub status: String,
+
+    /// HTTP status of the delivery attempt; omitted when none occurred
+    pub status_code: Option<i64>,
+
+    pub subscription_id: String,
+
+    pub success: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookReplayResponse {
+    pub attempt: i64,
+
+    /// Truncated to 500 characters
+    pub response_body: String,
+
+    pub status: WebhookReplayResponseStatus,
+
+    /// 0 when no HTTP response occurred
+    pub status_code: i64,
+
+    pub success: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebhookReplayResponseStatus {
+    Failed,
+
+    Success,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebhookRotateSecretResponse {
+    pub id: String,
+
+    /// The demoted secret, now serving as secondary during the overlap window
+    pub previous_secret: String,
+
+    /// The new primary signing secret (whsec_ prefixed)
+    pub secret: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookStatusResponse {
+    pub status: WebhookStatusResponseStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebhookStatusResponseStatus {
+    Paused,
+
+    Resumed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebhookSubscription {
+    /// Omitted when empty
+    pub api_key_id: Option<String>,
+
+    pub contract_id: String,
+
+    pub created_at: String,
+
+    pub id: String,
+
+    pub network: String,
+
+    /// Present while deliveries are paused
+    pub paused_at: Option<String>,
+
+    /// HMAC signing secret for deliveries; omitted when empty
+    pub secret: Option<String>,
+
+    pub target_url: String,
+
+    /// Topic filter; omitted when unfiltered
+    pub topic0: Option<String>,
 }
