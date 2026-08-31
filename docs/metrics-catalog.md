@@ -19,6 +19,9 @@ port `9090`, set via `METRICS_PORT`). Defined in
 | `trident_indexer_events_skipped_total` | counter | — | events | Events skipped: diagnostic/failed-call events, or filtered by the contract allowlist. |
 | `trident_indexer_parse_errors_total` | counter | — | events | Events that failed XDR decoding and were written to `parse_errors` instead of `soroban_events`. |
 | `trident_scval_unexpected_variant_total` | counter | — | values | Structurally valid ScVal variants decoded where they should never appear in event payloads (`ContractInstance` / ledger-key forms); stored faithfully, surfaced via `TridentIndexerUnexpectedScValVariant` (#506). Emitted by the shared decoder in `trident-common`. |
+| `trident_indexer_dead_lettered_total` | counter | — | events | Undecodable events durably written to `parse_errors` after the dead-letter insert's own retries (#414). |
+| `trident_indexer_persist_dead_lettered_total` | counter | — | events | Events that decoded fine but exhausted the persist retry budget and were durably captured in `failed_events` (#508). |
+| `trident_indexer_persist_dead_letter_backlog` | gauge | — | rows | `failed_events` rows awaiting replay (`replayed_at IS NULL`), refreshed each active poll cycle and on every dead-letter write; non-empty pages via `TridentIndexerPersistDeadLetterBacklog` (#508). |
 | `trident_indexer_poll_duration_seconds` | histogram | — | seconds | Wall-clock time of one `poll_once` cycle (may span multiple RPC pages). |
 | `trident_indexer_poll_errors_total` | counter | — | cycles | Poll cycles that returned an error (logged, cursor unaffected, retried next interval). |
 | `trident_indexer_rpc_retries_total` | counter | — | retries | Retries triggered by transient `getEvents` failures (exponential backoff). |
