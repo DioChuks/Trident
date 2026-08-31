@@ -345,6 +345,7 @@ var liveCoverageDeferred = map[string]bool{
 	"pauseWebhook":            true,
 	"resumeWebhook":           true,
 	"listWebhookDeliveries":   true,
+	"rotateWebhookSecret":     true,
 	"listWebhookDeadLetters":  true,
 	"replayWebhookDeadLetter": true,
 }
