@@ -431,18 +431,21 @@ configured Kubernetes termination grace period.
 ## Launch Chaos Baseline
 
 Issue #439 requires actual fault injection for the launch environment. Use
-`load-tests/chaos-launch.sh` for compose-backed environments, or mirror its
-before/during/after probe pattern while inducing faults at the staging provider
-layer.
+`load-tests/chaos-launch.sh` with the local RPC compose overlay, or mirror its
+before/during/after assertions while inducing faults at the staging provider
+layer. See [`load-tests/README.md`](../load-tests/README.md#local-dependency-chaos-verification)
+for the complete local setup.
 
 Recommended command for a compose-backed run:
 
 ```bash
 BASE_URL=http://localhost:3000 \
-COMPOSE_FILE=docker/docker-compose.yml \
+COMPOSE_PROJECT=trident-chaos \
+COMPOSE_FILES='docker/docker-compose.yml;docker/docker-compose.ci.yml;docker/docker-compose.chaos.yml' \
+COMPOSE_ENV_FILE=.env.ci \
 FAULT_SECONDS=30 \
-RECOVERY_SECONDS=45 \
-RPC_SERVICE=<local-rpc-service-name> \
+RECOVERY_SECONDS=180 \
+API_KEY=ci-test-api-key-do-not-use-in-production \
 ./load-tests/chaos-launch.sh
 ```
 
